@@ -227,6 +227,10 @@ _enable_audio_lane: bool = False
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
+# ``--adapter-path`` in effect for the loaded text model (None = bare
+# checkpoint). Mirrored into ServerConfig.adapter_path by _sync_config so the
+# persisted prefix cache is namespaced per adapter (runtime.cache).
+_adapter_path: str | None = None
 # True when ``load_model`` was given an explicit ``--served-model-name``, so
 # downstream surfaces (the readiness banner) can prefer the served API name
 # over the catalog alias. Set regardless of what the name resolves to (issue
@@ -1963,6 +1967,7 @@ def load_model(
     no_openai_harmony_streaming: bool = False,
     enable_disk_stream: bool = False,
     disk_stream_cache_gb: float = 1.0,
+    adapter_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -2011,6 +2016,11 @@ def load_model(
             ``vllm_mlx.disk_stream_patch`` in ``_start_llm`` before the
             model reaches ``AsyncEngineCore``. Default False keeps every
             existing caller's behavior unchanged.
+        adapter_path: Keyword-only. ``--adapter-path`` — directory of an
+            mlx-lm LoRA/DoRA adapter fused into the text model at load time
+            (see ``utils.tokenizer.load_model_with_fallback``). Falls back to
+            the alias profile's ``adapter_path`` when the caller passes
+            ``None``; text lane only.
     """
     if force_mllm and force_text:
         raise ValueError(
@@ -2115,6 +2125,7 @@ def load_model(
         _model_alias, \
         _model_name, \
         _model_path, \
+        _adapter_path, \
         _served_model_name_set, \
         _default_max_tokens, \
         _default_max_tokens_is_explicit, \
@@ -2175,6 +2186,12 @@ def load_model(
 
         _bare_repo_has_pulled_variant = pulled_variant(model_name) is not None
     _model_config = None if _bare_repo_has_pulled_variant else _profile
+    # Explicit --adapter-path wins; an alias may declare its own adapter.
+    # Resolved once here so the engine, ServerConfig and the prefix-cache
+    # identity all see the same value.
+    _adapter_path = adapter_path or (
+        getattr(_profile, "adapter_path", None) if _profile is not None else None
+    )
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
 
@@ -2429,6 +2446,7 @@ def load_model(
             chat_template_id=(
                 _profile.chat_template_id if _profile is not None else None
             ),
+            adapter_path=_adapter_path,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
@@ -2681,6 +2699,9 @@ async def _load_dynamic_resident_model(
             chat_template_id=(
                 profile.chat_template_id if profile is not None else None
             ),
+            adapter_path=(
+                getattr(profile, "adapter_path", None) if profile is not None else None
+            ),
             force_text=effective_force_text,
             serving_lane_reason=serving_lane_reason,
             gpu_memory_utilization=_resident_gpu_memory_utilization,
@@ -2774,6 +2795,7 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
     global _engine, _model_name, _model_alias, _model_path, _served_model_name_set
     global _enable_auto_tool_choice, _tool_call_parser, _tool_parser_instance
     global _reasoning_parser, _reasoning_parser_name
+    global _adapter_path
 
     if entry is None:
         _engine = None
@@ -2796,6 +2818,8 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
         cfg.tool_parser_instance = None
         cfg.reasoning_parser = None
         cfg.reasoning_parser_name = None
+        cfg.adapter_path = None
+        _adapter_path = None
         cfg.ready = False
         return
 
@@ -2803,6 +2827,9 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
     _model_name = entry.model_name
     _model_alias = entry.model_name
     _model_path = entry.model_path
+    # The replacement engine owns its adapter (alias-declared); keep the
+    # prefix-cache identity in step with the engine actually serving.
+    _adapter_path = getattr(entry.engine, "_adapter_path", None)
     # A replacement assistant has no --served-model-name override; the banner
     # must fall back to the alias, so clear the explicit-override marker.
     _served_model_name_set = False
@@ -2848,6 +2875,7 @@ def _sync_config() -> None:
     cfg.model_name = _model_name
     cfg.model_alias = _model_alias
     cfg.model_path = _model_path
+    cfg.adapter_path = _adapter_path
     cfg.default_max_tokens = _default_max_tokens
     cfg.default_max_tokens_is_explicit = _default_max_tokens_is_explicit
     cfg.default_timeout = _default_timeout

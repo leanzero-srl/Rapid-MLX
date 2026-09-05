@@ -66,6 +66,7 @@ def _load_lazy_and_install_disk_stream(
     tokenizer_config: dict,
     cache_budget_gb: float,
     chat_template_id: str | None = None,
+    adapter_path: str | None = None,
 ):
     """``--disk-stream`` model-load step, run as a single unit on the
     mlx-step worker (see the ``_start_llm`` call site) so both the lazy
@@ -82,6 +83,12 @@ def _load_lazy_and_install_disk_stream(
     from .. import disk_stream_patch
     from ..utils.tokenizer import _resolve_model_path, load_model_with_fallback
 
+    lazy_kwargs = {}
+    if adapter_path is not None:
+        # LoRA rides mlx_lm.load(adapter_path=...) inside the shared loader,
+        # so the adapter is fused before disk_stream_patch.install sees the
+        # model. Passed only when set to keep the historical call shape.
+        lazy_kwargs["adapter_path"] = adapter_path
     model, tokenizer, config, checkpoint_source = load_model_with_fallback(
         model_name,
         tokenizer_config,
@@ -89,6 +96,7 @@ def _load_lazy_and_install_disk_stream(
         lazy=True,
         return_config=True,
         return_source=True,
+        **lazy_kwargs,
     )
     checkpoint_path = _resolve_model_path(checkpoint_source)
     if checkpoint_path is None:
@@ -875,6 +883,7 @@ class BatchedEngine(BaseEngine):
         disk_stream_cache_gb: float = 1.0,
         chat_template_id: str | None = None,
         serving_lane_reason: str | None = None,
+        adapter_path: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -918,8 +927,16 @@ class BatchedEngine(BaseEngine):
             serving_lane_reason: Machine-readable reason from the shared
                 serving-lane decision. Kept on the live engine so model and
                 residency APIs report the decision that was actually loaded.
+            adapter_path: Keyword-only. ``--adapter-path`` — directory of an
+                mlx-lm LoRA/DoRA adapter (``adapter_config.json`` +
+                ``adapters.safetensors``) fused into the text model inside
+                ``load_model_with_fallback`` (before MTP injection, MoE
+                fusion and the scheduler see it). Text lane only; ``start``
+                rejects it on the MLLM lane. ``None`` keeps every existing
+                caller byte-identical.
         """
         self._model_name = model_name
+        self._adapter_path = adapter_path
         if chat_template_id is None:
             from ..model_aliases import resolve_profile
 
@@ -1461,6 +1478,16 @@ class BatchedEngine(BaseEngine):
         self._validate_lane_capabilities()
 
         if self._is_mllm:
+            if getattr(self, "_adapter_path", None):
+                # mlx-vlm's loader has no adapter hook; loading weights and
+                # coming up "Ready" with the adapter silently ignored would
+                # be the #2955 class of failure. Fail closed before any load.
+                raise ValueError(
+                    "--adapter-path is only supported on the text (mlx-lm) "
+                    "serving lane; this model routed to the MLLM lane. Pass "
+                    "--no-mllm to force the text lane if the checkpoint is "
+                    "text-capable, or serve without --adapter-path."
+                )
             await self._start_mllm()
         else:
             await self._start_llm()
@@ -1790,12 +1817,18 @@ class BatchedEngine(BaseEngine):
                     tokenizer_config,
                     getattr(self, "_disk_stream_cache_gb", 1.0),
                     getattr(self, "_chat_template_id", None),
+                    getattr(self, "_adapter_path", None),
                 ).result()
             )
         else:
             load_kwargs = {"tokenizer_config": tokenizer_config}
             if chat_template_id := getattr(self, "_chat_template_id", None):
                 load_kwargs["chat_template_id"] = chat_template_id
+            if adapter_path := getattr(self, "_adapter_path", None):
+                # LoRA is fused INSIDE the loader (mlx_lm.load(adapter_path=)
+                # / load_adapters), so fuse_gate_up, the GDN fusion, MTP
+                # dispatch and the scheduler below all see the tuned model.
+                load_kwargs["adapter_path"] = adapter_path
             if self._scheduler_config is not None and (
                 getattr(self._scheduler_config, "spec_decode", "none") == "dspark"
             ):
@@ -1847,11 +1880,19 @@ class BatchedEngine(BaseEngine):
         kv_dtype = str(
             getattr(self._scheduler_config, "kv_cache_dtype", None) or "bf16"
         )
+        _pin_kwargs = {}
+        if adapter_path := getattr(self, "_adapter_path", None):
+            # A fused adapter changes every cached K/V; persisted entries from
+            # the bare checkpoint must not be reused (see
+            # runtime.cache._adapter_identity_suffix). Passed only when set so
+            # the no-adapter pin keeps its exact historical call shape.
+            _pin_kwargs["adapter_path"] = adapter_path
         pin_prefix_cache_identity(
             self,
             raw_model_name=self._model_name,
             checkpoint_source=checkpoint_source,
             kv_dtype=kv_dtype,
+            **_pin_kwargs,
         )
 
         # 0.9.13 PR-A: new-arch MTP inject dispatcher (Gemma 4 external

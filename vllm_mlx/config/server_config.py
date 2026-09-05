@@ -41,6 +41,10 @@ class ServerConfig:
     model_name: str | None = None
     model_alias: str | None = None
     model_path: str | None = None
+    # ``--adapter-path`` in effect for the loaded text model (None = bare
+    # checkpoint). Read by runtime.cache to namespace the persisted prefix
+    # cache: adapter KV must never be shared with the bare model's.
+    adapter_path: str | None = None
     # Runtime owner for additional engines loaded into this process. The
     # legacy ``engine`` fields remain the protected startup/default model;
     # request routes consult this manager for residency, eviction, and status.

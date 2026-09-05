@@ -4764,6 +4764,35 @@ def serve_command(args):
             file=sys.stderr,
         )
         sys.exit(2)
+    _adapter_path = getattr(args, "adapter_path", None)
+    if _adapter_path:
+        # Fail fast with an actionable message before any weights load; the
+        # loader re-checks the same invariant (utils.tokenizer.
+        # _validate_adapter_path) for programmatic callers.
+        from pathlib import Path as _AdapterPath
+
+        _adir = _AdapterPath(_adapter_path).expanduser()
+        _adapter_missing = [
+            name
+            for name in ("adapter_config.json", "adapters.safetensors")
+            if not (_adir / name).is_file()
+        ]
+        if not _adir.is_dir() or _adapter_missing:
+            print(
+                f"error: --adapter-path {_adapter_path!r} is not an mlx-lm adapter "
+                "directory (needs adapter_config.json and adapters.safetensors, "
+                "as written by `mlx_lm.lora --train --adapter-path DIR`).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        _adapter_path = str(_adir)
+        if args.mllm:
+            print(
+                "error: --adapter-path is only supported on the text (mlx-lm) "
+                "lane and cannot be combined with --mllm.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     server.configure_model_residency(
         memory_limit_gb=getattr(args, "resident_memory_limit_gb", 0.0),
         idle_ttl_seconds=getattr(args, "resident_model_idle_ttl", 0.0),
@@ -4780,6 +4809,7 @@ def serve_command(args):
             force_text=args.no_mllm,
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
+            adapter_path=_adapter_path,
             force_hybrid=getattr(args, "force_hybrid", False),
             no_hybrid=getattr(args, "no_hybrid", False),
             force_spec_decode=getattr(args, "force_spec_decode", False),
@@ -10624,6 +10654,19 @@ Examples:
         type=str,
         default=None,
         help="The model name used in the API. If not specified, the model argument is used.",
+    )
+    serve_parser.add_argument(
+        "--adapter-path",
+        dest="adapter_path",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory of an mlx-lm LoRA/DoRA adapter (adapter_config.json + "
+            "adapters.safetensors, as written by `mlx_lm.lora --train`). The "
+            "adapter is fused into the model at load time, before speculative "
+            "decoding or the scheduler see it. Text (mlx-lm) models only."
+        ),
     )
     serve_parser.add_argument(
         "--force-disk-check",
