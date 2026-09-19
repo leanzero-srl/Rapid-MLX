@@ -426,7 +426,7 @@ def _semantic_cache_identity(cfg, raw_model_name: str) -> str:
     identity = (
         f"{raw_model_name}\0prefix-cache-v{_PREFIX_CACHE_NAMESPACE_VERSION}"
         f"\0kv={kv_dtype}\0revision={revision}"
-    )
+    ) + _adapter_identity_suffix(getattr(cfg, "adapter_path", None))
     if engine is not None:
         try:
             setattr(engine, attr, identity)
@@ -437,15 +437,39 @@ def _semantic_cache_identity(cfg, raw_model_name: str) -> str:
     return identity
 
 
+def _adapter_identity_suffix(adapter_path: str | None) -> str:
+    """Extra identity axis for a fused LoRA/DoRA adapter (``--adapter-path``).
+
+    A model served with an adapter is a DIFFERENT model from the same
+    checkpoint served bare: every layer the adapter touches produces different
+    K/V for the same tokens, so persisted prefix-cache entries must never be
+    shared across the two (measured on SmolLM-135M: reusing base-model KV
+    under an adapter flipped a 2.6-logit first-token decision). The suffix is
+    empty when no adapter is set so every pre-existing identity string — and
+    every on-disk cache directory keyed by it — stays byte-identical. The
+    adapter directory is fingerprinted like a local checkpoint
+    (``_cached_model_revision``: file manifest + byte hash for small files),
+    so retraining into the same directory also invalidates the cache.
+    """
+    if not adapter_path:
+        return ""
+    return f"\0adapter={_cached_model_revision(str(adapter_path))}"
+
+
 def pin_prefix_cache_identity(
-    engine, *, raw_model_name: str, checkpoint_source: str, kv_dtype: str
+    engine,
+    *,
+    raw_model_name: str,
+    checkpoint_source: str,
+    kv_dtype: str,
+    adapter_path: str | None = None,
 ) -> str:
     """Pin cache identity before a loaded engine becomes concurrently visible."""
     revision = _cached_model_revision(checkpoint_source)
     identity = (
         f"{raw_model_name}\0prefix-cache-v{_PREFIX_CACHE_NAMESPACE_VERSION}"
         f"\0kv={kv_dtype}\0revision={revision}"
-    )
+    ) + _adapter_identity_suffix(adapter_path)
     engine._rapid_mlx_prefix_cache_identity = identity
     return identity
 

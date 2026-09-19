@@ -131,6 +131,10 @@ class ModelProfile:
     # once when the tokenizer/processor is loaded; request rendering never
     # infers a template from a model name or from template contents.
     chat_template_id: str | None = None
+    # Optional mlx-lm LoRA/DoRA adapter directory (``adapter_config.json`` +
+    # ``adapters.safetensors``) fused into the text model at load time. An
+    # explicit ``serve --adapter-path`` always wins over this default.
+    adapter_path: str | None = None
 
     # --- Architecture / capability gates ---
     # ``is_hybrid`` = the model uses linear-attention or recurrent layers

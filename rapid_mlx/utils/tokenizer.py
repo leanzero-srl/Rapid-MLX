@@ -1273,6 +1273,7 @@ def load_model_with_fallback(
     lazy: bool = False,
     return_config: bool = False,
     return_source: bool = False,
+    adapter_path: str | None = None,
 ):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -1280,6 +1281,15 @@ def load_model_with_fallback(
     Args:
         model_name: HuggingFace model name or local path
         tokenizer_config: Optional tokenizer configuration
+        adapter_path: Optional directory holding an mlx-lm LoRA/DoRA adapter
+            (``adapter_config.json`` + ``adapters.safetensors``, as written by
+            ``mlx_lm.lora --train``). When set, the adapter layers are fused
+            into the model INSIDE this loader — before the MTP injector, the
+            MoE fusion passes or the scheduler ever see the model — through
+            mlx-lm's public API only (``mlx_lm.load(adapter_path=...)`` on
+            the native path, ``mlx_lm.tuner.utils.load_adapters`` on the
+            loaders that bypass ``mlx_lm.load``). ``None`` (default) leaves
+            every existing call path byte-identical.
         lazy: ``--disk-stream`` path only. When True, skip every
             *branch-selection* fallback / tokenizer-quirk path below
             (Gemma 4 native/legacy routing, vendored-arch tokenizer
@@ -1385,6 +1395,10 @@ def load_model_with_fallback(
     if not rapid_owned_runtime:
         validate_local_model_file(model_name)
 
+    # Fail fast on a bad --adapter-path BEFORE multi-GB weights are read:
+    # mlx-lm's own check only fires after the base model is resident.
+    _validate_adapter_path(adapter_path)
+
     tokenizer_config, trust_remote_code = apply_remote_code_policy(tokenizer_config)
 
     # Security hardening: when remote-code execution is enabled (the default,
@@ -1435,8 +1449,11 @@ def load_model_with_fallback(
             # security overlay only for reviewed runtimes. Rapid's supported
             # mlx-lm floor (0.31.3) exposes this keyword on both load APIs.
             lazy_load_kwargs["model_config"] = rapid_owned_model_config
+        if adapter_path is not None:
+            lazy_load_kwargs["adapter_path"] = str(adapter_path)
         result = _mlx_lm_load(model_name, **lazy_load_kwargs)
         model, tokenizer = result[0], result[1]
+        _log_lora_applied(model, adapter_path)
 
         # The four fixups below are pure post-load tokenizer/generation-
         # config/model-attribute adjustments: each one reads the already-
@@ -1482,21 +1499,15 @@ def load_model_with_fallback(
         # actually used for.
         _post_load_ubc_evict(model_name)
         return (*result, str(model_name)) if return_source else result
+    impl_kwargs = {}
     if rapid_owned_runtime:
-        result = _load_model_with_fallback_impl(
-            model_name,
-            tokenizer_config,
-            enable_dspark=enable_dspark,
-            model_config=rapid_owned_model_config,
-        )
+        impl_kwargs["enable_dspark"] = enable_dspark
+        impl_kwargs["model_config"] = rapid_owned_model_config
     elif enable_dspark:
-        result = _load_model_with_fallback_impl(
-            model_name, tokenizer_config, enable_dspark=True
-        )
-    else:
-        # Preserve the historical two-argument call shape for downstream
-        # wrappers and tests that instrument this internal dispatch boundary.
-        result = _load_model_with_fallback_impl(model_name, tokenizer_config)
+        impl_kwargs["enable_dspark"] = True
+    if adapter_path is not None:
+        impl_kwargs["adapter_path"] = str(adapter_path)
+    result = _load_model_with_fallback_impl(model_name, tokenizer_config, **impl_kwargs)
     _resolve_loaded_template(result)
     # Defect 4: evict UBC mirror of safetensors shards on Darwin so
     # the (mmap mirror + materialised weights) burst does not double
@@ -1684,11 +1695,23 @@ def _load_model_with_fallback_impl(
     *,
     enable_dspark: bool = False,
     model_config: dict | None = None,
+    adapter_path: str | None = None,
 ):
     """Inner load implementation — kept separate so the public wrapper can
     install a try/finally for the Defect 4 UBC eviction without rewriting
-    every return branch in the loader."""
+    every return branch in the loader.
+
+    ``adapter_path`` (LoRA/DoRA adapter directory) rides ``mlx_lm.load``'s own
+    ``adapter_path`` kwarg on the native path and ``_apply_lora_adapter`` on
+    every loader that bypasses ``mlx_lm.load`` — so the adapter is fused into
+    the model before any post-load step (MTP injection, fusion) sees it."""
     from mlx_lm import load
+
+    # Only widen mlx_lm.load's call when an adapter is actually requested so
+    # the no-adapter path keeps its exact historical call shape.
+    load_kwargs = {"tokenizer_config": tokenizer_config}
+    if adapter_path is not None:
+        load_kwargs["adapter_path"] = str(adapter_path)
 
     _register_vendored_archs()
     tokenizer_config = tokenizer_config or {}
@@ -1700,6 +1723,7 @@ def _load_model_with_fallback_impl(
             model_name,
             enable_dspark=enable_dspark,
             model_config=model_config,
+            adapter_path=adapter_path,
         )
     # #1420: neutralize any declared chat-template / tool-parser type whose
     # mlx-lm module isn't bundled, BEFORE any load() — covers the native
@@ -1708,13 +1732,16 @@ def _load_model_with_fallback_impl(
     tokenizer_config = _neutralize_unbundled_template_types(
         model_name, tokenizer_config
     )
+    load_kwargs["tokenizer_config"] = tokenizer_config
 
     # Check if model needs fallback (e.g., Nemotron)
     if _needs_tokenizer_fallback(model_name):
         logger.info(
             f"Model {model_name} requires tokenizer fallback, loading directly..."
         )
-        return _load_with_tokenizer_fallback(model_name, enable_dspark=enable_dspark)
+        return _load_with_tokenizer_fallback(
+            model_name, enable_dspark=enable_dspark, adapter_path=adapter_path
+        )
 
     # Vendored architectures (e.g. deepseek_v4) — transformers' AutoConfig
     # doesn't know about them, so mlx-lm's high-level load() blows up
@@ -1725,7 +1752,9 @@ def _load_model_with_fallback_impl(
             f"Model {model_name} uses a vendored architecture, "
             "skipping AutoConfig path and loading directly..."
         )
-        return _load_with_tokenizer_fallback(model_name, enable_dspark=enable_dspark)
+        return _load_with_tokenizer_fallback(
+            model_name, enable_dspark=enable_dspark, adapter_path=adapter_path
+        )
 
     # Gemma 4: mlx-lm 0.31+ supports it natively. Only use our wrapper
     # for older mlx-lm versions that lack gemma4 model support. Several
@@ -1752,18 +1781,24 @@ def _load_model_with_fallback_impl(
                     "Gemma 4 cross-layer shared KV uses the metadata-preserving "
                     "unified text loader"
                 )
-                return load_gemma4_unified_text(model_name, tokenizer_config)
+                return _with_lora_adapter(
+                    load_gemma4_unified_text(model_name, tokenizer_config),
+                    adapter_path,
+                )
 
             from ..models.gemma4_text import load_gemma4_text
 
             logger.info(
                 "Gemma 4 cross-layer shared KV uses the metadata-preserving text loader"
             )
-            return load_gemma4_text(model_name, tokenizer_config)
+            return _with_lora_adapter(
+                load_gemma4_text(model_name, tokenizer_config), adapter_path
+            )
         try:
             # Try native mlx-lm load first (0.31+)
-            model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
+            model, tokenizer = load(model_name, **load_kwargs)
             logger.info("Gemma 4 loaded natively via mlx-lm")
+            _log_lora_applied(model, adapter_path)
             if not getattr(tokenizer, "chat_template", None):
                 mp = _resolve_model_path(model_name)
                 if mp is not None:
@@ -1784,7 +1819,10 @@ def _load_model_with_fallback_impl(
                     f"Gemma 4 unified native load failed ({e}), "
                     "falling back to unified text-only wrapper (legacy mlx-lm)"
                 )
-                return load_gemma4_unified_text(model_name, tokenizer_config)
+                return _with_lora_adapter(
+                    load_gemma4_unified_text(model_name, tokenizer_config),
+                    adapter_path,
+                )
 
             from ..models.gemma4_text import load_gemma4_text
 
@@ -1792,10 +1830,16 @@ def _load_model_with_fallback_impl(
                 f"Gemma 4 native load failed ({e}), "
                 "falling back to text-only wrapper (legacy mlx-lm)"
             )
-            return load_gemma4_text(model_name, tokenizer_config)
+            return _with_lora_adapter(
+                load_gemma4_text(model_name, tokenizer_config), adapter_path
+            )
 
     try:
-        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
+        # mlx_lm.load fuses the adapter itself (load_adapters + eval) before
+        # returning, so the LoRA layers are in place ahead of the MTP
+        # re-injection below.
+        model, tokenizer = load(model_name, **load_kwargs)
+        _log_lora_applied(model, adapter_path)
         # mlx_lm.load() succeeds but sanitize() may have silently
         # stripped mtp.* weights.  Check if the config declares MTP
         # layers and the model came back without a .mtp attribute;
@@ -1825,7 +1869,7 @@ def _load_model_with_fallback_impl(
         ):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
             return _load_with_tokenizer_fallback(
-                model_name, enable_dspark=enable_dspark
+                model_name, enable_dspark=enable_dspark, adapter_path=adapter_path
             )
         # Fallback for models with extra/missing weights (e.g., vision tower, MTP layers).
         # Retry with strict=False to discard extra weights.
@@ -1836,12 +1880,123 @@ def _load_model_with_fallback_impl(
                 f"Model has extra/missing parameters (likely VLM / MTP weights), "
                 f"retrying with strict=False: {e}"
             )
-            return _load_strict_false(model_name, tokenizer_config)
+            return _load_strict_false(
+                model_name, tokenizer_config, adapter_path=adapter_path
+            )
         else:
             raise
 
 
-def _load_strict_false(model_name: str, tokenizer_config: dict = None):
+def _validate_adapter_path(adapter_path: str | None) -> None:
+    """Reject a missing / incomplete adapter directory before any weights load.
+
+    An mlx-lm adapter directory (``mlx_lm.lora --train --adapter-path``)
+    always holds ``adapter_config.json`` and ``adapters.safetensors``; both
+    are required by ``mlx_lm.tuner.utils.load_adapters``. No-op for ``None``.
+    """
+    if adapter_path is None:
+        return
+    adir = Path(adapter_path)
+    if not adir.is_dir():
+        raise FileNotFoundError(
+            f"--adapter-path {adapter_path!r} is not a directory. Expected the "
+            "adapter directory written by `mlx_lm.lora --train --adapter-path`."
+        )
+    missing = [
+        name
+        for name in ("adapter_config.json", "adapters.safetensors")
+        if not (adir / name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"--adapter-path {adapter_path!r} is missing {missing}; an mlx-lm "
+            "adapter directory needs adapter_config.json and adapters.safetensors."
+        )
+
+
+# Adapter module class names across mlx-lm releases (``mlx_lm.tuner.lora`` /
+# ``mlx_lm.tuner.dora``). Matched by NAME rather than by importing the
+# classes so the count stays version-agnostic and can never itself break a
+# load when a class is renamed or added upstream.
+_ADAPTER_MODULE_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "LoRALinear",
+        "LoRASwitchLinear",
+        "LoRAEmbedding",
+        "DoRALinear",
+        "DoRAEmbedding",
+    }
+)
+
+
+def count_adapter_modules(model) -> int:
+    """Number of LoRA/DoRA adapter modules fused into ``model`` (0 if none)."""
+    try:
+        return sum(
+            1
+            for _, module in model.named_modules()
+            if type(module).__name__ in _ADAPTER_MODULE_CLASS_NAMES
+        )
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never break a load
+        logger.debug("adapter module count failed: %s", e)
+        return -1
+
+
+def _log_lora_applied(model, adapter_path: str | None) -> None:
+    """One INFO line per load stating which adapter is live and how wide."""
+    if adapter_path is None:
+        return
+    n = count_adapter_modules(model)
+    if n == 0:
+        # The adapter file loaded but no module was swapped — almost always
+        # an adapter trained against a different architecture / num_layers.
+        # Say so loudly rather than serving the base model as if tuned.
+        logger.warning(
+            "LoRA adapter %s loaded but 0 adapter modules are present on the "
+            "model — the adapter's architecture/num_layers may not match this "
+            "checkpoint; generation will match the BASE model.",
+            adapter_path,
+        )
+        return
+    logger.info(
+        "LoRA adapter applied: %s (%s modules)",
+        adapter_path,
+        n if n >= 0 else "unknown",
+    )
+
+
+def _apply_lora_adapter(model, adapter_path: str | None):
+    """Fuse an mlx-lm adapter into an already-loaded ``model``.
+
+    Used by every loader that bypasses ``mlx_lm.load`` (strict=False retry,
+    raw-tokenizer fallback, vendored/Gemma-4 wrappers). Mirrors exactly what
+    ``mlx_lm.load`` does after its own ``load_model``: ``load_adapters`` then
+    ``model.eval()`` — the second call matters because the freshly created
+    LoRA modules default to training mode (dropout live) otherwise.
+    Public mlx-lm API only; no monkey-patching.
+    """
+    if adapter_path is None:
+        return model
+    from mlx_lm.tuner.utils import load_adapters
+
+    model = load_adapters(model, str(adapter_path))
+    model.eval()
+    _log_lora_applied(model, adapter_path)
+    return model
+
+
+def _with_lora_adapter(result, adapter_path: str | None):
+    """Apply ``_apply_lora_adapter`` to the model of a ``(model, tokenizer, ...)``
+    tuple returned by a wrapper loader, preserving the tuple shape."""
+    if adapter_path is None:
+        return result
+    model = _apply_lora_adapter(result[0], adapter_path)
+    return (model, *result[1:])
+
+
+def _load_strict_false(
+    model_name: str, tokenizer_config: dict = None, *, adapter_path: str | None = None
+):
     """Load model with strict=False to discard extra weights (e.g., vision tower, MTP)."""
     from mlx_lm.utils import load_model, load_tokenizer
 
@@ -1854,6 +2009,8 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
         model_path = Path(snapshot_download(model_name))
 
     model, config = load_model(model_path, strict=False)
+    # Adapter first, so the MTP injector below sees the tuned trunk.
+    model = _apply_lora_adapter(model, adapter_path)
     tokenizer = load_tokenizer(
         model_path,
         tokenizer_config or {},
@@ -1926,6 +2083,7 @@ def _load_with_tokenizer_fallback(
     *,
     enable_dspark: bool = False,
     model_config: dict | None = None,
+    adapter_path: str | None = None,
 ):
     """Load model with fallback tokenizer for non-standard models like Nemotron."""
     from mlx_lm.utils import load_model
@@ -1976,6 +2134,8 @@ def _load_with_tokenizer_fallback(
     else:
         # Load model
         model, _ = load_model(model_path, model_config=model_config)
+    # Fuse the LoRA adapter (if any) before anything downstream sees the model.
+    model = _apply_lora_adapter(model, adapter_path)
 
     # Try to load tokenizer from tokenizer.json directly
     tokenizer_json = model_path / "tokenizer.json"

@@ -229,6 +229,7 @@ _model_alias: str | None = None  # Short alias used to start the model (if any)
 # that intentionally want the audio routes mounted (e.g. side-car patterns
 # where the audio backend lives in a separate process the routes proxy to).
 _enable_audio_lane: bool = False
+_adapter_path: str | None = None
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
@@ -2145,6 +2146,7 @@ def load_model(
     no_openai_harmony_streaming: bool = False,
     enable_disk_stream: bool = False,
     disk_stream_cache_gb: float = 1.0,
+    adapter_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -2303,6 +2305,7 @@ def load_model(
         else:
             scheduler_config.prefill_step_size = prefill_step_size
 
+    global _adapter_path
     global \
         _engine, \
         _model_alias, \
@@ -2368,6 +2371,7 @@ def load_model(
 
         _bare_repo_has_pulled_variant = pulled_variant(model_name) is not None
     _model_config = None if _bare_repo_has_pulled_variant else _profile
+    _adapter_path = adapter_path if adapter_path is not None else getattr(_profile, "adapter_path", None)
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
 
@@ -2621,6 +2625,7 @@ def load_model(
         )
         _engine = BatchedEngine(
             model_name=_engine_model_path,
+            adapter_path=_adapter_path,
             profile_name=effective_model_alias,
             chat_template_id=(
                 _profile.chat_template_id if _profile is not None else None
@@ -2886,6 +2891,7 @@ async def _load_dynamic_resident_model(
 
         engine = BatchedEngine(
             model_name=load_path,
+            adapter_path=getattr(profile, "adapter_path", None),
             profile_name=model_name if model_name != load_path else None,
             chat_template_id=(
                 profile.chat_template_id if profile is not None else None
@@ -2995,6 +3001,7 @@ def _handoff_resident_primary_audio_worker(
 def _set_resident_primary(entry: ModelEntry | None) -> None:
     """Publish a replacement assistant as the legacy/default engine."""
 
+    global _adapter_path
     global _engine, _model_name, _model_alias, _model_path, _served_model_name_set
     global _enable_auto_tool_choice, _tool_call_parser, _tool_parser_instance
     global _reasoning_parser, _reasoning_parser_name
@@ -3017,6 +3024,7 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
         _model_name = None
         _model_alias = None
         _model_path = None
+        _adapter_path = None
         _enable_auto_tool_choice = False
         _tool_call_parser = None
         _tool_parser_instance = None
@@ -3028,6 +3036,7 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
         cfg.model_name = None
         cfg.model_alias = None
         cfg.model_path = None
+        cfg.adapter_path = None
         cfg.enable_auto_tool_choice = False
         cfg.tool_call_parser = None
         cfg.tool_parser_instance = None
@@ -3040,6 +3049,7 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
     _model_name = entry.model_name
     _model_alias = entry.model_name
     _model_path = entry.model_path
+    _adapter_path = getattr(entry.engine, "_adapter_path", None)
     # A replacement assistant has no --served-model-name override; the banner
     # must fall back to the alias, so clear the explicit-override marker.
     _served_model_name_set = False
@@ -3059,6 +3069,7 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
     cfg.model_name = entry.model_name
     cfg.model_alias = entry.model_name
     cfg.model_path = entry.model_path
+    cfg.adapter_path = _adapter_path
     cfg.enable_auto_tool_choice = _enable_auto_tool_choice
     cfg.tool_call_parser = entry.tool_call_parser
     cfg.tool_parser_instance = None
@@ -3089,6 +3100,7 @@ def _sync_config() -> None:
     cfg.model_name = _model_name
     cfg.model_alias = _model_alias
     cfg.model_path = _model_path
+    cfg.adapter_path = _adapter_path
     cfg.default_max_tokens = _default_max_tokens
     cfg.default_max_tokens_is_explicit = _default_max_tokens_is_explicit
     cfg.default_timeout = _default_timeout

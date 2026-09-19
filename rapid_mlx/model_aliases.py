@@ -185,6 +185,9 @@ def _coerce(alias: str, value: object) -> AliasProfile:
             "tool_call_parser",
             "reasoning_parser",
             "chat_template_id",
+            # Optional mlx-lm LoRA/DoRA adapter directory fused at load
+            # time (``serve --adapter-path`` default for this alias).
+            "adapter_path",
             "is_hybrid",
             # r6-A R6-C1: pin the JSON-declared is_hybrid value so the
             # runtime ArraysCache probe in
@@ -700,6 +703,15 @@ def _coerce(alias: str, value: object) -> AliasProfile:
                 f"{sorted(VALID_CHAT_TEMPLATE_IDS)}"
             )
 
+    adapter_path = value.get("adapter_path")
+    if adapter_path is not None and (
+        not isinstance(adapter_path, str) or not adapter_path.strip()
+    ):
+        raise ValueError(
+            f"alias {alias!r}: adapter_path must be a non-empty string, "
+            f"got {adapter_path!r}"
+        )
+
     return AliasProfile(
         hf_path=hf_path,
         subfolder=subfolder,
@@ -710,6 +722,7 @@ def _coerce(alias: str, value: object) -> AliasProfile:
         tool_call_parser=value.get("tool_call_parser"),
         reasoning_parser=value.get("reasoning_parser"),
         chat_template_id=chat_template_id,
+        adapter_path=adapter_path,
         is_hybrid=_strict_bool("is_hybrid", False),
         is_hybrid_explicit=_strict_bool("is_hybrid_explicit", False),
         is_moe=_strict_bool("is_moe", False),
