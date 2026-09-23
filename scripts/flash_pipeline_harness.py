@@ -349,7 +349,7 @@ def cmd_pipe(options) -> int:
         model_dir,
         group,
         context=options.context,
-        batch=2 if options.soak_minutes else 1,
+        batch=2 if options.soak_minutes or options.pairs else 1,
         prefill_step=options.prefill_step,
         starts=pipe._parse_starts(options.split),
         layer_limit=options.layer_limit,
@@ -378,6 +378,23 @@ def cmd_pipe(options) -> int:
             f"{prompt['name']}: prefill {timing['prefill_tok_s']:.1f} tok/s decode "
             f"{timing['decode_tok_s']:.2f} tok/s peak {mx.get_peak_memory() / 2**30:.2f} GiB"
         )
+    pairs = []
+    for first, second in _pairs(prompts) if options.pairs else []:
+        rows = [prompts[first], prompts[second]]
+        generated, traces, _ = _greedy_pipe(
+            stage,
+            guard,
+            [row["ids"] for row in rows],
+            options.pairs,
+            options.prefill_step,
+        )
+        pairs.append(
+            {
+                "names": [row["name"] for row in rows],
+                "tokens": generated,
+                "traces": traces if stage.is_last else None,
+            }
+        )
     summary = {
         "mode": "pipeline",
         "rank": rank,
@@ -391,6 +408,7 @@ def cmd_pipe(options) -> int:
         "memory_before": before,
         "memory_after_load": after_load,
         "memory_end": _node_snapshot(),
+        "pairs": pairs,
         "results": results
         if stage.is_last
         else [
@@ -525,6 +543,279 @@ def cmd_compare(options) -> int:
     return 0 if all(item["identical"] for item in report) else 1
 
 
+def _pairs(prompts: list[dict]) -> list[tuple[int, int]]:
+    """Every neighbouring pair, as the soak's two-request batches formed them."""
+    return [(index, (index + 1) % len(prompts)) for index in range(len(prompts))]
+
+
+def _load_truncatable(model_dir: Path, layer_limit: int | None):
+    from mlx_lm.utils import load_model
+
+    from rapid_mlx.utils.tokenizer import _register_vendored_archs
+
+    _register_vendored_archs()
+    model, _ = load_model(model_dir, lazy=True)
+    if layer_limit:
+        pipe.slice_model(model, 0, 1, 0, layer_limit)
+    return model
+
+
+def _greedy_rows_model(
+    model, rows: list[list[int]], max_tokens: int, prefill_step: int
+):
+    """Single-process greedy through ``model(...)`` itself; left-padded batch
+    caches come from mlx-lm's own ``_make_cache`` (the BatchGenerator seam)."""
+    from mlx_lm.generate import _make_cache
+
+    batch = len(rows)
+    tokens, padding = pipe._left_pad(rows, 0)
+    cache = model.make_cache() if batch == 1 else _make_cache(model, padding, None)
+    prefix = tokens[:, :-1]
+    for offset in range(0, prefix.shape[1], prefill_step):
+        model(prefix[:, offset : offset + prefill_step], cache=cache)
+        mx.eval([layer.state for layer in cache])
+    current = tokens[:, -1:]
+    generated = [[] for _ in range(batch)]
+    traces = [[] for _ in range(batch)]
+    for _ in range(max_tokens):
+        logits = model(current, cache=cache)
+        next_tokens = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.int32)
+        mx.eval(next_tokens, logits, [layer.state for layer in cache])
+        for row, token in enumerate(next_tokens.tolist()):
+            generated[row].append(token)
+            traces[row].append(_trace_row(logits[row, -1]))
+        current = next_tokens[:, None]
+    return generated, traces
+
+
+def _first_divergence(left: list[int], right: list[int]) -> int | None:
+    return next((i for i, (a, b) in enumerate(zip(left, right)) if a != b), None)
+
+
+def cmd_batchcheck(options) -> int:
+    """Single-process: does a two-request batch reproduce single requests?"""
+    model_dir = Path(options.model).expanduser()
+    prompts = _load_prompts(Path(options.prompts))
+    model = _load_truncatable(model_dir, options.layer_limit)
+    mx.eval(model.parameters())
+    singles = {}
+    for prompt in prompts:
+        tokens, traces = _greedy_rows_model(
+            model, [prompt["ids"]], options.max_tokens, options.prefill_step
+        )
+        singles[prompt["name"]] = (tokens[0], traces[0])
+    report = []
+    for first, second in _pairs(prompts):
+        rows = [prompts[first], prompts[second]]
+        tokens, traces = _greedy_rows_model(
+            model,
+            [row["ids"] for row in rows],
+            options.max_tokens,
+            options.prefill_step,
+        )
+        for row, generated, trace in zip(rows, tokens, traces):
+            single_tokens, single_trace = singles[row["name"]]
+            step = _first_divergence(single_tokens, generated)
+            entry = {
+                "pair": [prompts[first]["name"], prompts[second]["name"]],
+                "row": row["name"],
+                "matches_single": step is None,
+                "tokens": generated,
+                "trace": trace,
+            }
+            if step is not None:
+                entry.update(
+                    {
+                        "first_divergence": step,
+                        "single_margin": single_trace[step]["margin"],
+                        "batched_margin": trace[step]["margin"],
+                        "single_top2": single_trace[step]["top_ids"][:2],
+                        "batched_top2": trace[step]["top_ids"][:2],
+                        "max_abs_top1_logprob_diff_before": max(
+                            [
+                                abs(
+                                    single_trace[i]["top_logprobs"][0]
+                                    - trace[i]["top_logprobs"][0]
+                                )
+                                for i in range(step)
+                            ]
+                            or [0.0]
+                        ),
+                    }
+                )
+            report.append(entry)
+            print(
+                json.dumps(
+                    {k: v for k, v in entry.items() if k not in ("tokens", "trace")}
+                ),
+                flush=True,
+            )
+    out = Path(options.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "batchcheck.json").write_text(json.dumps(report, indent=1))
+    matched = sum(entry["matches_single"] for entry in report)
+    print(f"batched rows matching single: {matched}/{len(report)}", flush=True)
+    if options.pipe_dir:
+        ranks = sorted(
+            Path(options.pipe_dir).glob("rank*.json"), key=lambda p: int(p.stem[4:])
+        )
+        piped = json.loads(ranks[-1].read_text())["pairs"]
+        same_tokens = same_traces = total = 0
+        for index, pair in enumerate(piped):
+            for row in range(2):
+                ours = report[2 * index + row]
+                total += 1
+                same_tokens += pair["tokens"][row] == ours["tokens"]
+                same_traces += pair["traces"][row] == ours["trace"]
+        print(
+            f"pipeline batched vs single-process batched: tokens identical "
+            f"{same_tokens}/{total}, top-5 traces identical {same_traces}/{total}",
+            flush=True,
+        )
+    return 0
+
+
+def cmd_stream(options) -> int:
+    """Teacher-forced full-model reference holding one layer's weights at a time.
+
+    Replays ``Qwen4ExpTextModel.__call__`` over each prompt + the pipeline's
+    own generated tokens as one prefill, loading a layer's tensors (lazy
+    safetensors reads), running it for every sequence, then dropping it.
+    """
+    import gc
+
+    from mlx_lm.generate import _make_cache
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+
+    model_dir = Path(options.model).expanduser()
+    prompts = {p["name"]: p["ids"] for p in _load_prompts(Path(options.prompts))}
+    ranks = sorted(
+        Path(options.pipe_dir).glob("rank*.json"), key=lambda p: int(p.stem[4:])
+    )
+    source = json.loads(ranks[-1].read_text())
+    groups = [
+        {"rows": [(r["name"], r["tokens"], r["trace"])]} for r in source["results"]
+    ]
+    for pair in source.get("pairs") or []:
+        groups.append(
+            {"rows": list(zip(pair["names"], pair["tokens"], pair["traces"]))}
+        )
+
+    model = _load_truncatable(model_dir, None)
+    text = model.language_model
+    inner = text.model
+    args = text.args
+    for group in groups:
+        sequences = [prompts[name] + tokens[:-1] for name, tokens, _ in group["rows"]]
+        tokens, padding = pipe._left_pad(sequences, 0)
+        group["tokens"] = tokens
+        group["padding"] = padding
+        group["cache"] = (
+            model.make_cache()
+            if len(sequences) == 1
+            else _make_cache(model, padding, None)
+        )
+    peaks = []
+
+    def release(label: str) -> None:
+        gc.collect()
+        mx.clear_cache()
+        peaks.append((label, round(mx.get_peak_memory() / 2**30, 3)))
+        mx.reset_peak_memory()
+
+    mx.eval(inner.embed_tokens.parameters())
+    first_linear = next(i for i, layer in enumerate(inner.layers) if layer.is_linear)
+    first_attention = next(
+        i for i, layer in enumerate(inner.layers) if not layer.is_linear
+    )
+    for group in groups:
+        hidden = inner.embed_tokens(group["tokens"])
+        hidden = mx.tile(hidden, (1, 1, args.hc_count))
+        cache = group["cache"]
+        group["linear_mask"] = create_ssm_mask(hidden, cache[first_linear])
+        group["attention_mask"] = create_attention_mask(
+            hidden, cache[first_attention][0]
+        )
+        mx.eval(hidden)
+        group["hidden"] = hidden
+    del inner["embed_tokens"]
+    release("embed")
+    started = time.perf_counter()
+    for index in range(args.num_hidden_layers):
+        layer = inner.layers[index]
+        mx.eval(layer.parameters())
+        for group in groups:
+            group["hidden"] = layer(
+                group["hidden"],
+                input_ids=group["tokens"],
+                mask=group["linear_mask"]
+                if layer.is_linear
+                else group["attention_mask"],
+                cache=group["cache"][index],
+            )
+            mx.eval(group["hidden"])
+            group["cache"][index] = None
+        inner.layers[index] = None
+        del layer
+        release(f"layer{index}")
+        print(
+            f"layer {index} done, peak {peaks[-1][1]} GiB, "
+            f"{time.perf_counter() - started:.0f}s",
+            flush=True,
+        )
+    mx.eval(inner.hyper_connection_mixer.parameters(), text.lm_head.parameters())
+    report = []
+    for group in groups:
+        for row, (name, generated, trace) in enumerate(group["rows"]):
+            start = group["padding"][row] + len(prompts[name]) - 1
+            positions = mx.arange(start, start + len(generated))
+            logits = text.lm_head(
+                inner.hyper_connection_mixer(group["hidden"][row : row + 1, positions])
+            )[0]
+            mx.eval(logits)
+            exact = 0
+            worst = 0.0
+            disagreements = []
+            for step, token in enumerate(generated):
+                ours = _trace_row(logits[step])
+                row_logprobs = logits[step].astype(mx.float32)
+                row_logprobs = row_logprobs - mx.logsumexp(row_logprobs)
+                theirs = mx.array(trace[step]["top_ids"])
+                diff = mx.max(
+                    mx.abs(row_logprobs[theirs] - mx.array(trace[step]["top_logprobs"]))
+                ).item()
+                worst = max(worst, diff)
+                if ours["top_ids"][0] == token:
+                    exact += 1
+                else:
+                    disagreements.append(
+                        {
+                            "step": step,
+                            "pipeline_token": token,
+                            "stream_top2": ours["top_ids"][:2],
+                            "stream_margin": ours["margin"],
+                            "pipeline_margin": trace[step]["margin"],
+                        }
+                    )
+            entry = {
+                "row": name,
+                "batch": len(group["rows"]),
+                "argmax_matches": exact,
+                "steps": len(generated),
+                "max_abs_logprob_diff_top5": round(worst, 6),
+                "disagreements": disagreements,
+            }
+            report.append(entry)
+            print(json.dumps(entry), flush=True)
+    out = Path(options.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "stream.json").write_text(
+        json.dumps({"report": report, "peaks_gib": peaks}, indent=1)
+    )
+    print(f"max per-layer peak {max(p for _, p in peaks)} GiB", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="flash_pipeline_harness")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -553,6 +844,29 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--split")
             sub.add_argument("--soak-minutes", type=float, default=0)
             sub.add_argument("--soak-tokens", type=int, default=64)
+            sub.add_argument(
+                "--pairs",
+                type=int,
+                default=0,
+                help="also run every neighbouring prompt pair as a batch of 2",
+            )
+
+    check = commands.add_parser("batchcheck")
+    check.add_argument("--model", required=True)
+    check.add_argument("--prompts", required=True)
+    check.add_argument("--out", required=True)
+    check.add_argument("--max-tokens", type=int, default=64)
+    check.add_argument("--prefill-step", type=int, default=pipe.default_prefill_step())
+    check.add_argument("--layer-limit", type=int)
+    check.add_argument(
+        "--pipe-dir", help="pipeline run with --pairs to compare against"
+    )
+
+    stream = commands.add_parser("stream")
+    stream.add_argument("--model", required=True)
+    stream.add_argument("--prompts", required=True)
+    stream.add_argument("--pipe-dir", required=True)
+    stream.add_argument("--out", required=True)
 
     compare = commands.add_parser("compare")
     compare.add_argument("--ref", required=True)
@@ -565,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
         "ref": cmd_ref,
         "pipe": cmd_pipe,
         "compare": cmd_compare,
+        "batchcheck": cmd_batchcheck,
+        "stream": cmd_stream,
     }[options.command](options)
 
 
