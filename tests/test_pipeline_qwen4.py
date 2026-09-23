@@ -394,7 +394,19 @@ def test_node_memory_reads_the_kernel_counters():
     node = pipe.measure_node_memory()
     assert node.total_bytes > 0
     assert 0 <= node.free_percent <= 100
-    assert node.available_bytes == node.total_bytes * node.free_percent // 100
+    assert 0 < node.available_bytes <= node.total_bytes
+    vm_stat = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(vm_stat.split("page size of ")[1].split()[0])
+    pages = {
+        line.split(":")[0].strip(): int(line.split(":")[1].strip(" ."))
+        for line in vm_stat.splitlines()[1:]
+        if ":" in line and line.split(":")[1].strip(" .").isdigit()
+    }
+    # vm_stat's "Pages free" is already free - speculative.
+    expected = (
+        pages["Pages free"] + pages["File-backed pages"] + pages["Pages purgeable"]
+    ) * page
+    assert abs(node.available_bytes - expected) < 0.02 * node.total_bytes
     assert node.pressure_level in (1, 2, 4)
 
 

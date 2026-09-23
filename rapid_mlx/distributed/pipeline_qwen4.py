@@ -114,21 +114,75 @@ class NodeMemory:
         )
 
 
-def measure_node_memory() -> NodeMemory:
-    """Free memory as the kernel's memorystatus reports it.
+class _VMStatistics64(ctypes.Structure):
+    """``struct vm_statistics64`` from <mach/vm_statistics.h>."""
 
-    ``kern.memorystatus_level`` is the percentage the jetsam subsystem
-    considers free (what ``memory_pressure`` prints); unlike psutil's
-    "available" it does not count reclaimable file cache as used.
+    _fields_ = [
+        ("free_count", ctypes.c_uint32),
+        ("active_count", ctypes.c_uint32),
+        ("inactive_count", ctypes.c_uint32),
+        ("wire_count", ctypes.c_uint32),
+        ("zero_fill_count", ctypes.c_uint64),
+        ("reactivations", ctypes.c_uint64),
+        ("pageins", ctypes.c_uint64),
+        ("pageouts", ctypes.c_uint64),
+        ("faults", ctypes.c_uint64),
+        ("cow_faults", ctypes.c_uint64),
+        ("lookups", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("purges", ctypes.c_uint64),
+        ("purgeable_count", ctypes.c_uint32),
+        ("speculative_count", ctypes.c_uint32),
+        ("decompressions", ctypes.c_uint64),
+        ("compressions", ctypes.c_uint64),
+        ("swapins", ctypes.c_uint64),
+        ("swapouts", ctypes.c_uint64),
+        ("compressor_page_count", ctypes.c_uint32),
+        ("throttled_count", ctypes.c_uint32),
+        ("external_page_count", ctypes.c_uint32),
+        ("internal_page_count", ctypes.c_uint32),
+        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+    ]
+
+
+_HOST_VM_INFO64 = 4
+
+
+def _host_vm_statistics() -> _VMStatistics64:
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.mach_host_self.restype = ctypes.c_uint32
+    stats = _VMStatistics64()
+    count = ctypes.c_uint32(ctypes.sizeof(stats) // ctypes.sizeof(ctypes.c_int32))
+    result = libc.host_statistics64(
+        libc.mach_host_self(), _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)
+    )
+    if result != 0:
+        raise OSError(f"host_statistics64 returned kern_return_t {result}")
+    return stats
+
+
+def measure_node_memory() -> NodeMemory:
+    """Memory a new allocation can take without pushing anything to swap.
+
+    (free - speculative) + file-backed + purgeable pages, from
+    host_statistics64: truly-free pages plus file cache and purgeable memory
+    the kernel reclaims on demand.  The same measure goose-sidecar's
+    memory.rs uses.  Neither psutil/sysinfo "available" (counts file cache as
+    used: read 0 GB on a machine 88% free) nor ``kern.memorystatus_level``
+    (stayed at 46-47% while the real figure moved 41.4 -> 28.0 GiB, measured
+    by goose-sidecar 2026-09-23).
     """
     total = _sysctl_int("hw.memsize")
-    level = _sysctl_int("kern.memorystatus_level")
-    pressure = _sysctl_int("kern.memorystatus_vm_pressure_level")
+    page = _sysctl_int("hw.pagesize")
+    stats = _host_vm_statistics()
+    truly_free = max(0, stats.free_count - stats.speculative_count)
+    pages = truly_free + stats.external_page_count + stats.purgeable_count
+    available = min(total, pages * page)
     return NodeMemory(
         total_bytes=total,
-        available_bytes=total * level // 100,
-        free_percent=level,
-        pressure_level=pressure,
+        available_bytes=available,
+        free_percent=round(100 * available / total),
+        pressure_level=_sysctl_int("kern.memorystatus_vm_pressure_level"),
     )
 
 
