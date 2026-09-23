@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import dataclasses
 import inspect
 import json
 import os
@@ -907,6 +908,28 @@ def _gather_node_budgets(node: NodeMemory, ckpt_total: int, group: Any):
     ]
 
 
+def truncate_layers(
+    args: TextModelArgs, ckpt: CheckpointBytes, layer_limit: int
+) -> tuple[TextModelArgs, CheckpointBytes]:
+    """The first ``layer_limit`` decoder layers plus the embedding and head.
+
+    A verification device only: the truncated network is not the model, but
+    its single-process and split forwards must agree exactly, which lets real
+    weights prove the split on a machine that cannot hold all of them.
+    """
+    if not 0 < layer_limit <= args.num_hidden_layers:
+        raise ValueError(
+            f"layer_limit {layer_limit} outside 1..{args.num_hidden_layers}"
+        )
+    kept = dataclasses.replace(
+        args,
+        num_hidden_layers=layer_limit,
+        layer_types=list(args.layer_types[:layer_limit]),
+        ple_layer_ids=[i for i in args.ple_layer_ids if i <= layer_limit],
+    )
+    return kept, dataclasses.replace(ckpt, layer_bytes=ckpt.layer_bytes[:layer_limit])
+
+
 def load_stage(
     model_dir: Path,
     group: Any,
@@ -915,6 +938,7 @@ def load_stage(
     batch: int,
     prefill_step: int | None = None,
     starts: list[int] | None = None,
+    layer_limit: int | None = None,
     log=print,
 ) -> tuple[PipelineStage, PipelinePlan, MemoryGuard]:
     from mlx_lm.utils import load_model
@@ -923,6 +947,8 @@ def load_stage(
 
     args = load_text_args(model_dir)
     ckpt = read_checkpoint_bytes(model_dir, args.num_hidden_layers)
+    if layer_limit is not None:
+        args, ckpt = truncate_layers(args, ckpt, layer_limit)
     node = measure_node_memory()
     nodes = _gather_node_budgets(node, ckpt.text_bytes, group)
     step = prefill_step or default_prefill_step()

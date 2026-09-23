@@ -194,6 +194,8 @@ def cmd_ref(options) -> int:
     before = _node_snapshot()
     args = pipe.load_text_args(model_dir)
     ckpt = pipe.read_checkpoint_bytes(model_dir, args.num_hidden_layers)
+    if options.layer_limit:
+        args, ckpt = pipe.truncate_layers(args, ckpt, options.layer_limit)
     node = pipe.measure_node_memory()
     one = [pipe.NodeBudget("single", node.total_bytes, node.budget_bytes, "measured")]
     plan = pipe.plan_pipeline(
@@ -218,7 +220,17 @@ def cmd_ref(options) -> int:
     # working set (mllm_batch_generator.py); the reference does the same.
     mx.set_wired_limit(int(mx.device_info()["max_recommended_working_set_size"]))
     load_start = time.perf_counter()
-    model, tokenizer = load_model_with_fallback(str(model_dir))
+    if options.layer_limit:
+        from mlx_lm.utils import load_model, load_tokenizer
+
+        from rapid_mlx.utils.tokenizer import _register_vendored_archs
+
+        _register_vendored_archs()
+        model, _ = load_model(model_dir, lazy=True)
+        pipe.slice_model(model, 0, 1, 0, options.layer_limit)
+        tokenizer = load_tokenizer(model_dir)
+    else:
+        model, tokenizer = load_model_with_fallback(str(model_dir))
     mx.eval(model.parameters())
     load_s = time.perf_counter() - load_start
     after_load = _node_snapshot()
@@ -340,6 +352,7 @@ def cmd_pipe(options) -> int:
         batch=2 if options.soak_minutes else 1,
         prefill_step=options.prefill_step,
         starts=pipe._parse_starts(options.split),
+        layer_limit=options.layer_limit,
         log=log,
     )
     load_s = time.perf_counter() - load_start
@@ -530,6 +543,11 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--context", type=int, default=8192)
         sub.add_argument(
             "--prefill-step", type=int, default=pipe.default_prefill_step()
+        )
+        sub.add_argument(
+            "--layer-limit",
+            type=int,
+            help="verification only: first N decoder layers + embed + head",
         )
         if name == "pipe":
             sub.add_argument("--split")
