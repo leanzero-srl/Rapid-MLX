@@ -1550,6 +1550,9 @@ class StreamOptions(BaseModel):
         return v
 
 
+REQUEST_EXTENSIONS: tuple[str, ...] = ("rapid_mlx_transient_tail",)
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -1652,6 +1655,13 @@ class ChatCompletionRequest(BaseModel):
     # keys are passed through for model-specific template variables. See
     # ``_resolve_enable_thinking`` in service/helpers.py for precedence.
     chat_template_kwargs: dict | None = None
+    # LeanZero fork extension (advertised in ``ModelInfo.request_extensions``):
+    # the exact trailing text of the LAST user message that changes on every
+    # request (e.g. an agent's per-turn clock/budget block). The prompt is
+    # rendered unchanged; a non-trimmable (hybrid) cache snapshots its message
+    # boundary BEFORE this text, so the next request — which drops it and
+    # appends new turns — reuses the whole stable prefix. None = upstream.
+    rapid_mlx_transient_tail: str | None = None
     # reasoning_max_tokens — caps the THINKING portion only (tokens inside
     # ``<think>...</think>``); the model then answers. Does NOT bound the
     # answer — pair with ``max_tokens`` for total length. None = no reasoning
@@ -2626,6 +2636,11 @@ class ModelInfo(BaseModel):
     # lie the desktop happily believed. Empty list (rather than
     # ``None``) means "we've thought about it; nothing applies".
     capabilities: list[str] = Field(default_factory=list)
+    # LeanZero fork: non-OpenAI request fields this server honours, so a
+    # client sends one only after the server declared it (never on a guess).
+    request_extensions: list[str] = Field(
+        default_factory=lambda: list(REQUEST_EXTENSIONS)
+    )
     # F-K-CAPABILITIES-OMIT-AUDIO: per-lane audio backend status
     # surfaced when the deep audio probe has been run
     # (``RAPID_MLX_AUDIO_DEEP_PROBE=1``). ``None`` means the deep

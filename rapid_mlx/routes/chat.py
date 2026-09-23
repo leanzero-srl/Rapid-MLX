@@ -4847,6 +4847,12 @@ async def _create_chat_completion_impl(
     if isinstance(ctk, dict) and ctk:
         chat_kwargs["chat_template_kwargs"] = ctk
 
+    # LeanZero fork: a client-marked volatile tail moves only the hybrid
+    # cache's boundary snapshot (engine ``_stable_messages_before_transient_tail``);
+    # absent, the kwargs are exactly upstream's.
+    if request.rapid_mlx_transient_tail:
+        chat_kwargs["transient_tail"] = request.rapid_mlx_transient_tail
+
     # Context-length pre-check (DoS defense + UX, rapid-desktop#273 / #463).
     # See ``service/helpers.py::enforce_context_length_for_messages`` for
     # the rationale (8 MiB body still holds ~2M tokens → context window

@@ -3372,6 +3372,9 @@ class BatchedEngine(BaseEngine):
         messages, transient_message_start = self._prepare_cache_stable_messages(
             messages
         )
+        stable_messages = self._stable_messages_before_transient_tail(
+            messages, transient_message_start, kwargs.pop("transient_tail", None)
+        )
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
@@ -3454,7 +3457,16 @@ class BatchedEngine(BaseEngine):
         # PR #435 was built to fix. Gating on ``is_hybrid`` keeps the fix
         # active where it's needed and inert where it broke things.
         if self._needs_prefix_boundary_snapshot():
-            if transient_message_start is None:
+            if stable_messages is not None:
+                prefix_boundary = self._compute_prefix_boundary(
+                    messages,
+                    tools,
+                    stable_messages=stable_messages,
+                    generation_prompt=prompt,
+                    enable_thinking=enable_thinking,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+            elif transient_message_start is None:
                 prefix_boundary = self._compute_prefix_boundary(
                     messages,
                     tools,
@@ -3543,6 +3555,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         *,
         transient_message_start: int | None = None,
+        stable_messages: list[dict[str, Any]] | None = None,
         generation_prompt: str | list[int] | None = None,
         enable_thinking: bool | None = None,
         chat_template_kwargs: dict | None = None,
@@ -3558,6 +3571,12 @@ class BatchedEngine(BaseEngine):
         Some third-party templates do not make the no-generation rendering a
         strict prefix of the generation rendering.  For those, retain the
         historical dummy-last-user LCP boundary as a conservative fallback.
+
+        ``stable_messages`` (LeanZero fork) is the message list the client's
+        NEXT request is known to begin with — the current messages minus a
+        client-marked volatile tail (``_stable_messages_before_transient_tail``).
+        It takes the same LCP-against-a-future-probe path as server-side
+        transient priming.
         """
         # Find index of last user message
         last_user_idx = None
@@ -3593,10 +3612,15 @@ class BatchedEngine(BaseEngine):
                 else tokenizer.encode(real_prompt)
             )
 
-            if transient_message_start is not None:
+            if transient_message_start is not None or stable_messages is not None:
+                prefix_messages = (
+                    stable_messages
+                    if stable_messages is not None
+                    else messages[:transient_message_start]
+                )
                 future_prompt = self._apply_chat_template(
                     [
-                        *messages[:transient_message_start],
+                        *prefix_messages,
                         {
                             "role": "assistant",
                             "content": "__rapid_mlx_boundary_probe__",
@@ -3685,6 +3709,51 @@ class BatchedEngine(BaseEngine):
             return max(0, boundary - _PREFIX_BOUNDARY_REPLAY_TOKENS)
         except Exception:
             return 0
+
+    @staticmethod
+    def _stable_messages_before_transient_tail(
+        messages: list[dict[str, Any]],
+        transient_message_start: int | None,
+        transient_tail: str | None,
+    ) -> list[dict[str, Any]] | None:
+        """The stable message prefix left once a client-marked volatile tail is removed.
+
+        LeanZero fork, request field ``rapid_mlx_transient_tail``: the client
+        names the exact trailing text of its LAST user message that changes on
+        every request (an agent's per-turn clock/budget block). The prompt
+        submitted is unchanged; only the non-trimmable-cache boundary snapshot
+        moves to before that text, so the next request — which drops this tail
+        and appends new turns — finds an exact-prefix entry.
+
+        Returns ``None`` (upstream boundary behaviour) when no tail was sent.
+        A tail that is not the exact suffix of the last user message's string
+        content is logged and ignored rather than guessed at.
+        """
+        if not transient_tail:
+            return None
+        limit = (
+            len(messages)
+            if transient_message_start is None
+            else transient_message_start
+        )
+        index = next(
+            (i for i in range(limit - 1, -1, -1) if messages[i].get("role") == "user"),
+            None,
+        )
+        content = messages[index].get("content") if index is not None else None
+        if not isinstance(content, str) or not content.endswith(transient_tail):
+            logger.warning(
+                "[prefix_boundary] rapid_mlx_transient_tail ignored: it is not the "
+                "exact suffix of the last user message's text (tail %d chars, "
+                "last user message %s)",
+                len(transient_tail),
+                "absent" if index is None else f"#{index}",
+            )
+            return None
+        stable_content = content[: len(content) - len(transient_tail)]
+        if stable_content == "":
+            return list(messages[:index])
+        return [*messages[:index], {**messages[index], "content": stable_content}]
 
     @staticmethod
     def _prepare_cache_stable_messages(
@@ -4160,6 +4229,9 @@ class BatchedEngine(BaseEngine):
         messages, transient_message_start = self._prepare_cache_stable_messages(
             messages
         )
+        stable_messages = self._stable_messages_before_transient_tail(
+            messages, transient_message_start, kwargs.pop("transient_tail", None)
+        )
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
@@ -4211,7 +4283,16 @@ class BatchedEngine(BaseEngine):
         # must apply the same gating condition so a future change can't
         # silently regress one path while keeping the other green.
         if self._needs_prefix_boundary_snapshot():
-            if transient_message_start is None:
+            if stable_messages is not None:
+                prefix_boundary = self._compute_prefix_boundary(
+                    messages,
+                    tools,
+                    stable_messages=stable_messages,
+                    generation_prompt=prompt,
+                    enable_thinking=enable_thinking,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+            elif transient_message_start is None:
                 prefix_boundary = self._compute_prefix_boundary(
                     messages,
                     tools,
