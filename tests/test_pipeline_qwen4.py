@@ -164,7 +164,12 @@ def tiny_checkpoint(tmp_path_factory) -> Path:
     return path
 
 
-def _reference(model_dir: Path, prompts: list[list[int]], max_tokens: int):
+def _reference(
+    model_dir: Path,
+    prompts: list[list[int]],
+    max_tokens: int,
+    prefill_step: int | None = None,
+):
     """The fork's own single-process forward, mlx-lm's generate_step shape."""
     _register_vendored_archs()
     model, _ = load_model(model_dir)
@@ -181,8 +186,11 @@ def _reference(model_dir: Path, prompts: list[list[int]], max_tokens: int):
     mx.eval(logits)
 
     cache = fresh_cache()
-    model(tokens[:, :-1], cache=cache)
-    mx.eval([layer.state for layer in cache])
+    prefix = tokens[:, :-1]
+    step_size = prefill_step or prefix.shape[1]
+    for offset in range(0, prefix.shape[1], step_size):
+        model(prefix[:, offset : offset + step_size], cache=cache)
+        mx.eval([layer.state for layer in cache])
     current = tokens[:, -1:]
     generated = []
     for _ in range(max_tokens):
@@ -406,22 +414,33 @@ def test_slice_drops_unowned_modules(tiny_checkpoint):
 
 
 @pytest.mark.parametrize(
-    ("ranks", "split", "prompts"),
+    ("ranks", "split", "prompts", "prefill_step"),
     [
-        (2, None, PROMPTS),  # the planner's own split for this machine's budget
-        (2, "1", PROMPTS),  # the PLE n-gram layer and its caches live on rank 1
-        (2, "3", PROMPTS),  # rank 1 opens on a QSA layer
-        (2, "3", SHORT_PROMPTS),  # dense masked attention, then sparse in decode
-        (3, "2,5", PROMPTS),  # a middle rank that receives and forwards
+        (2, None, PROMPTS, None),  # the planner's own split for this budget
+        (2, "1", PROMPTS, None),  # the PLE n-gram layer and caches on rank 1
+        (2, "3", PROMPTS, None),  # rank 1 opens on a QSA layer
+        (2, "3", SHORT_PROMPTS, None),  # dense masked attention, sparse in decode
+        (2, "3", PROMPTS, 8),  # chunked prefill, as long real prompts run
+        (3, "2,5", PROMPTS, None),  # a middle rank that receives and forwards
     ],
-    ids=["planned", "ple-on-rank1", "qsa-first", "short-dense", "three-ranks"],
+    ids=[
+        "planned",
+        "ple-on-rank1",
+        "qsa-first",
+        "short-dense",
+        "chunked-prefill",
+        "three-ranks",
+    ],
 )
 def test_pipeline_matches_single_process(
-    tiny_checkpoint, tmp_path, ranks, split, prompts
+    tiny_checkpoint, tmp_path, ranks, split, prompts, prefill_step
 ):
-    ref_logits, ref_tokens = _reference(tiny_checkpoint, prompts, DECODE_TOKENS)
+    ref_logits, ref_tokens = _reference(
+        tiny_checkpoint, prompts, DECODE_TOKENS, prefill_step
+    )
     dump = tmp_path / "pipeline.npz"
-    stdout = _launch(tiny_checkpoint, ranks, split, dump, prompts).stdout
+    extra = () if prefill_step is None else ("--prefill-step", str(prefill_step))
+    stdout = _launch(tiny_checkpoint, ranks, split, dump, prompts, extra).stdout
     result = np.load(dump)
     padding = [max(map(len, prompts)) - len(p) for p in prompts]
     diffs = [
