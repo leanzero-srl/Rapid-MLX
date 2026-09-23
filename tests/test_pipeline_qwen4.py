@@ -227,7 +227,15 @@ def _free_port_block(count: int) -> int:
     raise RuntimeError("no free consecutive port block on 127.0.0.1")
 
 
-def _launch(model_dir: Path, ranks: int, split: str | None, dump: Path, prompts):
+def _launch(
+    model_dir: Path,
+    ranks: int,
+    split: str | None,
+    dump: Path,
+    prompts,
+    extra: tuple[str, ...] = (),
+    expect_dump: bool = True,
+):
     launcher = Path(sys.executable).parent / "mlx.launch"
     if not launcher.exists():
         pytest.skip("mlx.launch is not installed next to this interpreter")
@@ -259,14 +267,16 @@ def _launch(model_dir: Path, ranks: int, split: str | None, dump: Path, prompts)
     ]
     if split:
         command += ["--split", split]
+    command += list(extra)
     # A hang guard for the test harness only; the engine itself has no clock.
     completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
     # mlx.launch can exit 0 after a rank died (measured: a rank's bind error
     # still returned 0), so the dump itself is the proof the run completed.
-    assert completed.returncode == 0 and dump.exists(), (
-        completed.stdout + completed.stderr
-    )
-    return completed.stdout
+    if expect_dump:
+        assert completed.returncode == 0 and dump.exists(), (
+            completed.stdout + completed.stderr
+        )
+    return completed
 
 
 def test_checkpoint_bytes_match_loaded_parameters(tiny_checkpoint):
@@ -411,7 +421,7 @@ def test_pipeline_matches_single_process(
 ):
     ref_logits, ref_tokens = _reference(tiny_checkpoint, prompts, DECODE_TOKENS)
     dump = tmp_path / "pipeline.npz"
-    stdout = _launch(tiny_checkpoint, ranks, split, dump, prompts)
+    stdout = _launch(tiny_checkpoint, ranks, split, dump, prompts).stdout
     result = np.load(dump)
     padding = [max(map(len, prompts)) - len(p) for p in prompts]
     diffs = [
@@ -424,3 +434,25 @@ def test_pipeline_matches_single_process(
     assert result["tokens"].shape == (len(prompts), DECODE_TOKENS)
     if split:
         assert result["starts"].tolist() == [0, *map(int, split.split(","))]
+
+
+def test_memory_guard_trip_stops_every_rank_on_the_same_step(tiny_checkpoint, tmp_path):
+    dump = tmp_path / "never.npz"
+    completed = _launch(
+        tiny_checkpoint,
+        2,
+        "4",
+        dump,
+        PROMPTS,
+        extra=("--guard-limit-gib", "0"),
+        expect_dump=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert not dump.exists()
+    # The trip rides the step's all_sum, so every rank raises the guard's own
+    # error instead of one rank dying and the other blocking in recv/all_sum
+    # (a hang would hit the harness timeout). mlx.launch exits 0 here too.
+    stops = [
+        line for line in output.splitlines() if "PipelineMemoryStopError: rank" in line
+    ]
+    assert stops and all("MLX active memory" in line for line in stops), output

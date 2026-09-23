@@ -981,6 +981,10 @@ def _cmd_run(options) -> int:
         starts=_parse_starts(options.split),
         log=lambda line: print(line, flush=True),
     )
+    if options.guard_limit_gib is not None:
+        guard.budget_bytes = min(
+            guard.budget_bytes, int(options.guard_limit_gib * 2**30)
+        )
     eos_ids: tuple[int, ...] = ()
     if tokenizer is not None and not options.ignore_eos:
         eos_ids = tuple(tokenizer.eos_token_ids)
@@ -1039,6 +1043,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--split")
     run.add_argument("--ignore-eos", action="store_true")
     run.add_argument("--dump", help="last rank writes prefill logits + tokens (npz)")
+    run.add_argument(
+        "--guard-limit-gib",
+        type=float,
+        help="lower the per-step memory stop threshold (it can never be raised)",
+    )
 
     options = parser.parse_args(argv)
     if options.command == "plan":
