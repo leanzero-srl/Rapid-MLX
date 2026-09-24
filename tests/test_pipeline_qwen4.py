@@ -385,7 +385,7 @@ def test_guardrails_are_ratios_of_this_node(monkeypatch):
     assert calls["memory"] == int(total * pipe.MEMORY_LIMIT_RATIO)
     assert calls["wired"] == int(total * pipe.WIRED_LIMIT_RATIO)
     assert calls["cache"] == calls["memory"] - 10 * 2**30
-    assert limits["budget"] == int(total // 2 * pipe.AVAILABLE_HEADROOM_RATIO)
+    assert limits["budget"] == total // 2 - int(total * pipe.PRESSURE_FLOOR_RATIO)
     with pytest.raises(pipe.PipelineDoesNotFitError, match="budget"):
         pipe.apply_memory_guardrails(node, total)
 
@@ -487,3 +487,51 @@ def test_memory_guard_trip_stops_every_rank_on_the_same_step(tiny_checkpoint, tm
         line for line in output.splitlines() if "PipelineMemoryStopError: rank" in line
     ]
     assert stops and all("MLX active memory" in line for line in stops), output
+
+
+_SLOW_PEER = """
+import sys, time
+import mlx.core as mx
+from rapid_mlx.distributed.pipeline_qwen4 import receive_stream
+group = mx.distributed.init(strict=True)
+if group.rank() == 0:
+    x = mx.ones((1, 64, 1024), dtype=mx.bfloat16)
+    mx.eval(x)
+    time.sleep(float(sys.argv[1]))
+    mx.eval(mx.distributed.send(x, 1, group=group))
+else:
+    hidden = receive_stream((1, 64, 1024), mx.bfloat16, 0, group)
+    total = (hidden @ mx.ones((1024, 1024), dtype=mx.bfloat16)).sum()
+    mx.eval(total)
+    print("RECEIVED", total.item(), flush=True)
+"""
+
+
+def test_a_slow_upstream_rank_cannot_trip_the_gpu_watchdog(tmp_path):
+    """Upstream takes longer than the Metal watchdog (6 s fails a fused recv)."""
+    script = tmp_path / "slow_peer.py"
+    script.write_text(_SLOW_PEER)
+    launcher = Path(sys.executable).parent / "mlx.launch"
+    completed = subprocess.run(
+        [
+            str(launcher),
+            "--backend",
+            "ring",
+            "-n",
+            "2",
+            "--hosts",
+            "127.0.0.1",
+            "--starting-port",
+            str(_free_port_block(2)),
+            "--",
+            sys.executable,
+            str(script),
+            "8",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    output = completed.stdout + completed.stderr
+    assert "RECEIVED 67108864.0" in output, output
+    assert "Timeout" not in output, output

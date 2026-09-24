@@ -55,9 +55,12 @@ MEMORY_LIMIT_RATIO = 0.75
 # ratio: the same MTPLX receipt measured 60% of RAM as the safe wired ceiling;
 # exo's unbounded wiring is what panicked the 96 GB M3 Ultra.
 WIRED_LIMIT_RATIO = 0.60
-# ratio: policy, not yet measured — 10% of the memory the kernel reports as
-# free stays free for the OS and for transients the workspace model misses.
-AVAILABLE_HEADROOM_RATIO = 0.90
+# ratio: the share of RAM that must stay available (host_statistics64) after
+# a rank loads.  Measured 2026-09-24 on the real model: the M4 Max 128 GB went
+# to vm pressure WARN at 19.4 GiB available (15%) — and its peer died — while
+# it stayed normal down to 27.3 GiB (21%); the M3 Ultra 96 GB stayed normal at
+# 21.0 GiB (22%).  The lowest share measured normal is the floor.
+PRESSURE_FLOOR_RATIO = 0.21
 # Inside DecoderLayer._combine the incoming stream, the residual copy and the
 # combined output are alive together: three stream-width buffers.
 STREAM_LIVE_BUFFERS = 3
@@ -109,9 +112,12 @@ class NodeMemory:
 
     @property
     def budget_bytes(self) -> int:
-        return min(
-            int(self.available_bytes * AVAILABLE_HEADROOM_RATIO),
-            int(self.total_bytes * MEMORY_LIMIT_RATIO),
+        return max(
+            0,
+            min(
+                self.available_bytes - int(self.total_bytes * PRESSURE_FLOOR_RATIO),
+                int(self.total_bytes * MEMORY_LIMIT_RATIO),
+            ),
         )
 
 
@@ -664,6 +670,21 @@ class MemoryGuard:
 # ---------------------------------------------------------------------------
 
 
+def receive_stream(shape, dtype, src: int, group: Any) -> mx.array:
+    """Receive and land the stream BEFORE any GPU work depends on it.
+
+    A lazy recv fused into the first layer's graph makes a Metal command
+    buffer wait on the transfer's event; if the upstream rank needs more than
+    the macOS GPU watchdog allows (measured: 3 s passes, 6 s fails with
+    kIOGPUCommandBufferCallbackErrorTimeout) the downstream rank dies.  That
+    killed rank 1 on the real model when rank 0 ran under memory pressure.
+    Waiting on the host instead has no such limit.
+    """
+    hidden = mx.distributed.recv(shape, dtype, src, group=group)
+    mx.eval(hidden)
+    return hidden
+
+
 def slice_model(model: Model, rank: int, size: int, start: int, end: int) -> None:
     """Drop every module this rank does not own (before weights materialize)."""
     text = model.language_model
@@ -729,11 +750,11 @@ class PipelineStage:
             hidden = inner.embed_tokens(inputs)
             hidden = mx.tile(hidden, (1, 1, self.args.hc_count))
         else:
-            hidden = mx.distributed.recv(
+            hidden = receive_stream(
                 (batch, length, self.args.hc_count * self.args.hidden_size),
                 self.wire_dtype,
                 self.rank - 1,
-                group=self.group,
+                self.group,
             )
         layers = inner.layers
         linear_index = next(
