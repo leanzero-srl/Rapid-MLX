@@ -36,6 +36,7 @@ import math
 import os
 import queue
 import signal
+import socket
 import sys
 import threading
 import time
@@ -732,7 +733,7 @@ def _run_jobs(
             job.push(("done", "length"))
 
 
-def _rank0_loop(stage, guard, state: _State, prefill_step: int) -> None:
+def _rank0_loop(stage, guard, state: _State, prefill_step: int, wake: _Wake) -> None:
     group = stage.group
     while True:
         if state.held is not None:
@@ -740,6 +741,7 @@ def _rank0_loop(stage, guard, state: _State, prefill_step: int) -> None:
         else:
             first = state.jobs.get()
         if first is None:
+            wake.ring()
             _broadcast_batch(group, None, state.max_batch)
             return
         if first.cancelled:
@@ -767,14 +769,76 @@ def _rank0_loop(stage, guard, state: _State, prefill_step: int) -> None:
             lengths = candidate
         state.active = batch
         state.reserved = state.kv.reserve(lengths) if state.kv is not None else []
+        wake.ring()
         _broadcast_batch(group, [job.row for job in batch], state.max_batch)
         _run_jobs(stage, guard, state, batch, prefill_step)
         state.active = []
         state.reserved = []
 
 
-def _worker_loop(stage, guard, max_batch: int, prefill_step: int) -> None:
+def _rank0_host() -> str:
+    """Rank 0's address as the launcher told every rank (JACCL coordinator or ring host 0)."""
+    coordinator = os.environ.get("MLX_JACCL_COORDINATOR")
+    if coordinator:
+        return coordinator.rsplit(":", 1)[0]
+    hostfile = os.environ.get("MLX_HOSTFILE")
+    if hostfile:
+        text = Path(hostfile).read_text() if Path(hostfile).is_file() else hostfile
+        return json.loads(text)[0][0].rsplit(":", 1)[0]
+    raise RuntimeError(
+        "no MLX_JACCL_COORDINATOR or MLX_HOSTFILE: rank 0's address is unknown"
+    )
+
+
+class _Wake:
+    """A kernel-blocking doorbell in front of every batch command.
+
+    Waiting for the next batch inside the header ``all_sum`` busy-polls the
+    transport: an idle worker rank burned a full core (measured over JACCL on
+    the M3 Ultra: 60.2 CPU-s in 60 s idle).  Rank 0 now rings one byte per
+    worker over a plain TCP socket right before it issues the collective, and
+    each worker parks in ``recv`` — no clock, no polling.  A closed socket
+    (rank 0 gone) ends the worker.
+    """
+
+    def __init__(self, group):
+        self.rank = group.rank()
+        self.peers: list[socket.socket] = []
+        self.link: socket.socket | None = None
+        if group.size() == 1:
+            return
+        host = _rank0_host()
+        if self.rank == 0:
+            server = socket.create_server((host, 0))
+            port = server.getsockname()[1]
+        else:
+            server, port = None, 0
+        agreed = mx.distributed.all_sum(mx.array([port], dtype=mx.int32), group=group)
+        port = int(agreed.item())
+        if self.rank == 0:
+            for _ in range(group.size() - 1):
+                peer, _ = server.accept()
+                peer.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.peers.append(peer)
+            server.close()
+        else:
+            self.link = socket.create_connection((host, port))
+            self.link.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def ring(self) -> None:
+        for peer in self.peers:
+            peer.sendall(b"\x01")
+
+    def wait(self) -> bool:
+        if self.link is None:
+            return True
+        return self.link.recv(1) == b"\x01"
+
+
+def _worker_loop(stage, guard, max_batch: int, prefill_step: int, wake: _Wake) -> None:
     while True:
+        if not wake.wait():
+            return
         rows = _broadcast_batch(stage.group, None, max_batch)
         if rows is None:
             return
@@ -808,6 +872,7 @@ def serve(options, emit=None) -> int:
     # is advertised: a readiness probe that succeeds means a request can run.
     warm = [_Row(ids=[0] * 8, max_tokens=2, temperature=0.0, top_p=1.0)]
     run_batch(stage, guard, warm, prefill_step)
+    wake = _Wake(group)
     context = options.context or plan.context
     if not stage.is_first:
         emit(
@@ -818,7 +883,7 @@ def serve(options, emit=None) -> int:
                 "layers": [stage.start, stage.end],
             },
         )
-        _worker_loop(stage, guard, options.max_batch, prefill_step)
+        _worker_loop(stage, guard, options.max_batch, prefill_step, wake)
         return 0
 
     from mlx_lm.utils import load_tokenizer
@@ -877,7 +942,7 @@ def serve(options, emit=None) -> int:
         },
     )
     try:
-        _rank0_loop(stage, guard, state, prefill_step)
+        _rank0_loop(stage, guard, state, prefill_step, wake)
     finally:
         server.should_exit = True
     return 0
