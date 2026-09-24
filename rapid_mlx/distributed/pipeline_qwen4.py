@@ -384,6 +384,11 @@ class StagePlan:
 
     @property
     def utilization(self) -> float:
+        # A node already below its pressure floor has no budget at all: every
+        # split that gives it layers is infinitely over, and the plan still
+        # prints (and refuses) with the numbers instead of crashing.
+        if self.node.budget_bytes <= 0:
+            return float("inf")
         return self.total_bytes / self.node.budget_bytes
 
 
@@ -475,8 +480,6 @@ def _balanced_starts(args, ckpt, nodes, context, batch, prefill_step) -> list[in
     for rank in range(1, size):
         for end in range(rank + 1, layers + 1):
             for start in range(rank, end):
-                if best[rank - 1][start] == inf:
-                    continue
                 cost = _stage_plan(
                     args,
                     ckpt,
@@ -490,7 +493,10 @@ def _balanced_starts(args, ckpt, nodes, context, batch, prefill_step) -> list[in
                     prefill_step,
                 ).utilization
                 worst = max(best[rank - 1][start], cost)
-                if worst < best[rank][end]:
+                # choice 0 is never a legal start for rank >= 1: it marks
+                # "unset", so an all-infinite row (a node below its pressure
+                # floor) still yields a split to print and refuse.
+                if worst < best[rank][end] or choice[rank][end] == 0:
                     best[rank][end] = worst
                     choice[rank][end] = start
     starts = [0] * size

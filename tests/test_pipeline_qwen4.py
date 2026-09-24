@@ -535,3 +535,18 @@ def test_a_slow_upstream_rank_cannot_trip_the_gpu_watchdog(tmp_path):
     output = completed.stdout + completed.stderr
     assert "RECEIVED 67108864.0" in output, output
     assert "Timeout" not in output, output
+
+
+def test_a_node_below_its_pressure_floor_refuses_instead_of_crashing(tiny_checkpoint):
+    args = pipe.load_text_args(tiny_checkpoint)
+    ckpt = pipe.read_checkpoint_bytes(tiny_checkpoint, args.num_hidden_layers)
+    starved = pipe.NodeMemory(96 * 2**30, 10 * 2**30, 10, 2)
+    assert starved.budget_bytes == 0
+    nodes = [
+        pipe.NodeBudget("big", 2**36, 2**35, "test"),
+        pipe.NodeBudget("starved", starved.total_bytes, starved.budget_bytes, "test"),
+    ]
+    plan = pipe.plan_pipeline(args, ckpt, nodes, context=256, batch=1, prefill_step=256)
+    assert not plan.stages[1].total_bytes <= plan.stages[1].node.budget_bytes
+    assert "DOES NOT FIT" in pipe.format_plan(plan)
+    assert pipe.plan_json(plan, pipe.wire_bytes_per_token(args, 2, 2))["fits"] is False
