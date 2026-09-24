@@ -57,16 +57,16 @@ from ..models.qwen4_exp_cache import QSAIndexCache  # noqa: E402
 # measured node always carries Metal's own ceiling instead (NodeMemory).
 MEMORY_LIMIT_RATIO = 0.75
 # measured: the share of RAM that stays available (host_statistics64) under a
-# rank's full budget.  2026-09-24, M3 Ultra 96 GB after a compaction
-# (``memory_pressure -l warn``, incompressible pages): the kernel raised vm
-# pressure WARN at 3.73 GiB available = 3.9% of RAM.  goose's watchdog closes
-# admission at 5% of RAM (WATCHDOG_WARN_RESERVE_RATIO) and the ranks' own
-# re-measure at load read up to 0.6% of RAM below goose's preflight (goose
-# DERIVED_CONTEXT_MARGIN_RATIO carries 2% for it): 5% + 2% = 7%, so a stage
-# planned at 100% of its budget leaves the node above goose's WARN reserve and
-# the kernel's measured WARN point.  It replaced the 21% floor, which was the
-# lowest share seen NORMAL under a load — not where WARN starts.
-AVAILABLE_MARGIN_RATIO = 0.07
+# rank's full budget = the highest kernel-WARN point measured + the load drift.
+# 2026-09-24, goose's compaction (memory_pressure -l warn, incompressible pages)
+# reached kernel WARN at 9.3 GiB available on the M4 Max 128 GB (7.3% of RAM)
+# and at 3.3-4.0 GiB on the M3 Ultra 96 GB (3.4-4.2%); the ranks' re-measure at
+# load reads up to 0.6% of RAM below goose's preflight (goose carries 2%):
+# 7.3% + 2% = 9.3%.  The first loosening (7%, from the M3 Ultra alone) sat BELOW
+# the M4 Max's WARN point, and a live Flash split planned rank 0 at 96% of it
+# served under kernel WARN (7.1 GiB available) — backed off to this.  It
+# replaced the 21% floor ("lowest share seen NORMAL", not where WARN starts).
+AVAILABLE_MARGIN_RATIO = 0.093
 # measured: one decoder layer's forward peaks at 49x the chunk's HC-stream
 # bytes above its resident weights — 1.96 GiB (GDN) / 1.94 GiB (QSA) for a
 # 2,101-token chunk of the real 4-bit checkpoint, 2026-09-24; the MoE block is

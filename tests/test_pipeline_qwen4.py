@@ -398,20 +398,20 @@ def test_the_budget_is_the_gpu_ceiling_or_available_less_the_margin():
     # M3 Ultra 96 GB after compaction: 79.0 GiB available, ceiling 77.76 GiB.
     ceiling = 83_494_174_720
     roomy = pipe.NodeMemory(96 * gib, int(79.0 * gib), 82, 1, ceiling)
-    assert roomy.budget_bytes == int(79.0 * gib) - int(96 * gib * 0.07)
+    assert roomy.budget_bytes == int(79.0 * gib) - int(96 * gib * 0.093)
     # Nearly idle: the ceiling binds.
     idle = pipe.NodeMemory(96 * gib, 95 * gib, 99, 1, ceiling)
     assert idle.budget_bytes == ceiling
     # The owner's app screenshot rule (available − 21% of RAM) on the same node
-    # gave 58.8 GiB; the new rule gives 72.3 GiB.
-    assert roomy.budget_bytes - (int(79.0 * gib) - int(96 * gib * 0.21)) > 13 * gib
+    # gave 58.8 GiB; the new rule gives 70.1 GiB.
+    assert roomy.budget_bytes - (int(79.0 * gib) - int(96 * gib * 0.21)) > 11 * gib
 
 
 def test_node_arguments_carry_free_and_the_gpu_ceiling():
     node = pipe._parse_node("workhorse:96:79:77.76")
     assert node.available_bytes == 79 * 2**30
     assert node.ceiling_bytes == int(77.76 * 2**30)
-    assert node.budget_bytes == 79 * 2**30 - int(96 * 2**30 * 0.07)
+    assert node.budget_bytes == 79 * 2**30 - int(96 * 2**30 * 0.093)
     assert node.source == "free + GPU ceiling given"
     idle = pipe._parse_node("m:128:127:107.52")
     assert idle.budget_bytes == int(107.52 * 2**30)
