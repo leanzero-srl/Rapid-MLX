@@ -2795,7 +2795,21 @@ def _extract_token_logprob(
     import mlx.core as mx
     import numpy as np
 
-    if hasattr(logprobs_array, "astype"):
+    if isinstance(logprobs_array, mx.array):
+        # ``np.array`` on an unevaluated MLX array evaluates it inside the
+        # buffer protocol, where an MLX error (e.g. a lazy row created on the
+        # mlx-step thread's stream) is a C++ throw that aborts the process.
+        # ``mx.eval`` raises the same error as a Python RuntimeError, so a
+        # bad row fails THIS request and the engine stays up.
+        logprobs_array = logprobs_array.astype(mx.float32)
+        try:
+            mx.eval(logprobs_array)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "logprobs row could not be materialized on the request "
+                f"thread ({exc}); the request fails, the engine stays up"
+            ) from exc
+    elif hasattr(logprobs_array, "astype"):
         logprobs_array = logprobs_array.astype(mx.float32)
     probs = np.array(logprobs_array).flatten()
     top_k = min(top_k, len(probs))
