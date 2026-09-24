@@ -983,6 +983,7 @@ def load_stage(
     mx.eval(model.parameters())
     wire_dtype = _exchange_wire_dtype(model, group)
     stage = PipelineStage(model, group, stage_plan.start, stage_plan.end, wire_dtype)
+    stage.limits = limits
     return stage, plan, MemoryGuard(node.budget_bytes, rank)
 
 
@@ -1011,6 +1012,50 @@ def _parse_starts(text: str | None) -> list[int] | None:
     return [0, *(int(item) for item in text.split(","))]
 
 
+def plan_json(plan: PipelinePlan, wire: dict[str, int]) -> dict[str, Any]:
+    """The plan as data — what goose's preflight reads (no text parsing)."""
+    ckpt = plan.checkpoint
+    return {
+        "context": plan.context,
+        "batch": plan.batch,
+        "prefill_step": plan.prefill_step,
+        "max_context": plan.max_context,
+        "starts": plan.starts,
+        "fits": _fits(plan.stages),
+        "checkpoint": {
+            "text_bytes": ckpt.text_bytes,
+            "head_bytes": ckpt.head_bytes,
+            "tail_bytes": ckpt.tail_bytes,
+            "excluded_bytes": ckpt.excluded_bytes,
+            "layer_bytes": ckpt.layer_bytes,
+        },
+        "ratios": {
+            "memory_limit": MEMORY_LIMIT_RATIO,
+            "wired_limit": WIRED_LIMIT_RATIO,
+            "pressure_floor": PRESSURE_FLOOR_RATIO,
+            "layer_transient_stream_multiple": LAYER_TRANSIENT_STREAM_MULTIPLE,
+        },
+        "wire": wire,
+        "stages": [
+            {
+                "rank": stage.rank,
+                "node": stage.node.name,
+                "layer_start": stage.start,
+                "layer_end": stage.end,
+                "weight_bytes": stage.weight_bytes,
+                "state_bytes": stage.state_bytes,
+                "workspace_bytes": stage.workspace_bytes,
+                "total_bytes": stage.total_bytes,
+                "budget_bytes": stage.node.budget_bytes,
+                "ram_bytes": stage.node.total_bytes,
+                "budget_source": stage.node.source,
+                "fits": stage.total_bytes <= stage.node.budget_bytes,
+            }
+            for stage in plan.stages
+        ],
+    }
+
+
 def _cmd_plan(options) -> int:
     model_dir = Path(options.model).expanduser()
     args = load_text_args(model_dir)
@@ -1025,8 +1070,11 @@ def _cmd_plan(options) -> int:
         prefill_step=options.prefill_step or default_prefill_step(),
         starts=_parse_starts(options.split),
     )
-    print(format_plan(plan))
     wire = wire_bytes_per_token(args, ckpt.activation_bytes, len(nodes))
+    if options.json:
+        print(json.dumps(plan_json(plan, wire)))
+        return 0 if _fits(plan.stages) else 2
+    print(format_plan(plan))
     print(
         "wire per token per sequence: "
         f"{wire['stream_per_hop']:,} B stream x {wire['hops']} hop(s) + "
@@ -1120,6 +1168,12 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--batch", type=int, default=1)
     plan.add_argument("--prefill-step", type=int)
     plan.add_argument("--split", help="forced starts for ranks 1..N-1, e.g. 20")
+    plan.add_argument("--json", action="store_true", help="machine-readable plan")
+
+    from . import pipeline_qwen4_serve
+
+    serve = commands.add_parser("serve", help="OpenAI server; one rank per process")
+    pipeline_qwen4_serve.add_arguments(serve)
 
     run = commands.add_parser("run", help="run one rank (launch with mlx.launch)")
     run.add_argument("--model", required=True)
@@ -1140,6 +1194,13 @@ def main(argv: list[str] | None = None) -> int:
     options = parser.parse_args(argv)
     if options.command == "plan":
         return _cmd_plan(options)
+    if options.command == "serve":
+        code = pipeline_qwen4_serve.serve(options)
+        # Every rank has left the collective loop; do not let interpreter
+        # teardown wait on HTTP/executor threads.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     if not options.prompt and not options.prompt_ids:
         parser.error("run needs --prompt or --prompt-ids")
     return _cmd_run(options)
