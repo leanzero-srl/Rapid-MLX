@@ -701,6 +701,21 @@ def cmd_stream(options) -> int:
             {"rows": list(zip(pair["names"], pair["tokens"], pair["traces"]))}
         )
 
+    args_full = pipe.load_text_args(model_dir)
+    ckpt = pipe.read_checkpoint_bytes(model_dir, args_full.num_hidden_layers)
+    node = pipe.measure_node_memory()
+    usable = node.available_bytes - int(node.total_bytes * pipe.PRESSURE_FLOOR_RATIO)
+    # Resident at most: the largest layer, plus the embedding while the first
+    # layers run (it is dropped before layer 0) — i.e. max of the two holds.
+    need = max(max(ckpt.layer_bytes), ckpt.head_bytes, ckpt.tail_bytes)
+    print(
+        f"stream preflight: largest hold {need / 2**30:.2f} GiB, usable "
+        f"{usable / 2**30:.2f} GiB (available {node.available_bytes / 2**30:.2f})",
+        flush=True,
+    )
+    if need > usable:
+        print("REFUSED: the largest single hold does not fit", flush=True)
+        return 3
     model = _load_truncatable(model_dir, None)
     text = model.language_model
     inner = text.model
@@ -758,11 +773,15 @@ def cmd_stream(options) -> int:
         inner.layers[index] = None
         del layer
         release(f"layer{index}")
+        pressure = pipe._sysctl_int("kern.memorystatus_vm_pressure_level")
         print(
-            f"layer {index} done, peak {peaks[-1][1]} GiB, "
+            f"layer {index} done, peak {peaks[-1][1]} GiB, pressure {pressure}, "
             f"{time.perf_counter() - started:.0f}s",
             flush=True,
         )
+        if pressure >= 4:
+            print("ABORT: vm pressure CRITICAL", flush=True)
+            return 4
     mx.eval(inner.hyper_connection_mixer.parameters(), text.lm_head.parameters())
     report = []
     for group in groups:
