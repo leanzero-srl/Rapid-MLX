@@ -826,6 +826,32 @@ def _install_dense_sampler_fastpath(batch_gen: "BatchGenerator") -> None:
     logger.info("[dense_sampler_fastpath] installed on BatchGenerator")
 
 
+def _materialize_response_logprobs(responses: list[Any]) -> None:
+    """Evaluate every response's logprobs row on the mlx-step thread.
+
+    MLX streams are thread-local. The plain decode path hands out rows that
+    ``BatchGenerator`` already ``async_eval``-ed, but the speculative paths
+    (vendored MTP, suffix, DSpark) yield LAZY views such as ``lps[i]`` of an
+    evaluated verify stack. The route thread later converts the row with
+    ``np.array``, which evaluates the pending slice on a stream that does not
+    exist in the route thread; MLX throws ``There is no Stream(gpu, N) in
+    current thread`` from inside the buffer protocol, which cannot propagate
+    as a Python exception, so libc++ aborts the WHOLE server on one
+    ``logprobs: true`` request (LeanZero lz.4). One batched eval per step on
+    the owning thread makes every row cross the thread boundary materialized;
+    rows the generator already evaluated cost nothing.
+    """
+    rows: list[mx.array] = []
+    for response in responses:
+        lp = getattr(response, "logprobs", None)
+        if isinstance(lp, mx.array):
+            rows.append(lp)
+        elif isinstance(lp, (list, tuple)):
+            rows.extend(x for x in lp if isinstance(x, mx.array))
+    if rows:
+        mx.eval(*rows)
+
+
 def _mtp_controller_key(model_name: str | None, sidecar: str | None) -> str | None:
     """Combine target and drafter identity into one controller key.
 
@@ -8962,6 +8988,8 @@ class Scheduler:
         finished_ids = set()
         terminal_performance_requests: list[Request] = []
         prompt_tps_this_batch = 0.0
+
+        _materialize_response_logprobs(responses)
 
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
