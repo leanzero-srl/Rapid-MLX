@@ -61,9 +61,11 @@ WIRED_LIMIT_RATIO = 0.60
 # it stayed normal down to 27.3 GiB (21%); the M3 Ultra 96 GB stayed normal at
 # 21.0 GiB (22%).  The lowest share measured normal is the floor.
 PRESSURE_FLOOR_RATIO = 0.21
-# Inside DecoderLayer._combine the incoming stream, the residual copy and the
-# combined output are alive together: three stream-width buffers.
-STREAM_LIVE_BUFFERS = 3
+# measured: one decoder layer's forward peaks at 49x the chunk's HC-stream
+# bytes above its resident weights — 1.96 GiB (GDN) / 1.94 GiB (QSA) for a
+# 2,101-token chunk of the real 4-bit checkpoint, 2026-09-24; the MoE block is
+# 1.53-1.59 GiB of it.  The earlier term-by-term guess modeled 0.33 GiB.
+LAYER_TRANSIENT_STREAM_MULTIPLE = 49
 
 # kern.memorystatus_vm_pressure_level values published by xnu
 # (osfmk/kern/kern_memorystatus... kVMPressureNormal/Warning/Critical).
@@ -338,34 +340,19 @@ def workspace_bytes(
     prefill_step: int,
     act: int,
 ) -> int:
-    """Modeled (unmeasured) peak transient for one prefill chunk on a stage."""
+    """Peak transient of one prefill chunk on a stage (measured multiple)."""
     tokens = min(prefill_step, context)
-    hc_width = args.hc_count * args.hidden_size
-    stream = batch * tokens * hc_width * act * STREAM_LIVE_BUFFERS
-    widths = []
-    has_attention = False
-    for index in layers:
-        if args.layer_types[index] == "linear_attention":
-            key_dim = args.linear_num_key_heads * args.linear_key_head_dim
-            value_dim = args.linear_num_value_heads * args.linear_value_head_dim
-            widths.append(2 * key_dim + 2 * value_dim + 2 * args.linear_num_value_heads)
-        else:
-            has_attention = True
-            widths.append(
-                2 * args.num_attention_heads * args.head_dim
-                + 2 * args.num_key_value_heads * args.head_dim
-                + (int(args.indexer_n_heads) + 1) * int(args.indexer_head_dim)
-            )
-        widths.append(
-            args.num_experts_per_tok
-            * max(3 * args.moe_intermediate_size, args.hidden_size)
-        )
-    projections = batch * tokens * max(widths) * 4
+    stream_bytes = args.hc_count * args.hidden_size * act
+    layer = batch * tokens * stream_bytes * LAYER_TRANSIENT_STREAM_MULTIPLE
+    has_attention = any(
+        args.layer_types[index] != "linear_attention" for index in layers
+    )
     # The QSA dense fallback materializes a boolean selection and an additive
-    # mask over the physical KV length for the chunk's queries.
+    # mask over the physical KV length for the chunk's queries; it grows with
+    # context, which the 2,101-token measurement barely exercised.
     attention = batch * tokens * context * (1 + act) if has_attention else 0
     logits = batch * args.vocab_size * 4 if is_last else 0
-    return stream + projections + attention + logits
+    return layer + attention + logits
 
 
 # ---------------------------------------------------------------------------

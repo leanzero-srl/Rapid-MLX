@@ -675,6 +675,34 @@ def cmd_batchcheck(options) -> int:
     return 0
 
 
+def _decode_shaped(layer, group: dict, cache, prefill_step: int) -> mx.array:
+    """One layer over the teacher-forced sequence in the exact shapes greedy
+    decode feeds it: the prompt minus its last token in prefill chunks, then
+    the last prompt token alone, then every generated token alone.  Layer i at
+    step t needs only layer i-1 at step t and its own cache, so layer-major
+    order reproduces the token-major computation."""
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+
+    hidden, tokens = group["hidden"], group["tokens"]
+    width = tokens.shape[1]
+    prompt_width = width - len(group["rows"][0][1]) + 1
+    spans = [
+        (start, min(start + prefill_step, prompt_width - 1))
+        for start in range(0, prompt_width - 1, prefill_step)
+    ] + [(position, position + 1) for position in range(prompt_width - 1, width)]
+    outputs = []
+    for start, end in spans:
+        chunk = hidden[:, start:end]
+        if layer.is_linear:
+            mask = create_ssm_mask(chunk, cache)
+        else:
+            mask = create_attention_mask(chunk, cache[0])
+        output = layer(chunk, input_ids=tokens[:, start:end], mask=mask, cache=cache)
+        mx.eval(output, cache.state)
+        outputs.append(output)
+    return mx.concatenate(outputs, axis=1)
+
+
 def cmd_stream(options) -> int:
     """Teacher-forced full-model reference holding one layer's weights at a time.
 
@@ -700,6 +728,13 @@ def cmd_stream(options) -> int:
         groups.append(
             {"rows": list(zip(pair["names"], pair["tokens"], pair["traces"]))}
         )
+    if options.pair_singles:
+        # Each neighbouring pair as a left-padded batch of 2, teacher-forced
+        # with the SINGLE-request tokens and compared with the single-request
+        # trace: isolates what batching alone does to the logits.
+        singles = [(r["name"], r["tokens"], r["trace"]) for r in source["results"]]
+        for first, second in _pairs(singles):
+            groups.append({"rows": [singles[first], singles[second]]})
 
     args_full = pipe.load_text_args(model_dir)
     ckpt = pipe.read_checkpoint_bytes(model_dir, args_full.num_hidden_layers)
@@ -707,9 +742,23 @@ def cmd_stream(options) -> int:
     usable = node.available_bytes - int(node.total_bytes * pipe.PRESSURE_FLOOR_RATIO)
     # Resident at most: the largest layer, plus the embedding while the first
     # layers run (it is dropped before layer 0) — i.e. max of the two holds.
-    need = max(max(ckpt.layer_bytes), ckpt.head_bytes, ckpt.tail_bytes)
+    longest = max(
+        len(prompts[name]) + len(tokens)
+        for group in groups
+        for name, tokens, _ in group["rows"]
+    )
+    workspace = pipe.workspace_bytes(
+        args_full,
+        range(args_full.num_hidden_layers),
+        is_last=True,
+        context=longest,
+        batch=max(len(group["rows"]) for group in groups),
+        prefill_step=longest if options.shape == "prefill" else options.prefill_step,
+        act=ckpt.activation_bytes,
+    )
+    need = max(max(ckpt.layer_bytes), ckpt.head_bytes, ckpt.tail_bytes) + workspace
     print(
-        f"stream preflight: largest hold {need / 2**30:.2f} GiB, usable "
+        f"stream preflight: largest hold + modeled workspace {need / 2**30:.2f} GiB, usable "
         f"{usable / 2**30:.2f} GiB (available {node.available_bytes / 2**30:.2f})",
         flush=True,
     )
@@ -760,14 +809,19 @@ def cmd_stream(options) -> int:
         layer = inner.layers[index]
         mx.eval(layer.parameters())
         for group in groups:
-            group["hidden"] = layer(
-                group["hidden"],
-                input_ids=group["tokens"],
-                mask=group["linear_mask"]
-                if layer.is_linear
-                else group["attention_mask"],
-                cache=group["cache"][index],
-            )
+            if options.shape == "decode":
+                group["hidden"] = _decode_shaped(
+                    layer, group, group["cache"][index], options.prefill_step
+                )
+            else:
+                group["hidden"] = layer(
+                    group["hidden"],
+                    input_ids=group["tokens"],
+                    mask=group["linear_mask"]
+                    if layer.is_linear
+                    else group["attention_mask"],
+                    cache=group["cache"][index],
+                )
             mx.eval(group["hidden"])
             group["cache"][index] = None
         inner.layers[index] = None
@@ -785,25 +839,35 @@ def cmd_stream(options) -> int:
     mx.eval(inner.hyper_connection_mixer.parameters(), text.lm_head.parameters())
     report = []
     for group in groups:
-        for row, (name, generated, trace) in enumerate(group["rows"]):
-            start = group["padding"][row] + len(prompts[name]) - 1
-            positions = mx.arange(start, start + len(generated))
+        width = group["tokens"].shape[1]
+        steps = len(group["rows"][0][1])
+        first = width - steps
+        # One (batch, 1) head call per step: the decode path's exact shape.
+        per_step = []
+        for step in range(steps):
             logits = text.lm_head(
-                inner.hyper_connection_mixer(group["hidden"][row : row + 1, positions])
-            )[0]
+                inner.hyper_connection_mixer(
+                    group["hidden"][:, first + step : first + step + 1]
+                )
+            )[:, 0]
             mx.eval(logits)
+            per_step.append(logits)
+        for row, (name, generated, trace) in enumerate(group["rows"]):
             exact = 0
             worst = 0.0
+            top1_diffs = []
             disagreements = []
             for step, token in enumerate(generated):
-                ours = _trace_row(logits[step])
-                row_logprobs = logits[step].astype(mx.float32)
+                row_logits = per_step[step][row]
+                ours = _trace_row(row_logits)
+                row_logprobs = row_logits.astype(mx.float32)
                 row_logprobs = row_logprobs - mx.logsumexp(row_logprobs)
                 theirs = mx.array(trace[step]["top_ids"])
-                diff = mx.max(
-                    mx.abs(row_logprobs[theirs] - mx.array(trace[step]["top_logprobs"]))
-                ).item()
-                worst = max(worst, diff)
+                diffs = mx.abs(
+                    row_logprobs[theirs] - mx.array(trace[step]["top_logprobs"])
+                )
+                worst = max(worst, mx.max(diffs).item())
+                top1_diffs.append(diffs[0].item())
                 if ours["top_ids"][0] == token:
                     exact += 1
                 else:
@@ -816,12 +880,15 @@ def cmd_stream(options) -> int:
                             "pipeline_margin": trace[step]["margin"],
                         }
                     )
+            top1_diffs.sort()
             entry = {
                 "row": name,
                 "batch": len(group["rows"]),
                 "argmax_matches": exact,
                 "steps": len(generated),
                 "max_abs_logprob_diff_top5": round(worst, 6),
+                "top1_logprob_diff_median": round(top1_diffs[len(top1_diffs) // 2], 6),
+                "top1_logprob_diff_max": round(top1_diffs[-1], 6),
                 "disagreements": disagreements,
             }
             report.append(entry)
@@ -886,6 +953,18 @@ def main(argv: list[str] | None = None) -> int:
     stream.add_argument("--prompts", required=True)
     stream.add_argument("--pipe-dir", required=True)
     stream.add_argument("--out", required=True)
+    stream.add_argument(
+        "--shape",
+        choices=("prefill", "decode"),
+        default="prefill",
+        help="prefill: one forward per sequence; decode: greedy decode's shapes",
+    )
+    stream.add_argument(
+        "--pair-singles",
+        action="store_true",
+        help="also batch neighbouring prompts, teacher-forced on single-run tokens",
+    )
+    stream.add_argument("--prefill-step", type=int, default=pipe.default_prefill_step())
 
     compare = commands.add_parser("compare")
     compare.add_argument("--ref", required=True)
