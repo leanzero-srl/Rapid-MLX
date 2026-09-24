@@ -67,6 +67,16 @@ def _load_prompts(path: Path) -> list[dict]:
     return json.loads(path.read_text())["prompts"]
 
 
+def _image_input(vision, tokenizer, prompt: dict):
+    """An image prompt's pixels, re-derived from its file; the ids must agree."""
+    ids, image = pipe.chat_image_prompt(
+        vision, tokenizer, prompt["text"], [prompt["image"]]
+    )
+    if ids != prompt["ids"]:
+        raise ValueError(f"{prompt['name']}: the image re-expands to different ids")
+    return image
+
+
 # ---------------------------------------------------------------------------
 # prompts
 # ---------------------------------------------------------------------------
@@ -139,6 +149,33 @@ def cmd_prompts(options) -> int:
             indent=1,
         )
     )
+    if options.image:
+        from rapid_mlx.models.qwen4_exp_vision import load_vision_tower
+
+        vision = load_vision_tower(Path(options.model).expanduser())
+        ids, image = pipe.chat_image_prompt(
+            vision, tokenizer, options.image_question, [options.image]
+        )
+        prompts.append(
+            {
+                "name": "image-screenshot",
+                "kind": "image",
+                "text": options.image_question,
+                "image": str(Path(options.image).resolve()),
+                "grid_thw": image.grid_thw,
+                "ids": ids,
+            }
+        )
+        out.write_text(
+            json.dumps(
+                {
+                    "model": str(options.model),
+                    "eos_token_ids": sorted(tokenizer.eos_token_ids),
+                    "prompts": prompts,
+                },
+                indent=1,
+            )
+        )
     for prompt in prompts:
         print(f"{prompt['name']}: {len(prompt['ids'])} tokens")
     return 0
@@ -273,25 +310,45 @@ def cmd_ref(options) -> int:
 
 
 def _greedy_pipe(
-    stage, guard, rows: list[list[int]], max_tokens: int, prefill_step: int
+    stage,
+    guard,
+    rows: list[list[int]],
+    max_tokens: int,
+    prefill_step: int,
+    images=None,
 ):
     """Batch of rows; the last rank traces every step of every row."""
     batch = len(rows)
     tokens, padding = pipe._left_pad(rows, 0)
-    cache = stage.make_cache(padding if batch > 1 else None)
     start = time.perf_counter()
+    embeddings, rope = pipe.prepare_multimodal(stage, rows, images)
+    cache = stage.make_cache(padding if batch > 1 else None)
     prefix = tokens[:, :-1]
     for offset in range(0, prefix.shape[1], prefill_step):
         out = stage.forward(
-            prefix[:, offset : offset + prefill_step], cache, logits=None
+            prefix[:, offset : offset + prefill_step],
+            cache,
+            logits=None,
+            embeddings=None
+            if embeddings is None
+            else embeddings[:, :-1][:, offset : offset + prefill_step],
+            rope_positions=rope,
         )
         pipe._step_sync(stage, out, cache, batch, guard, sample=False)
     current = tokens[:, -1:]
+    current_embeddings = None if embeddings is None else embeddings[:, -1:]
     generated = [[] for _ in range(batch)]
     traces = [[] for _ in range(batch)]
     first = None
     for _ in range(max_tokens):
-        out = stage.forward(current, cache, logits="last")
+        out = stage.forward(
+            current,
+            cache,
+            logits="last",
+            embeddings=current_embeddings,
+            rope_positions=rope,
+        )
+        current_embeddings = None
         next_tokens = pipe._step_sync(stage, out, cache, batch, guard, sample=True)
         if first is None:
             first = time.perf_counter()
@@ -361,10 +418,23 @@ def cmd_pipe(options) -> int:
         f"loaded layers [{stage.start}, {stage.end}) in {load_s:.1f}s {json.dumps(after_load)}"
     )
     _greedy_pipe(stage, guard, [prompts[0]["ids"]], 4, options.prefill_step)
+    tokenizer = None
+    if stage.is_first and any(p.get("image") for p in prompts):
+        from mlx_lm.utils import load_tokenizer
+
+        tokenizer = load_tokenizer(model_dir)
     results = []
     for prompt in prompts:
+        images = None
+        if stage.is_first and prompt.get("image"):
+            images = [_image_input(stage.vision, tokenizer, prompt)]
         generated, traces, timing = _greedy_pipe(
-            stage, guard, [prompt["ids"]], options.max_tokens, options.prefill_step
+            stage,
+            guard,
+            [prompt["ids"]],
+            options.max_tokens,
+            options.prefill_step,
+            images,
         )
         results.append(
             {
@@ -675,7 +745,7 @@ def cmd_batchcheck(options) -> int:
     return 0
 
 
-def _decode_shaped(layer, group: dict, cache, prefill_step: int) -> mx.array:
+def _decode_shaped(layer, group: dict, cache, prefill_step: int, rope=None) -> mx.array:
     """One layer over the teacher-forced sequence in the exact shapes greedy
     decode feeds it: the prompt minus its last token in prefill chunks, then
     the last prompt token alone, then every generated token alone.  Layer i at
@@ -697,7 +767,13 @@ def _decode_shaped(layer, group: dict, cache, prefill_step: int) -> mx.array:
             mask = create_ssm_mask(chunk, cache)
         else:
             mask = create_attention_mask(chunk, cache[0])
-        output = layer(chunk, input_ids=tokens[:, start:end], mask=mask, cache=cache)
+        output = layer(
+            chunk,
+            input_ids=tokens[:, start:end],
+            mask=mask,
+            cache=cache,
+            rope_positions=rope,
+        )
         mx.eval(output, cache.state)
         outputs.append(output)
     return mx.concatenate(outputs, axis=1)
@@ -739,7 +815,7 @@ def cmd_stream(options) -> int:
     args_full = pipe.load_text_args(model_dir)
     ckpt = pipe.read_checkpoint_bytes(model_dir, args_full.num_hidden_layers)
     node = pipe.measure_node_memory()
-    usable = node.available_bytes - int(node.total_bytes * pipe.PRESSURE_FLOOR_RATIO)
+    usable = node.available_bytes - int(node.total_bytes * pipe.AVAILABLE_MARGIN_RATIO)
     # Resident at most: the largest layer, plus the embedding while the first
     # layers run (it is dropped before layer 0) — i.e. max of the two holds.
     longest = max(
@@ -792,8 +868,37 @@ def cmd_stream(options) -> int:
     first_attention = next(
         i for i, layer in enumerate(inner.layers) if not layer.is_linear
     )
+    image_prompts = {
+        p["name"]: p for p in _load_prompts(Path(options.prompts)) if p.get("image")
+    }
+    vision = tokenizer = None
+    if image_prompts:
+        from mlx_lm.utils import load_tokenizer
+
+        from rapid_mlx.models.qwen4_exp_vision import (
+            MRopePositions,
+            load_vision_tower,
+            merge_image_features,
+        )
+
+        vision = load_vision_tower(model_dir)
+        tokenizer = load_tokenizer(model_dir)
     for group in groups:
         hidden = inner.embed_tokens(group["tokens"])
+        group["rope"] = None
+        names = [name for name, _, _ in group["rows"]]
+        if any(name in image_prompts for name in names):
+            if len(names) != 1:
+                raise ValueError("image prompts are streamed one row at a time")
+            prompt = image_prompts[names[0]]
+            image = _image_input(vision, tokenizer, prompt)
+            features = vision.encode(mx.array(image.pixel_values), image.grid_thw)
+            hidden = merge_image_features(
+                hidden, group["tokens"][0], features, vision.image_token_id
+            )
+            group["rope"] = MRopePositions.from_rows(
+                [vision.rope_positions(prompt["ids"], image.grid_thw)]
+            )
         hidden = mx.tile(hidden, (1, 1, args.hc_count))
         cache = group["cache"]
         group["linear_mask"] = create_ssm_mask(hidden, cache[first_linear])
@@ -811,7 +916,11 @@ def cmd_stream(options) -> int:
         for group in groups:
             if options.shape == "decode":
                 group["hidden"] = _decode_shaped(
-                    layer, group, group["cache"][index], options.prefill_step
+                    layer,
+                    group,
+                    group["cache"][index],
+                    options.prefill_step,
+                    group["rope"],
                 )
             else:
                 group["hidden"] = layer(
@@ -821,6 +930,7 @@ def cmd_stream(options) -> int:
                     if layer.is_linear
                     else group["attention_mask"],
                     cache=group["cache"][index],
+                    rope_positions=group["rope"],
                 )
             mx.eval(group["hidden"])
             group["cache"][index] = None
@@ -910,6 +1020,11 @@ def main(argv: list[str] | None = None) -> int:
     prompts.add_argument("--model", required=True)
     prompts.add_argument("--out", required=True)
     prompts.add_argument("--long-tokens", type=int, default=1900)
+    prompts.add_argument("--image", help="add an image prompt (a screenshot)")
+    prompts.add_argument(
+        "--image-question",
+        default="Describe this screenshot: what city, temperature and conditions does it show?",
+    )
 
     for name in ("ref", "pipe"):
         sub = commands.add_parser(name)
