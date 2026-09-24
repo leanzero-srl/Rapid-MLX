@@ -676,6 +676,10 @@ def serve(options, emit=None) -> int:
     )
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     group = mx.distributed.init(strict=True)
+    emit(
+        "RANK_GROUP",
+        {"rank": group.rank(), "size": group.size(), "mlx": mx.__version__},
+    )
     model_dir = Path(options.model).expanduser()
     prefill_step = options.prefill_step or pipe.default_prefill_step()
     stage, plan, guard = pipe.load_stage(
