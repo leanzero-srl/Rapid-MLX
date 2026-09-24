@@ -128,7 +128,9 @@ class NodeMemory:
         )
 
 
-def node_budget_bytes(total_bytes: int, available_bytes: int, ceiling_bytes: int) -> int:
+def node_budget_bytes(
+    total_bytes: int, available_bytes: int, ceiling_bytes: int
+) -> int:
     """min(available − RAM × AVAILABLE_MARGIN_RATIO, the GPU ceiling), never below 0."""
     return max(
         0,
@@ -1130,6 +1132,22 @@ def _exchange_wire_dtype(model: Model, group: Any) -> mx.Dtype:
     return _MX_DTYPES_BY_CODE[int(agreed.item())]
 
 
+def _agree_vision_cost(local: VisionCost | None, group: Any) -> VisionCost | None:
+    """Rank 0's VisionCost on every rank (MiB-exact ints, like the node budgets)."""
+    # int32 would overflow a >2 GiB figure, so the figures travel as KiB, and
+    # every rank (rank 0 included) plans with the same rounded-up values.
+    kib = [0, 0, 0]
+    if group.rank() == 0 and local is not None:
+        kib = [1, -(-local.weight_bytes // 1024), -(-local.workspace_bytes // 1024)]
+    agreed = mx.array(kib, dtype=mx.int32)
+    if group.size() > 1:
+        agreed = mx.distributed.all_sum(agreed, group=group)
+    present, weight, workspace = agreed.tolist()
+    if not present:
+        return None
+    return VisionCost(weight_bytes=weight * 1024, workspace_bytes=workspace * 1024)
+
+
 def _gather_node_budgets(node: NodeMemory, ckpt_total: int, group: Any):
     """Every rank learns every rank's measured budget and checkpoint size."""
     mib = 2**20
@@ -1192,7 +1210,10 @@ def load_stage(
     ckpt = read_checkpoint_bytes(model_dir, args.num_hidden_layers)
     if layer_limit is not None:
         args, ckpt = truncate_layers(args, ckpt, layer_limit)
-    cost = vision_cost(model_dir, ckpt) if vision else None
+    # Only rank 0 holds the tower, so only rank 0 needs mlx-vlm: it measures the
+    # cost and every rank plans with rank 0's figures.
+    local = vision_cost(model_dir, ckpt) if vision and group.rank() == 0 else None
+    cost = _agree_vision_cost(local, group) if vision else None
     node = measure_node_memory()
     nodes = _gather_node_budgets(node, ckpt.text_bytes, group)
     step = prefill_step or default_prefill_step()

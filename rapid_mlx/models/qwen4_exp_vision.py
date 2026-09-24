@@ -152,6 +152,7 @@ def load_vision_tower(model_dir: Path) -> VisionTower | None:
     A checkpoint that declares a vision config but ships no ``model.visual``
     tensors is refused by name — it would otherwise serve images it cannot see.
     """
+    require_vision_runtime()
     from mlx_vlm.models.qwen4_exp import VisionConfig, VisionModel
 
     model_dir = Path(model_dir)
@@ -227,7 +228,19 @@ def load_vision_tower(model_dir: Path) -> VisionTower | None:
     )
 
 
+def require_vision_runtime() -> None:
+    """mlx-vlm carries the tower, the processor and the RoPE index; say so by name."""
+    try:
+        import mlx_vlm  # noqa: F401
+    except ImportError as missing:
+        raise RuntimeError(
+            "this checkpoint declares a vision tower but mlx-vlm is not installed in "
+            "this interpreter (pip install mlx-vlm==0.7.1), or serve it --no-vision"
+        ) from missing
+
+
 def _image_processor(model_dir: Path):
+    require_vision_runtime()
     from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
         Qwen3VLImageProcessor,
         _qwen_vl_image_kwargs,
