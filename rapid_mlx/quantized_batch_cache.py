@@ -99,6 +99,22 @@ def supported_kv_cache_types() -> tuple[tuple[type, ...], tuple[type, ...]]:
     return plain + (VLMKVCache,), rotating + (VLMRotatingKVCache,)
 
 
+def recurrent_state_cache_types() -> tuple[type, ...]:
+    """Exact cache classes that hold fixed-size recurrent state, not KV.
+
+    ``ArraysCache`` is what the GatedDeltaNet hybrids (qwen3_next, qwen3_5)
+    build for their linear-attention layers: conv + recurrent state whose size
+    does not depend on context and which the model reads through its own
+    gated-delta kernel, never through ``scaled_dot_product_attention``. The
+    live installer swaps only exact ``KVCache`` layers, so these stay as they
+    are. Exact classes only — subclasses and ``CacheList`` hybrids have their
+    own read paths and are not covered by this admission.
+    """
+    from mlx_lm.models.cache import ArraysCache
+
+    return (ArraysCache,)
+
+
 def _quantize(x: mx.array, group_size: int, bits: int) -> list[mx.array]:
     """Quantize along the last (head) dim -> [packed_uint32, scales, biases]."""
     return list(mx.quantize(x, group_size=group_size, bits=bits))

@@ -4553,6 +4553,10 @@ class Scheduler:
         rotating_layers: int
         total_layers: int
         shared_borrower_layers: int = 0
+        # Fixed-size recurrent state (GatedDeltaNet / linear attention
+        # ``ArraysCache``): not a KV cache, never grows with context, and never
+        # read through scaled_dot_product_attention — it stays as-is.
+        recurrent_state_layers: int = 0
 
     @staticmethod
     def _quantized_attention_incompatibility(model) -> str | None:
@@ -4591,9 +4595,11 @@ class Scheduler:
 
         Asks the model what caches it actually builds — no family names,
         no config heuristics. Returns ``None`` for an all-plain layout or a
-        verified mixture of plain ``KVCache`` and bounded ``RotatingKVCache``;
-        rotating components remain bf16. Returns the offending type name for
-        other layouts (``ArraysCache``/``MambaCache``), or
+        verified mixture of plain ``KVCache`` with bounded ``RotatingKVCache``
+        and/or fixed-size recurrent ``ArraysCache`` state (the GatedDeltaNet
+        hybrids: qwen3_next, qwen3_5); rotating and recurrent components remain
+        bf16. Returns the offending type name for other layouts (``CacheList``,
+        subclasses of the admitted types, unknown types), or
         :data:`_KV_CACHE_UNPROBEABLE` when no cache list could be built.
         Backstops the config-level safelist for models whose HF config
         was not readable at CLI time (fresh download).
@@ -4609,15 +4615,22 @@ class Scheduler:
         attention_reason = cls._quantized_attention_incompatibility(model)
         if attention_reason is not None:
             return attention_reason, None
-        from .quantized_batch_cache import supported_kv_cache_types
+        from .quantized_batch_cache import (
+            recurrent_state_cache_types,
+            supported_kv_cache_types,
+        )
 
         plain_kv_types, rotating_types = supported_kv_cache_types()
+        state_types = recurrent_state_cache_types()
         quantizable = sum(type(c) in plain_kv_types for c in caches)
         rotating = sum(type(c) in rotating_types for c in caches)
+        recurrent = sum(type(c) in state_types for c in caches)
         unsupported = [
             type(c).__name__
             for c in caches
-            if type(c) not in plain_kv_types and type(c) not in rotating_types
+            if type(c) not in plain_kv_types
+            and type(c) not in rotating_types
+            and type(c) not in state_types
         ]
         if unsupported:
             return unsupported[0], None
@@ -4631,6 +4644,7 @@ class Scheduler:
             rotating_layers=rotating,
             total_layers=len(caches),
             shared_borrower_layers=cls._cross_layer_kv_sharing_count(model),
+            recurrent_state_layers=recurrent,
         )
 
     @classmethod
@@ -4742,6 +4756,19 @@ class Scheduler:
                 self._kv_quant_layout.total_layers,
                 getattr(self.config, "kv_cache_quantization_bits", 8),
                 self._kv_quant_layout.rotating_layers,
+            )
+        if (
+            self._kv_quant_layout is not None
+            and self._kv_quant_layout.recurrent_state_layers
+        ):
+            logger.info(
+                "[kv-cache] hybrid partial quantization: %d/%d full-attention "
+                "layers use int%d; %d recurrent-state (linear attention) layers "
+                "hold fixed-size state and stay unquantized",
+                self._kv_quant_layout.quantizable_layers,
+                self._kv_quant_layout.total_layers,
+                getattr(self.config, "kv_cache_quantization_bits", 8),
+                self._kv_quant_layout.recurrent_state_layers,
             )
         if (
             self._kv_quant_layout is not None
