@@ -76,6 +76,9 @@ class _Row:
     max_tokens: int
     temperature: float
     top_p: float
+    # Rank 0 only: the row's preprocessed images.  They never cross ranks —
+    # rank 0 merges the tower's features and shares the RoPE table instead.
+    images: Any = None
 
 
 def _broadcast_batch(
@@ -182,17 +185,36 @@ def run_batch(
     padded = [[0] * (width - len(row.ids)) + row.ids for row in rows]
     tokens = mx.array(padded, dtype=mx.int32)
     padding = [width - len(row.ids) for row in rows]
+    embeddings, rope = pipe.prepare_multimodal(
+        stage,
+        [row.ids for row in rows],
+        [row.images for row in rows] if stage.is_first else None,
+    )
     cache = stage.make_cache(padding if len(rows) > 1 else None)
     prefix = tokens[:, :-1]
     for offset in range(0, prefix.shape[1], prefill_step):
         out = stage.forward(
-            prefix[:, offset : offset + prefill_step], cache, logits=None
+            prefix[:, offset : offset + prefill_step],
+            cache,
+            logits=None,
+            embeddings=None
+            if embeddings is None
+            else embeddings[:, :-1][:, offset : offset + prefill_step],
+            rope_positions=rope,
         )
         _step(stage, out, cache, rows, guard, 0, sample=False)
     current = tokens[:, -1:]
+    current_embeddings = None if embeddings is None else embeddings[:, -1:]
     for step in range(max(row.max_tokens for row in rows)):
         control = control_fn() if (control_fn is not None and stage.is_first) else 0
-        out = stage.forward(current, cache, logits="last")
+        out = stage.forward(
+            current,
+            cache,
+            logits="last",
+            embeddings=current_embeddings,
+            rope_positions=rope,
+        )
+        current_embeddings = None
         sampled, ended = _step(stage, out, cache, rows, guard, control, sample=True)
         if ended:
             return
@@ -299,24 +321,72 @@ def _template_parsers(tokenizer) -> tuple[str | None, str | None]:
     return tool, reasoning
 
 
-def _text_only(messages: list[dict]) -> list[dict]:
-    flattened = []
+_IMAGE_PART_TYPES = ("image_url", "input_image", "image")
+
+
+def _image_source(part: dict) -> Any:
+    """The OpenAI/Responses image reference inside one content part."""
+    for key in ("image_url", "image", "url"):
+        if part.get(key):
+            return part[key]
+    raise ValueError(f"image content part carries no image: {sorted(part)}")
+
+
+def _split_images(messages: list[dict], vision: bool) -> tuple[list[dict], list]:
+    """Messages for the chat template, plus the image references in order.
+
+    Text parts of a text-only message are joined (the template's plain-string
+    path).  An image part becomes ``{"type": "image"}``, which the checkpoint's
+    template renders as one ``<|vision_start|><|image_pad|><|vision_end|>``.
+    Without a vision tower an image is refused by name.
+    """
+    rendered, images = [], []
     for message in messages:
         content = message.get("content")
         if isinstance(content, list):
-            parts = []
+            parts, texts, has_image = [], [], False
             for part in content:
                 kind = part.get("type") if isinstance(part, dict) else None
                 if kind == "text":
-                    parts.append(part.get("text", ""))
+                    parts.append({"type": "text", "text": part.get("text", "")})
+                    texts.append(part.get("text", ""))
+                elif kind in _IMAGE_PART_TYPES:
+                    if not vision:
+                        raise ValueError(
+                            f"content part type {kind!r} is not supported: this "
+                            "split serves text only (the checkpoint declares no "
+                            "vision tower, or the server runs --no-vision)"
+                        )
+                    images.append(_image_source(part))
+                    parts.append({"type": "image"})
+                    has_image = True
                 else:
-                    raise ValueError(
-                        f"content part type {kind!r} is not supported: the pipeline "
-                        "split serves text only (the vision tower is not loaded)"
-                    )
-            message = {**message, "content": "".join(parts)}
-        flattened.append(message)
-    return flattened
+                    raise ValueError(f"content part type {kind!r} is not supported")
+            message = {**message, "content": parts if has_image else "".join(texts)}
+        rendered.append(message)
+    return rendered, images
+
+
+def _load_image(source: Any):
+    """A PIL image from a data URL / base64, http(s) URL, file:// URL or path.
+
+    Reuses the single engine's own resolver (``models.mllm.process_image_input``):
+    size caps, the SSRF guard on remote URLs, and local paths only inside
+    ``RAPID_MLX_MEDIA_ROOT``.  ``file://`` is that same local-path branch.
+    """
+    from urllib.parse import unquote, urlparse
+
+    from PIL import Image
+
+    from ..models.mllm import process_image_input
+
+    if isinstance(source, dict):
+        source = source.get("url") or source.get("image_url") or ""
+    if isinstance(source, str) and source.startswith("file://"):
+        source = unquote(urlparse(source).path)
+    path = process_image_input(source)
+    with Image.open(path) as image:
+        return image.convert("RGB")
 
 
 def _merge_tool_call_deltas(deltas: list[dict]) -> list[dict]:
@@ -338,7 +408,7 @@ def _merge_tool_call_deltas(deltas: list[dict]) -> list[dict]:
     return [merged[index] for index in sorted(merged)]
 
 
-def _build_app(state: _State, tokenizer, eos_ids: set[int]):
+def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -359,6 +429,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
         "_TokenizerHolder", (), {"tokenizer": tokenizer, "_tokenizer": tokenizer}
     )()
     app = FastAPI()
+    vision_processor = vision.processor(tokenizer) if vision is not None else None
+    capabilities = ["text"]
+    if vision is not None:
+        capabilities.append("vision")
+    if tool_parser is not None:
+        capabilities.append("tools")
 
     def error(status: int, message: str, kind: str) -> JSONResponse:
         return JSONResponse(
@@ -374,6 +450,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
                     "id": state.served,
                     "object": "model",
                     "owned_by": "rapid-mlx-pipeline",
+                    # The single engine's /v1/models shape (routes/models.py
+                    # _detect_capabilities): text -> vision -> tools.
+                    "modality": "image" if vision is not None else "text",
+                    "capabilities": capabilities,
                     "context_window": state.context,
                     "tool_call_parser": tool_parser,
                     "reasoning_parser": reasoning_parser,
@@ -446,10 +526,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
                 "tools_unsupported",
             )
         try:
-            messages = _normalize_tool_call_arguments_for_template(
-                _text_only(list(body.get("messages") or []))
+            messages, image_sources = _split_images(
+                list(body.get("messages") or []), vision is not None
             )
-        except ValueError as refusal:
+            messages = _normalize_tool_call_arguments_for_template(messages)
+            pictures = [_load_image(source) for source in image_sources]
+        except Exception as refusal:  # noqa: BLE001 - every cause is the client's input
             return error(400, str(refusal), "invalid_request_error")
         kwargs = dict(body.get("chat_template_kwargs") or {})
         enable_thinking = kwargs.pop("enable_thinking", body.get("enable_thinking"))
@@ -461,7 +543,22 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
             model_name=state.served,
             chat_template_kwargs=kwargs or None,
         )
-        ids = tokenizer.encode(prompt)
+        images = None
+        if pictures:
+            try:
+                processed = vision_processor(
+                    text=[prompt], images=pictures, return_tensors="np"
+                )
+            except Exception as refusal:  # noqa: BLE001 - malformed image input
+                return error(
+                    400, f"image preprocessing: {refusal}", "invalid_request_error"
+                )
+            ids = processed["input_ids"][0].tolist()
+            images = pipe.ImageInput(
+                processed["pixel_values"], processed["image_grid_thw"].tolist()
+            )
+        else:
+            ids = tokenizer.encode(prompt)
         budget = state.context - len(ids) - 1
         requested = body.get("max_completion_tokens") or body.get("max_tokens")
         if budget < 1:
@@ -476,7 +573,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
         stops = body.get("stop") or []
         stops = [stops] if isinstance(stops, str) else list(stops)
         loop = asyncio.get_running_loop()
-        job = _Job(_Row(ids, max_tokens, temperature, top_p), loop, asyncio.Queue())
+        job = _Job(
+            _Row(ids, max_tokens, temperature, top_p, images), loop, asyncio.Queue()
+        )
         state.jobs.put(job)
         created = int(time.time())
         processor = StreamingPostProcessor(
@@ -865,6 +964,7 @@ def serve(options, emit=None) -> int:
         batch=options.slots,
         prefill_step=prefill_step,
         starts=pipe._parse_starts(options.split),
+        vision=not options.no_vision,
         log=lambda line: print(line, flush=True),
     )
     emit("RANK_CAPS", {**stage.limits, "planned": plan.stages[stage.rank].total_bytes})
@@ -899,7 +999,7 @@ def serve(options, emit=None) -> int:
 
     import uvicorn
 
-    app = _build_app(state, tokenizer, set(tokenizer.eos_token_ids))
+    app = _build_app(state, tokenizer, set(tokenizer.eos_token_ids), stage.vision)
     server = uvicorn.Server(
         uvicorn.Config(app, host=options.host, port=options.port, log_level="warning")
     )
@@ -939,6 +1039,7 @@ def serve(options, emit=None) -> int:
             "served": state.served,
             "context": context,
             "starts": plan.starts,
+            "vision": stage.vision is not None,
         },
     )
     try:
@@ -969,6 +1070,11 @@ def add_arguments(parser) -> None:
     parser.add_argument("--prefill-step", type=int)
     parser.add_argument(
         "--split", help="pinned starts for ranks 1..N-1 (the preflighted plan)"
+    )
+    parser.add_argument(
+        "--no-vision",
+        action="store_true",
+        help="serve text only: rank 0 does not load the checkpoint's vision tower",
     )
 
 
