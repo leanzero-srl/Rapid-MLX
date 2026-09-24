@@ -643,6 +643,86 @@ def test_init_quantization_reports_shared_borrowers(caplog):
     )
 
 
+@pytest.mark.requires_mlx
+def test_live_cache_probe_accepts_gated_delta_hybrid():
+    """qwen3_5 / qwen3_next: ArraysCache linear layers + KVCache full attention.
+
+    The recurrent state is fixed-size and read through the gated-delta kernel,
+    so only the full-attention KV is quantized; the layout names both counts.
+    """
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from rapid_mlx.scheduler import Scheduler
+
+    class _FakeModel:
+        def make_cache(self):
+            return [ArraysCache(size=2), ArraysCache(size=2), ArraysCache(size=2), KVCache()] * 2
+
+    assert Scheduler._quantized_live_cache_incompatibility(_FakeModel()) is None
+    layout = Scheduler._quantized_live_cache_layout(_FakeModel())
+    assert layout.quantizable_layers == 2
+    assert layout.recurrent_state_layers == 6
+    assert layout.rotating_layers == 0
+    assert layout.total_layers == 8
+
+
+@pytest.mark.requires_mlx
+def test_live_cache_probe_rejects_recurrent_state_only():
+    """Nothing to quantize is not a quantizable layout."""
+    from mlx_lm.models.cache import ArraysCache
+
+    from rapid_mlx.scheduler import Scheduler
+
+    class _FakeModel:
+        def make_cache(self):
+            return [ArraysCache(size=2), ArraysCache(size=2)]
+
+    assert (
+        Scheduler._quantized_live_cache_incompatibility(_FakeModel())
+        == Scheduler._KV_CACHE_UNPROBEABLE
+    )
+
+
+@pytest.mark.requires_mlx
+def test_live_cache_probe_rejects_arrays_cache_subclass():
+    """Admission is by exact class: a subclass may carry its own read path."""
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from rapid_mlx.scheduler import Scheduler
+
+    class _StateVariant(ArraysCache):
+        pass
+
+    class _FakeModel:
+        def make_cache(self):
+            return [_StateVariant(size=2), KVCache()]
+
+    assert (
+        Scheduler._quantized_live_cache_incompatibility(_FakeModel())
+        == "_StateVariant"
+    )
+
+
+@pytest.mark.requires_mlx
+def test_install_leaves_recurrent_state_layers_untouched():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from rapid_mlx.quantized_batch_cache import (
+        _QuantizableKVCache,
+        install_quantized_batch_cache,
+    )
+
+    class _Gen:
+        def _make_new_cache(self):
+            return [ArraysCache(size=2), KVCache()]
+
+    gen = _Gen()
+    assert install_quantized_batch_cache(gen, group_size=64, bits=8)
+    state, kv = gen._make_new_cache()
+    assert type(state) is ArraysCache
+    assert isinstance(kv, _QuantizableKVCache)
+
+
 @pytest.mark.requires_mlx  # imports mlx_lm.models.cache + rapid_mlx.scheduler (mlx)
 def test_live_cache_probe_accepts_plain_kvcache():
     from mlx_lm.models.cache import KVCache
