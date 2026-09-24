@@ -7,7 +7,10 @@ There are no repository-name aliases or compatibility approximations here.
 
 M1 implements the target text decoder.  The checkpoint's MTP and vision
 modules are deliberately ignored by :meth:`Model.sanitize` until their own
-milestones have independent numerical and lifecycle coverage.
+milestones have independent numerical and lifecycle coverage.  Image input
+reaches this decoder from outside: :mod:`.qwen4_exp_vision` merges the vision
+tower's features into ``input_embeddings`` and passes ``rope_positions``, the
+(t, h, w) positions every attention and QSA-indexer layer rotates by.
 """
 
 from __future__ import annotations
@@ -820,12 +823,23 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
     inference forward here; the pure-MLX fallback below covers non-Metal use.
     """
 
-    if not mx.metal.is_available():
-        return None
     if position_ndim == 2:
         position_expr = "position_ids[b * q_len + t]"
+        selector_source = ""
+        input_names = ["x", "position_ids", "inv_freq"]
+    elif position_ndim == 3:
+        # Multimodal (t, h, w) positions: each frequency reads the axis the
+        # checkpoint's interleaved mrope_section assigns it — mlx-vlm's own
+        # 3-D branch of the same kernel (rope_utils._mrope_apply_kernel).
+        position_expr = "position_ids[(axis * q_bsz + b) * q_len + t]"
+        selector_source = "int axis = int(position_selector[freq_idx]);"
+        input_names = ["x", "position_ids", "inv_freq", "position_selector"]
     else:
-        raise ValueError("Qwen4-Exp text RoPE requires 2-D position IDs")
+        raise ValueError(
+            "Qwen4-Exp text RoPE requires 2-D position IDs (or 3-D multimodal ones)"
+        )
+    if not mx.metal.is_available():
+        return None
     source = f"""
         uint elem = thread_position_in_grid.x;
 
@@ -860,6 +874,7 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
         int freq_idx = slot;
         int d = freq_idx;
         int pair_d = d + half_dim;
+        {selector_source}
         float pos = static_cast<float>({position_expr});
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         float c = metal::cos(angle);
@@ -873,10 +888,43 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
     """
     return mx.fast.metal_kernel(
         name=f"qwen4_exp_rope_half_split_{rotary_dim}_{position_ndim}d",
-        input_names=["x", "position_ids", "inv_freq"],
+        input_names=input_names,
         output_names=["x_out"],
         source=source,
     )
+
+
+@cache
+def _interleaved_mrope_selector(section: tuple[int, ...], half_dim: int) -> mx.array:
+    """Which (t, h, w) axis each rotary frequency reads — Qwen3-VL interleaving.
+
+    mlx-vlm ``rope_utils._interleaved_position_selector``: frequencies
+    1, 4, 7, ... below ``3 * section[1]`` take h, 2, 5, 8, ... below
+    ``3 * section[2]`` take w, every other frequency takes t.
+    """
+    selector = [0] * half_dim
+    for axis, offset in ((1, 1), (2, 2)):
+        for index in range(offset, min(section[axis] * 3, half_dim), 3):
+            selector[index] = axis
+    return mx.array(selector, dtype=mx.int32)
+
+
+def _apply_mrope_positions(
+    x: mx.array,
+    positions: mx.array,
+    selector: mx.array,
+    inverse_frequency: mx.array,
+    rotary_dim: int,
+) -> mx.array:
+    """Pure-MLX multimodal RoPE on ``[B, H, L, D]`` (the non-Metal path)."""
+    per_frequency = mx.take(positions, selector, axis=0).transpose(1, 2, 0)
+    angles = per_frequency.astype(mx.float32) * inverse_frequency
+    angles = mx.concatenate([angles, angles], axis=-1)[:, None, :, :]
+    rotary = x[..., :rotary_dim]
+    half = rotary_dim // 2
+    rotated_half = mx.concatenate([-rotary[..., half:], rotary[..., :half]], axis=-1)
+    rotated = rotary * mx.cos(angles) + rotated_half * mx.sin(angles)
+    return mx.concatenate([rotated.astype(x.dtype), x[..., rotary_dim:]], axis=-1)
 
 
 def apply_qwen4_exp_rope(
@@ -885,16 +933,37 @@ def apply_qwen4_exp_rope(
     *,
     rotary_dim: int,
     base: float,
+    mrope_section: tuple[int, ...] = (),
 ) -> mx.array:
-    """Apply exact Qwen4-Exp text RoPE to ``[B, H, L, D]`` states."""
+    """Apply exact Qwen4-Exp text RoPE to ``[B, H, L, D]`` states.
+
+    ``positions`` is ``[L]`` / ``[B, L]`` (text), or ``[3, B, L]`` (t, h, w)
+    multimodal positions rotated per the checkpoint's ``mrope_section``.  A
+    3-D position whose three axes agree rotates bit-identically to the 2-D
+    one: every frequency reads the same integer.
+    """
 
     if positions.ndim == 1:
         positions = mx.broadcast_to(positions[None], (x.shape[0], positions.size))
     inverse_frequency = 1.0 / (
         base ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / float(rotary_dim))
     )
+    extra_inputs = []
+    if positions.ndim == 3:
+        if not mrope_section:
+            raise ValueError(
+                "3-D (t, h, w) RoPE positions need the checkpoint's mrope_section"
+            )
+        selector = _interleaved_mrope_selector(
+            tuple(mrope_section), inverse_frequency.shape[0]
+        )
+        extra_inputs.append(selector)
     kernel = _qwen4_exp_rope_kernel(rotary_dim, positions.ndim)
     if kernel is None:
+        if positions.ndim == 3:
+            return _apply_mrope_positions(
+                x, positions, selector, inverse_frequency, rotary_dim
+            )
         return apply_rotary_positions(
             x.transpose(0, 2, 1, 3),
             positions,
@@ -905,7 +974,7 @@ def apply_qwen4_exp_rope(
     slots = half_dim + x.shape[-1] - rotary_dim
     work_size = x.shape[0] * x.shape[1] * x.shape[2] * slots
     (output,) = kernel(
-        inputs=[x, positions, inverse_frequency],
+        inputs=[x, positions, inverse_frequency, *extra_inputs],
         template=[("T", x.dtype)],
         grid=(work_size, 1, 1),
         threadgroup=(256, 1, 1),
@@ -913,6 +982,10 @@ def apply_qwen4_exp_rope(
         output_dtypes=[x.dtype],
     )
     return output
+
+
+def _mrope_section(args: TextModelArgs) -> tuple[int, ...]:
+    return tuple((args.rope_parameters or {}).get("mrope_section") or ())
 
 
 @dataclass(frozen=True)
@@ -985,6 +1058,7 @@ class QSAIndexer(nn.Module):
         self.block_topk = self.token_budget // self.compress_ratio
         self.rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope_theta = args.rope_theta
+        self.mrope_section = _mrope_section(args)
         self.index_qk_proj = nn.Linear(
             args.hidden_size,
             (self.num_heads + self.num_kv_heads) * self.head_dim,
@@ -1009,6 +1083,7 @@ class QSAIndexer(nn.Module):
         *,
         physical_kv_length: int,
         record_rollback: bool = False,
+        rope_positions: Any | None = None,
     ) -> _QSASelection | None:
         batch, length, _ = hidden_states.shape
         cache._ensure_batch(batch)
@@ -1031,10 +1106,40 @@ class QSAIndexer(nn.Module):
         query = self.q_layernorm(query)
         query = apply_qwen4_exp_rope(
             query.transpose(0, 2, 1, 3),
-            positions,
+            positions if rope_positions is None else rope_positions.at(positions),
             rotary_dim=self.rotary_dim,
             base=self.rope_theta,
+            mrope_section=self.mrope_section,
         ).transpose(0, 2, 1, 3)
+
+        # A compressed key rotates at its group's first token.  With
+        # multimodal positions that position depends on the row, and the
+        # cache's per-row loop hands the transform only the logical start, so
+        # the rows are replayed here in the cache's own order (rows in turn,
+        # each row's committed tokens in turn) and every call is checked
+        # against it.
+        group_rows: list[tuple[int, int]] = []
+        if rope_positions is not None:
+            ratio = self.compress_ratio
+            for row, (_, valid_length) in enumerate(valid_spans):
+                for token in range(valid_length):
+                    position = offsets[row] + token
+                    if (position + 1) % ratio == 0:
+                        group_rows.append((row, position + 1 - ratio))
+            group_rows.reverse()
+
+        def group_position(start: int) -> mx.array:
+            if rope_positions is None:
+                return mx.array([[start]], dtype=mx.int64)
+            if not group_rows:
+                raise RuntimeError("QSA cache completed more groups than it committed")
+            row, expected = group_rows.pop()
+            if expected != start:
+                raise RuntimeError(
+                    f"QSA cache completed the group at {start}; row {row}'s next "
+                    f"group starts at {expected}"
+                )
+            return rope_positions.at_row(row, mx.array([[start]], dtype=mx.int64))
 
         def transform_group(group: mx.array, start: int) -> mx.array:
             # The singleton axis is synthetic: preserve the parent forward's
@@ -1045,18 +1150,22 @@ class QSAIndexer(nn.Module):
             ]
             return apply_qwen4_exp_rope(
                 normalized[:, None, None, :],
-                mx.array([[start]], dtype=mx.int64),
+                group_position(start),
                 rotary_dim=self.rotary_dim,
                 base=self.rope_theta,
+                mrope_section=self.mrope_section,
             )[:, 0, 0, :]
 
         def transform_groups(groups: mx.array, starts: mx.array) -> mx.array:
             normalized = self.k_layernorm(groups)
             return apply_qwen4_exp_rope(
                 normalized[:, None, :, :],
-                starts[None, :],
+                starts[None, :]
+                if rope_positions is None
+                else rope_positions.at_row(0, starts[None, :]),
                 rotary_dim=self.rotary_dim,
                 base=self.rope_theta,
+                mrope_section=self.mrope_section,
             )[:, 0, :, :]
 
         cache.update(
@@ -1224,6 +1333,7 @@ class QSAAttention(nn.Module):
         )
         self.q_norm = ZeroCenteredRMSNorm(args.head_dim, eps=args.rms_norm_eps)
         self.k_norm = ZeroCenteredRMSNorm(args.head_dim, eps=args.rms_norm_eps)
+        self.mrope_section = _mrope_section(args)
         self.rope = initialize_rope(
             self.rotary_dim,
             base=args.rope_theta,
@@ -1258,6 +1368,7 @@ class QSAAttention(nn.Module):
         mask: mx.array | str | None = None,
         *,
         record_rollback: bool = False,
+        rope_positions: Any | None = None,
     ) -> mx.array:
         batch, length, _ = x.shape
         kv_cache = None if cache is None else cache[0]
@@ -1280,6 +1391,7 @@ class QSAAttention(nn.Module):
             index_cache,
             physical_kv_length=physical_length,
             record_rollback=record_rollback,
+            rope_positions=rope_positions,
         )
 
         projected = self.q_proj(x).reshape(
@@ -1301,6 +1413,10 @@ class QSAAttention(nn.Module):
             positions = offset[:, None] + positions[None, :]
         else:
             positions = positions + int(offset)
+        if rope_positions is not None:
+            if positions.ndim == 1:
+                positions = mx.broadcast_to(positions[None], (batch, length))
+            positions = rope_positions.at(positions)
         # Qwen4-Exp uses half-split (rotate-half) pairing for its partial RoPE.
         # This follows mlx-vlm ecf1aa0a62958ea770bc25c35e173effe142aa3c
         # (MIT) while retaining Rapid's persistent QSA cache contract.
@@ -1309,12 +1425,14 @@ class QSAAttention(nn.Module):
             positions,
             rotary_dim=self.rotary_dim,
             base=self.indexer.rope_theta,
+            mrope_section=self.mrope_section,
         )
         keys = apply_qwen4_exp_rope(
             keys.transpose(0, 2, 1, 3),
             positions,
             rotary_dim=self.rotary_dim,
             base=self.indexer.rope_theta,
+            mrope_section=self.mrope_section,
         )
         if kv_cache is not None:
             keys, values = kv_cache.update_and_fetch(keys, values)
@@ -1870,6 +1988,7 @@ class DecoderLayer(nn.Module):
         cache: Any | None,
         record_rollback: bool = False,
         record_qsa_rollback: bool = False,
+        rope_positions: Any | None = None,
     ) -> mx.array:
         if self.ple is not None:
             hidden_states = hidden_states + self.ple(
@@ -1893,6 +2012,7 @@ class DecoderLayer(nn.Module):
                 cache=cache,
                 mask=mask,
                 record_rollback=record_qsa_rollback,
+                rope_positions=rope_positions,
             )
         hidden_states = self._combine(output, residual, injection)
 
@@ -1921,6 +2041,7 @@ class Qwen4ExpTextModel(nn.Module):
         return_hidden: bool = False,
         record_rollback: bool = False,
         record_qsa_rollback: bool = False,
+        rope_positions: Any | None = None,
     ) -> mx.array | tuple[mx.array, mx.array]:
         hidden_states = (
             input_embeddings
@@ -1957,6 +2078,7 @@ class Qwen4ExpTextModel(nn.Module):
                 cache=layer_cache,
                 record_rollback=record_rollback,
                 record_qsa_rollback=record_qsa_rollback,
+                rope_positions=rope_positions,
             )
         output = self.hyper_connection_mixer(hidden_states)
         return (output, hidden_states) if return_hidden else output
@@ -1978,6 +2100,7 @@ class TextModel(nn.Module):
         input_embeddings: mx.array | None = None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        rope_positions: Any | None = None,
     ) -> mx.array | tuple[mx.array, mx.array]:
         hidden_result = self.model(
             inputs,
@@ -1986,6 +2109,7 @@ class TextModel(nn.Module):
             return_hidden=return_hidden,
             record_rollback=n_confirmed > 0 and inputs.shape[1] > 1,
             record_qsa_rollback=n_confirmed > 1 and inputs.shape[1] > 2,
+            rope_positions=rope_positions,
         )
         if return_hidden:
             hidden, mtp_hidden = cast(tuple[mx.array, mx.array], hidden_result)
@@ -2094,6 +2218,7 @@ class Model(nn.Module):
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        rope_positions=None,
     ):
         return self.language_model(
             inputs,
@@ -2101,6 +2226,7 @@ class Model(nn.Module):
             input_embeddings,
             return_hidden=return_hidden,
             n_confirmed=n_confirmed,
+            rope_positions=rope_positions,
         )
 
     @property
