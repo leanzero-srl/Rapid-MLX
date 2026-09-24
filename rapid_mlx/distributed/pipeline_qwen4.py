@@ -51,18 +51,22 @@ from mlx_lm.models.cache import KVCache  # noqa: E402
 from ..models.qwen4_exp import Model, TextModelArgs  # noqa: E402
 from ..models.qwen4_exp_cache import QSAIndexCache  # noqa: E402
 
-# ratio: the MTPLX run measured a stable ceiling at 75% of RAM for MLX
-# allocations on 96-128 GB Apple silicon (mlx-jaccl-cluster skill, guardrail 3).
+# ratio: the stand-in ceiling for a node whose GPU working-set ceiling was not
+# given (a dry ``plan --node NAME:RAM[:FREE]``): the MTPLX run measured a stable
+# ceiling at 75% of RAM for MLX allocations on 96-128 GB Apple silicon.  A
+# measured node always carries Metal's own ceiling instead (NodeMemory).
 MEMORY_LIMIT_RATIO = 0.75
-# ratio: the same MTPLX receipt measured 60% of RAM as the safe wired ceiling;
-# exo's unbounded wiring is what panicked the 96 GB M3 Ultra.
-WIRED_LIMIT_RATIO = 0.60
-# ratio: the share of RAM that must stay available (host_statistics64) after
-# a rank loads.  Measured 2026-09-24 on the real model: the M4 Max 128 GB went
-# to vm pressure WARN at 19.4 GiB available (15%) — and its peer died — while
-# it stayed normal down to 27.3 GiB (21%); the M3 Ultra 96 GB stayed normal at
-# 21.0 GiB (22%).  The lowest share measured normal is the floor.
-PRESSURE_FLOOR_RATIO = 0.21
+# measured: the share of RAM that stays available (host_statistics64) under a
+# rank's full budget.  2026-09-24, M3 Ultra 96 GB after a compaction
+# (``memory_pressure -l warn``, incompressible pages): the kernel raised vm
+# pressure WARN at 3.73 GiB available = 3.9% of RAM.  goose's watchdog closes
+# admission at 5% of RAM (WATCHDOG_WARN_RESERVE_RATIO) and the ranks' own
+# re-measure at load read up to 0.6% of RAM below goose's preflight (goose
+# DERIVED_CONTEXT_MARGIN_RATIO carries 2% for it): 5% + 2% = 7%, so a stage
+# planned at 100% of its budget leaves the node above goose's WARN reserve and
+# the kernel's measured WARN point.  It replaced the 21% floor, which was the
+# lowest share seen NORMAL under a load — not where WARN starts.
+AVAILABLE_MARGIN_RATIO = 0.07
 # measured: one decoder layer's forward peaks at 49x the chunk's HC-stream
 # bytes above its resident weights — 1.96 GiB (GDN) / 1.94 GiB (QSA) for a
 # 2,101-token chunk of the real 4-bit checkpoint, 2026-09-24; the MoE block is
@@ -113,16 +117,30 @@ class NodeMemory:
     available_bytes: int
     free_percent: int
     pressure_level: int
+    # Metal's recommended working-set ceiling for this GPU
+    # (``max_recommended_working_set_size``): the most MLX may hold on the node.
+    ceiling_bytes: int
 
     @property
     def budget_bytes(self) -> int:
-        return max(
-            0,
-            min(
-                self.available_bytes - int(self.total_bytes * PRESSURE_FLOOR_RATIO),
-                int(self.total_bytes * MEMORY_LIMIT_RATIO),
-            ),
+        return node_budget_bytes(
+            self.total_bytes, self.available_bytes, self.ceiling_bytes
         )
+
+
+def node_budget_bytes(total_bytes: int, available_bytes: int, ceiling_bytes: int) -> int:
+    """min(available − RAM × AVAILABLE_MARGIN_RATIO, the GPU ceiling), never below 0."""
+    return max(
+        0,
+        min(
+            available_bytes - int(total_bytes * AVAILABLE_MARGIN_RATIO),
+            ceiling_bytes,
+        ),
+    )
+
+
+def gpu_ceiling_bytes() -> int:
+    return int(mx.device_info()["max_recommended_working_set_size"])
 
 
 class _VMStatistics64(ctypes.Structure):
@@ -194,6 +212,7 @@ def measure_node_memory() -> NodeMemory:
         available_bytes=available,
         free_percent=round(100 * available / total),
         pressure_level=_sysctl_int("kern.memorystatus_vm_pressure_level"),
+        ceiling_bytes=gpu_ceiling_bytes(),
     )
 
 
@@ -399,6 +418,9 @@ class NodeBudget:
     total_bytes: int
     budget_bytes: int
     source: str
+    # The figures the budget was built from, when they were given (plan JSON).
+    available_bytes: int | None = None
+    ceiling_bytes: int | None = None
 
 
 @dataclass
@@ -417,7 +439,7 @@ class StagePlan:
 
     @property
     def utilization(self) -> float:
-        # A node already below its pressure floor has no budget at all: every
+        # A node already below its available margin has no budget at all: every
         # split that gives it layers is infinitely over, and the plan still
         # prints (and refuses) with the numbers instead of crashing.
         if self.node.budget_bytes <= 0:
@@ -539,8 +561,8 @@ def _balanced_starts(
                 ).utilization
                 worst = max(best[rank - 1][start], cost)
                 # choice 0 is never a legal start for rank >= 1: it marks
-                # "unset", so an all-infinite row (a node below its pressure
-                # floor) still yields a split to print and refuse.
+                # "unset", so an all-infinite row (a node below its available
+                # margin) still yields a split to print and refuse.
                 if worst < best[rank][end] or choice[rank][end] == 0:
                     best[rank][end] = worst
                     choice[rank][end] = start
@@ -660,21 +682,22 @@ def wire_bytes_per_token(args: TextModelArgs, act: int, ranks: int) -> dict[str,
 
 
 def apply_memory_guardrails(node: NodeMemory, planned_bytes: int) -> dict[str, int]:
-    """Bound MLX on this rank as ratios of this node's RAM.
+    """Bound MLX on this rank at this GPU's own working-set ceiling.
 
     ``set_memory_limit`` is a guideline in MLX 0.32 (the allocator waits and
     reclaims cache first), so the hard stop is :class:`MemoryGuard`; the wired
-    limit is the one that prevents the exo-style wired-memory panic.
+    limit is Metal's recommended working set — never more — which is what
+    prevents the exo-style wired-memory panic.
     """
     budget = node.budget_bytes
     if planned_bytes > budget:
         raise PipelineDoesNotFitError(
             f"this rank plans {_gib(planned_bytes)} against a budget of "
-            f"{_gib(budget)} ({node.free_percent}% of {_gib(node.total_bytes)} free)"
+            f"{_gib(budget)} = min(available {_gib(node.available_bytes)} − RAM × "
+            f"{AVAILABLE_MARGIN_RATIO:.2f}, GPU ceiling {_gib(node.ceiling_bytes)})"
         )
-    memory_limit = int(node.total_bytes * MEMORY_LIMIT_RATIO)
-    system_wired = int(mx.device_info()["max_recommended_working_set_size"])
-    wired_limit = min(int(node.total_bytes * WIRED_LIMIT_RATIO), system_wired)
+    memory_limit = node.ceiling_bytes
+    wired_limit = node.ceiling_bytes
     cache_limit = max(0, memory_limit - planned_bytes)
     mx.set_memory_limit(memory_limit)
     mx.set_wired_limit(wired_limit)
@@ -1210,15 +1233,28 @@ def load_stage(
 
 def _parse_node(text: str) -> NodeBudget:
     parts = text.split(":")
-    if len(parts) not in (2, 3):
-        raise argparse.ArgumentTypeError("--node NAME:RAM_GIB[:FREE_GIB]")
+    if len(parts) not in (2, 3, 4):
+        raise argparse.ArgumentTypeError("--node NAME:RAM_GIB[:FREE_GIB[:CEILING_GIB]]")
     total = int(float(parts[1]) * 2**30)
-    if len(parts) == 3:
-        free = int(float(parts[2]) * 2**30)
-        memory = NodeMemory(total, free, round(100 * free / total), 1)
-        return NodeBudget(parts[0], total, memory.budget_bytes, "free given")
+    if len(parts) == 2:
+        return NodeBudget(
+            parts[0],
+            total,
+            int(total * MEMORY_LIMIT_RATIO),
+            "RAM cap, free not measured",
+        )
+    free = int(float(parts[2]) * 2**30)
+    if len(parts) == 4:
+        ceiling, source = int(float(parts[3]) * 2**30), "free + GPU ceiling given"
+    else:
+        ceiling, source = int(total * MEMORY_LIMIT_RATIO), "free given, ceiling RAM cap"
     return NodeBudget(
-        parts[0], total, int(total * MEMORY_LIMIT_RATIO), "RAM cap, free not measured"
+        parts[0],
+        total,
+        node_budget_bytes(total, free, ceiling),
+        source,
+        available_bytes=free,
+        ceiling_bytes=ceiling,
     )
 
 
@@ -1254,9 +1290,7 @@ def plan_json(plan: PipelinePlan, wire: dict[str, int]) -> dict[str, Any]:
             "layer_bytes": ckpt.layer_bytes,
         },
         "ratios": {
-            "memory_limit": MEMORY_LIMIT_RATIO,
-            "wired_limit": WIRED_LIMIT_RATIO,
-            "pressure_floor": PRESSURE_FLOOR_RATIO,
+            "available_margin": AVAILABLE_MARGIN_RATIO,
             "layer_transient_stream_multiple": LAYER_TRANSIENT_STREAM_MULTIPLE,
         },
         "wire": wire,
@@ -1271,6 +1305,8 @@ def plan_json(plan: PipelinePlan, wire: dict[str, int]) -> dict[str, Any]:
                 "workspace_bytes": stage.workspace_bytes,
                 "total_bytes": stage.total_bytes,
                 "budget_bytes": stage.node.budget_bytes,
+                "available_bytes": stage.node.available_bytes,
+                "ceiling_bytes": stage.node.ceiling_bytes,
                 "ram_bytes": stage.node.total_bytes,
                 "budget_source": stage.node.source,
                 "fits": stage.total_bytes <= stage.node.budget_bytes,
