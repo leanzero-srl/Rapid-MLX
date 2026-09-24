@@ -208,11 +208,11 @@ def cmd_ref(options) -> int:
     )
     print(pipe.format_plan(plan), flush=True)
     need = plan.stages[0].total_bytes
-    usable = node.available_bytes - int(node.total_bytes * pipe.PRESSURE_FLOOR_RATIO)
+    usable = node.budget_bytes
     if need > usable:
         print(
             f"REFUSED: single-node reference needs {need / 2**30:.2f} GiB, "
-            f"measured available - pressure floor = {usable / 2**30:.2f} GiB",
+            f"budget = min(available - RAM x margin, GPU ceiling) = {usable / 2**30:.2f} GiB",
             flush=True,
         )
         return 3
