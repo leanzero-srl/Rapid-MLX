@@ -263,6 +263,25 @@ def _text_only(messages: list[dict]) -> list[dict]:
     return flattened
 
 
+def _merge_tool_call_deltas(deltas: list[dict]) -> list[dict]:
+    """Fold the postprocessor's streaming tool-call deltas into whole calls."""
+    merged: dict[int, dict] = {}
+    for delta in deltas:
+        call = merged.setdefault(
+            delta.get("index", 0),
+            {
+                "id": None,
+                "type": "function",
+                "function": {"name": None, "arguments": ""},
+            },
+        )
+        call["id"] = call["id"] or delta.get("id")
+        function = delta.get("function") or {}
+        call["function"]["name"] = call["function"]["name"] or function.get("name")
+        call["function"]["arguments"] += function.get("arguments") or ""
+    return [merged[index] for index in sorted(merged)]
+
+
 def _build_app(state: _State, tokenizer, eos_ids: set[int]):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -271,6 +290,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
     from ..config.server_config import ServerConfig
     from ..engine.base import GenerationOutput
     from ..engine.batched import _normalize_tool_call_arguments_for_template
+    from ..service.helpers import _should_start_in_thinking
     from ..service.postprocessor import StreamingPostProcessor
     from ..utils.chat_template import apply_chat_template
 
@@ -397,6 +417,18 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
             request=body,
         )
         processor.reset()
+        if processor.reasoning_parser is not None and _should_start_in_thinking(
+            getattr(tokenizer, "chat_template", "") or "",
+            enable_thinking,
+            tools_requested=bool(tools),
+        ):
+            # The template opens <think> in the generation prompt, so the
+            # model never emits the opener.  deepseek_r1's streaming path
+            # flips a tagless stream to content after 64 characters unless it
+            # is told the prompt primed thinking (its own hook, set by
+            # configure_request on the distill variant).  Measured on Flash:
+            # without it every thought past 64 chars streamed as content.
+            processor.reasoning_parser._prompt_primed_thinking = True
 
         async def generate():
             """Yield (events, finish_reason, completion_tokens) as tokens arrive."""
@@ -575,15 +607,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
             job.cancelled = True
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": "".join(content) or None,
+            "content": "".join(content).strip() or None,
         }
         if reasoning:
-            message["reasoning_content"] = "".join(reasoning)
+            message["reasoning_content"] = "".join(reasoning).strip()
         if calls:
-            message["tool_calls"] = [
-                {key: value for key, value in call.items() if key != "index"}
-                for call in calls
-            ]
+            message["tool_calls"] = _merge_tool_call_deltas(calls)
             finish = "tool_calls"
         return {
             "id": f"chatcmpl-{job.id}",

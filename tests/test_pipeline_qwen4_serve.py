@@ -205,8 +205,12 @@ def test_streamed_and_non_streamed_text_agree(server):
             for key in pieces:
                 pieces[key] += delta.get(key) or ""
     message = whole["message"]
-    assert pieces["content"] == (message.get("content") or "")
-    assert pieces["reasoning_content"] == (message.get("reasoning_content") or "")
+    # The non-streamed message is trimmed like the single engine's whole-text
+    # reasoning split; the stream carries the same bytes untrimmed.
+    assert pieces["content"].strip() == (message.get("content") or "")
+    assert pieces["reasoning_content"].strip() == (
+        message.get("reasoning_content") or ""
+    )
 
 
 def test_queued_requests_are_batched_and_a_disconnect_cancels(server):
