@@ -15,11 +15,13 @@ planner accounts for them as that layer's bytes.  PLE needs the raw token ids;
 every rank already holds them because every rank runs the same driver loop and
 the sampled tokens are broadcast each step.
 
-Nothing here is imported by the single-node serving path.  Text only: the
-vision tower (``model.visual.*``) and the MTP head (``mtp.*``) are dropped by
-the model's own ``sanitize`` and are reported as excluded bytes.  Serving
-images would need the vision tower on rank 0 and its merged embeddings fed in
-place of ``embed_tokens``; that is not implemented.
+Nothing here is imported by the single-node serving path.  The MTP head
+(``mtp.*``) is dropped by the model's own ``sanitize``.  Image input: the vision
+tower (``model.visual.*``, :mod:`..models.qwen4_exp_vision`) is loaded on rank
+0 only and counted in rank 0's plan; rank 0 merges its features into the token
+embeddings before layer 0, and every rank receives the batch's multimodal RoPE
+table (plain integers, one all_sum) so the attention layers it owns rotate by
+the image's (t, h, w) positions.  Nothing else crosses a rank boundary.
 """
 
 from __future__ import annotations
@@ -213,6 +215,37 @@ class CheckpointBytes:
         return sum(self.layer_bytes) + self.head_bytes + self.tail_bytes
 
 
+@dataclass(frozen=True)
+class VisionCost:
+    """What serving images adds to rank 0: the tower and its encode transient.
+
+    The encode runs before the prefill and its buffers are released first
+    (``mx.clear_cache``), so the transient is the larger of the two, not the
+    sum.
+    """
+
+    weight_bytes: int
+    workspace_bytes: int
+
+
+def vision_cost(model_dir: Path, ckpt: CheckpointBytes) -> VisionCost | None:
+    """None when the checkpoint declares no vision tower."""
+    from ..models.qwen4_exp_vision import (
+        checkpoint_config,
+        declares_vision,
+        vision_workspace_bytes,
+    )
+
+    if not declares_vision(checkpoint_config(model_dir)):
+        return None
+    if not ckpt.excluded_bytes["vision"]:
+        raise ValueError(f"{model_dir} declares a vision_config but ships no tower")
+    return VisionCost(
+        weight_bytes=ckpt.excluded_bytes["vision"],
+        workspace_bytes=vision_workspace_bytes(model_dir),
+    )
+
+
 def _normalized_key(key: str) -> str | None:
     """Map a checkpoint key onto the loaded module path (Model.sanitize)."""
     if key.startswith("mtp."):
@@ -401,6 +434,7 @@ class PipelinePlan:
     checkpoint: CheckpointBytes
     max_context: int | None = field(default=None)
     args: TextModelArgs | None = field(default=None)
+    vision: VisionCost | None = field(default=None)
 
     @property
     def starts(self) -> list[int]:
@@ -418,6 +452,7 @@ def _stage_plan(
     context: int,
     batch: int,
     prefill_step: int,
+    vision: VisionCost | None = None,
 ) -> StagePlan:
     weights = sum(ckpt.layer_bytes[start:end])
     if rank == 0:
@@ -438,10 +473,15 @@ def _stage_plan(
         prefill_step=prefill_step,
         act=act,
     )
+    if rank == 0 and vision is not None:
+        weights += vision.weight_bytes
+        workspace = max(workspace, vision.workspace_bytes)
     return StagePlan(rank, node, start, end, weights, state, workspace)
 
 
-def _stages_for_starts(args, ckpt, nodes, starts, context, batch, prefill_step):
+def _stages_for_starts(
+    args, ckpt, nodes, starts, context, batch, prefill_step, vision=None
+):
     bounds = [*starts, args.num_hidden_layers]
     return [
         _stage_plan(
@@ -455,12 +495,15 @@ def _stages_for_starts(args, ckpt, nodes, starts, context, batch, prefill_step):
             context,
             batch,
             prefill_step,
+            vision,
         )
         for rank, node in enumerate(nodes)
     ]
 
 
-def _balanced_starts(args, ckpt, nodes, context, batch, prefill_step) -> list[int]:
+def _balanced_starts(
+    args, ckpt, nodes, context, batch, prefill_step, vision=None
+) -> list[int]:
     """Contiguous split minimizing the worst rank's cost / budget.
 
     Equal utilization is the same thing as layer bytes proportional to each
@@ -476,7 +519,7 @@ def _balanced_starts(args, ckpt, nodes, context, batch, prefill_step) -> list[in
     choice = [[0] * (layers + 1) for _ in range(size)]
     for end in range(1, layers + 1):
         best[0][end] = _stage_plan(
-            args, ckpt, nodes[0], 0, size, 0, end, context, batch, prefill_step
+            args, ckpt, nodes[0], 0, size, 0, end, context, batch, prefill_step, vision
         ).utilization
     for rank in range(1, size):
         for end in range(rank + 1, layers + 1):
@@ -492,6 +535,7 @@ def _balanced_starts(args, ckpt, nodes, context, batch, prefill_step) -> list[in
                     context,
                     batch,
                     prefill_step,
+                    vision,
                 ).utilization
                 worst = max(best[rank - 1][start], cost)
                 # choice 0 is never a legal start for rank >= 1: it marks
@@ -521,21 +565,28 @@ def plan_pipeline(
     batch: int,
     prefill_step: int,
     starts: list[int] | None = None,
+    vision: VisionCost | None = None,
 ) -> PipelinePlan:
     if starts is None:
-        starts = _balanced_starts(args, ckpt, nodes, context, batch, prefill_step)
+        starts = _balanced_starts(
+            args, ckpt, nodes, context, batch, prefill_step, vision
+        )
     if len(starts) != len(nodes) or starts[0] != 0 or starts != sorted(set(starts)):
         raise ValueError(f"invalid split starts {starts} for {len(nodes)} ranks")
     if starts[-1] >= args.num_hidden_layers:
         raise ValueError(f"split {starts} leaves the last rank without layers")
-    stages = _stages_for_starts(args, ckpt, nodes, starts, context, batch, prefill_step)
-    plan = PipelinePlan(stages, context, batch, prefill_step, ckpt, args=args)
+    stages = _stages_for_starts(
+        args, ckpt, nodes, starts, context, batch, prefill_step, vision
+    )
+    plan = PipelinePlan(
+        stages, context, batch, prefill_step, ckpt, args=args, vision=vision
+    )
     # Context ceiling on this split: the largest context every rank fits.
     low, high = 0, args.max_position_embeddings
     while low < high:
         middle = (low + high + 1) // 2
         trial = _stages_for_starts(
-            args, ckpt, nodes, starts, middle, batch, min(prefill_step, middle)
+            args, ckpt, nodes, starts, middle, batch, min(prefill_step, middle), vision
         )
         if _fits(trial):
             low = middle
@@ -559,10 +610,15 @@ def _gib(value: int) -> str:
 
 def format_plan(plan: PipelinePlan) -> str:
     ckpt = plan.checkpoint
+    vision = (
+        f"vision tower {_gib(plan.vision.weight_bytes)} + encode "
+        f"{_gib(plan.vision.workspace_bytes)} on rank 0"
+        if plan.vision is not None
+        else f"vision {_gib(ckpt.excluded_bytes['vision'])} not loaded"
+    )
     lines = [
         f"checkpoint text bytes {_gib(ckpt.text_bytes)} "
-        f"(excluded: mtp {_gib(ckpt.excluded_bytes['mtp'])}, "
-        f"vision {_gib(ckpt.excluded_bytes['vision'])}); "
+        f"(excluded: mtp {_gib(ckpt.excluded_bytes['mtp'])}; {vision}); "
         f"embed {_gib(ckpt.head_bytes)}, mixer+lm_head {_gib(ckpt.tail_bytes)}",
         f"context {plan.context:,} tokens, batch {plan.batch}, "
         f"prefill chunk {plan.prefill_step}",
@@ -712,6 +768,7 @@ class PipelineStage:
         self.end = end
         self.wire_dtype = wire_dtype
         self.args = model.language_model.args
+        self.vision = None
 
     @property
     def is_first(self) -> bool:
@@ -728,20 +785,30 @@ class PipelineStage:
 
         return _make_cache(self.model, left_padding, None)
 
-    def forward(self, inputs: mx.array, cache: list[Any], logits: str | None):
+    def forward(
+        self,
+        inputs: mx.array,
+        cache: list[Any],
+        logits: str | None,
+        *,
+        embeddings: mx.array | None = None,
+        rope_positions: Any | None = None,
+    ):
         """One pipeline stage of ``Qwen4ExpTextModel.__call__``.
 
         Returns the send handle on non-last ranks; on the last rank the
         logits (``"all"`` positions or the ``"last"`` one), or the stream
         itself when ``logits`` is None (prefill chunks whose logits nobody
-        reads).
+        reads).  ``embeddings`` (rank 0) replaces ``embed_tokens(inputs)`` —
+        the image-merged rows; ``rope_positions`` (every rank) is the batch's
+        :class:`MRopePositions` when any row carries an image.
         """
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
         inner = self.model.language_model.model
         batch, length = inputs.shape
         if self.is_first:
-            hidden = inner.embed_tokens(inputs)
+            hidden = inner.embed_tokens(inputs) if embeddings is None else embeddings
             hidden = mx.tile(hidden, (1, 1, self.args.hc_count))
         else:
             hidden = receive_stream(
@@ -774,6 +841,7 @@ class PipelineStage:
                 input_ids=inputs,
                 mask=linear_mask if layer.is_linear else attention_mask,
                 cache=layer_cache,
+                rope_positions=rope_positions,
             )
         if not self.is_last:
             if hidden.dtype != self.wire_dtype:
@@ -787,6 +855,119 @@ class PipelineStage:
         if logits == "last":
             hidden = hidden[:, -1:, :]
         return self.model.language_model.lm_head(inner.hyper_connection_mixer(hidden))
+
+
+@dataclass
+class ImageInput:
+    """One row's preprocessed images (rank 0 only): pixels + (t, h, w) grids."""
+
+    pixel_values: Any
+    grid_thw: list[list[int]]
+
+
+def exchange_rope_positions(
+    stage: PipelineStage,
+    rows: list[tuple[list[list[int]], int]] | None,
+    lengths: list[int],
+):
+    """Rank 0's multimodal RoPE table, identical on every rank; None if text-only.
+
+    Two all_sums: a flag, then (when set) the ``[3, B, W]`` table and the
+    per-row deltas as int32.  Every rank calls this once per batch, images or
+    not, so the collective order never depends on the request.
+    """
+    from ..models.qwen4_exp_vision import MRopePositions
+
+    batch, width = len(lengths), max(lengths)
+    local = stage.is_first and rows is not None
+    flag = mx.array([1 if local else 0], dtype=mx.int32)
+    if stage.size > 1:
+        flag = mx.distributed.all_sum(flag, group=stage.group)
+    if not int(flag.item()):
+        return None
+    table = [[[0] * width for _ in range(batch)] for _ in range(3)]
+    deltas = [0] * batch
+    if local:
+        for row, (positions, delta) in enumerate(rows):
+            if len(positions[0]) != lengths[row]:
+                raise ValueError(
+                    f"row {row}: RoPE table covers {len(positions[0])} tokens, "
+                    f"the row has {lengths[row]}"
+                )
+            for axis in range(3):
+                table[axis][row][: lengths[row]] = positions[axis]
+            deltas[row] = delta
+    flat = mx.array(
+        [value for axis in table for row in axis for value in row] + deltas,
+        dtype=mx.int32,
+    )
+    if stage.size > 1:
+        flat = mx.distributed.all_sum(flat, group=stage.group)
+    values = flat.tolist()
+
+    def axis_row(axis: int, row: int) -> list[int]:
+        start = (axis * batch + row) * width
+        return values[start : start + lengths[row]]
+
+    return MRopePositions.from_rows(
+        [
+            (
+                [axis_row(axis, row) for axis in range(3)],
+                values[3 * batch * width + row],
+            )
+            for row in range(batch)
+        ]
+    )
+
+
+def prepare_multimodal(
+    stage: PipelineStage,
+    rows_ids: list[list[int]],
+    images: list[ImageInput | None] | None,
+):
+    """``(embeddings, rope_positions)`` for one left-padded batch.
+
+    ``embeddings`` is rank 0's ``[B, W, hidden]`` with image features merged
+    (None on other ranks or for a text-only batch).  Called by every rank.
+    """
+    from ..models.qwen4_exp_vision import merge_image_features
+
+    lengths = [len(ids) for ids in rows_ids]
+    width = max(lengths)
+    vision = stage.vision
+    has_images = bool(images) and any(item is not None for item in images)
+    if has_images and (not stage.is_first or vision is None):
+        raise ValueError("image input needs the vision tower on rank 0")
+    tables = None
+    if has_images:
+        tables = [
+            vision.rope_positions(ids, item.grid_thw)
+            if item is not None
+            else ([list(range(len(ids)))] * 3, 0)
+            for ids, item in zip(rows_ids, images)
+        ]
+    rope = exchange_rope_positions(stage, tables, lengths)
+    if not has_images:
+        return None, rope
+    embed = stage.model.language_model.model.embed_tokens
+    merged = []
+    for ids, item in zip(rows_ids, images):
+        pad = width - len(ids)
+        tokens = mx.array([[0] * pad + ids], dtype=mx.int32)
+        row = embed(tokens)
+        if item is not None:
+            features = vision.encode(mx.array(item.pixel_values), item.grid_thw)
+            real = merge_image_features(
+                row[:, pad:], mx.array(ids), features, vision.image_token_id
+            )
+            row = mx.concatenate([row[:, :pad], real], axis=1) if pad else real
+        merged.append(row)
+    embeddings = mx.concatenate(merged, axis=0)
+    mx.eval(embeddings)
+    # The encode transient is planned as the larger of it and the prefill's,
+    # not their sum: hand its buffers back before the prefill allocates.
+    mx.clear_cache()
+    return embeddings, rope
 
 
 def _step_sync(
@@ -833,11 +1014,15 @@ def pipeline_prefill_logits(
     *,
     pad_id: int = 0,
     guard: MemoryGuard | None = None,
+    images: list[ImageInput | None] | None = None,
 ) -> mx.array | None:
     """Full-prompt logits from one un-chunked forward (last rank only)."""
     tokens, padding = _left_pad(prompts, pad_id)
+    embeddings, rope = prepare_multimodal(stage, prompts, images)
     cache = stage.make_cache(padding if len(prompts) > 1 else None)
-    out = stage.forward(tokens, cache, logits="all")
+    out = stage.forward(
+        tokens, cache, logits="all", embeddings=embeddings, rope_positions=rope
+    )
     if stage.is_last:
         mx.eval(out)
     _step_sync(stage, out, cache, len(prompts), guard, sample=False)
@@ -859,6 +1044,7 @@ def pipeline_generate(
     eos_ids: tuple[int, ...] = (),
     prefill_step: int | None = None,
     guard: MemoryGuard | None = None,
+    images: list[ImageInput | None] | None = None,
 ) -> list[list[int]]:
     """Greedy decode, identical token stream on every rank.
 
@@ -869,16 +1055,33 @@ def pipeline_generate(
     step = prefill_step or default_prefill_step()
     tokens, padding = _left_pad(prompts, pad_id)
     batch = len(prompts)
+    embeddings, rope = prepare_multimodal(stage, prompts, images)
     cache = stage.make_cache(padding if batch > 1 else None)
     prefix = tokens[:, :-1]
     for offset in range(0, prefix.shape[1], step):
-        out = stage.forward(prefix[:, offset : offset + step], cache, logits=None)
+        out = stage.forward(
+            prefix[:, offset : offset + step],
+            cache,
+            logits=None,
+            embeddings=None
+            if embeddings is None
+            else embeddings[:, :-1][:, offset : offset + step],
+            rope_positions=rope,
+        )
         _step_sync(stage, out, cache, batch, guard, sample=False)
     current = tokens[:, -1:]
+    current_embeddings = None if embeddings is None else embeddings[:, -1:]
     generated: list[list[int]] = [[] for _ in range(batch)]
     finished = [False] * batch
     for _ in range(max_tokens):
-        out = stage.forward(current, cache, logits="last")
+        out = stage.forward(
+            current,
+            cache,
+            logits="last",
+            embeddings=current_embeddings,
+            rope_positions=rope,
+        )
+        current_embeddings = None
         next_tokens = _step_sync(stage, out, cache, batch, guard, sample=True)
         for row, token in enumerate(next_tokens):
             generated[row].append(token)
@@ -954,16 +1157,19 @@ def load_stage(
     prefill_step: int | None = None,
     starts: list[int] | None = None,
     layer_limit: int | None = None,
+    vision: bool = True,
     log=print,
 ) -> tuple[PipelineStage, PipelinePlan, MemoryGuard]:
     from mlx_lm.utils import load_model
 
+    from ..models.qwen4_exp_vision import load_vision_tower
     from ..utils.tokenizer import _register_vendored_archs
 
     args = load_text_args(model_dir)
     ckpt = read_checkpoint_bytes(model_dir, args.num_hidden_layers)
     if layer_limit is not None:
         args, ckpt = truncate_layers(args, ckpt, layer_limit)
+    cost = vision_cost(model_dir, ckpt) if vision else None
     node = measure_node_memory()
     nodes = _gather_node_budgets(node, ckpt.text_bytes, group)
     step = prefill_step or default_prefill_step()
@@ -975,6 +1181,7 @@ def load_stage(
         batch=batch,
         prefill_step=step,
         starts=starts,
+        vision=cost,
     )
     rank = group.rank()
     if rank == 0:
@@ -990,6 +1197,8 @@ def load_stage(
     mx.eval(model.parameters())
     wire_dtype = _exchange_wire_dtype(model, group)
     stage = PipelineStage(model, group, stage_plan.start, stage_plan.end, wire_dtype)
+    if rank == 0 and cost is not None:
+        stage.vision = load_vision_tower(model_dir)
     stage.limits = limits
     return stage, plan, MemoryGuard(node.budget_bytes, rank)
 
@@ -1030,6 +1239,13 @@ def plan_json(plan: PipelinePlan, wire: dict[str, int]) -> dict[str, Any]:
         "starts": plan.starts,
         "slots": plan.batch,
         "fits": _fits(plan.stages),
+        "vision": None
+        if plan.vision is None
+        else {
+            "rank": 0,
+            "weight_bytes": plan.vision.weight_bytes,
+            "workspace_bytes": plan.vision.workspace_bytes,
+        },
         "checkpoint": {
             "text_bytes": ckpt.text_bytes,
             "head_bytes": ckpt.head_bytes,
@@ -1077,6 +1293,7 @@ def _cmd_plan(options) -> int:
         batch=options.batch,
         prefill_step=options.prefill_step or default_prefill_step(),
         starts=_parse_starts(options.split),
+        vision=None if options.no_vision else vision_cost(model_dir, ckpt),
     )
     wire = wire_bytes_per_token(args, ckpt.activation_bytes, len(nodes))
     if options.json:
@@ -1123,8 +1340,19 @@ def _cmd_run(options) -> int:
         batch=len(prompts),
         prefill_step=options.prefill_step,
         starts=_parse_starts(options.split),
+        vision=not options.no_vision,
         log=lambda line: print(line, flush=True),
     )
+    images = None
+    if stage.is_first and options.vision_inputs:
+        images = _load_vision_inputs(Path(options.vision_inputs), len(prompts))
+    elif stage.is_first and options.image:
+        prompts[0], first = chat_image_prompt(
+            stage.vision, tokenizer, options.prompt[0], options.image
+        )
+        images = [first] + [None] * (len(prompts) - 1)
+    if options.image:
+        prompts = _agree_prompts(stage, prompts)
     if options.guard_limit_gib is not None:
         guard.budget_bytes = min(
             guard.budget_bytes, int(options.guard_limit_gib * 2**30)
@@ -1134,7 +1362,7 @@ def _cmd_run(options) -> int:
         eos_ids = tuple(tokenizer.eos_token_ids)
     logits = None
     if options.dump:
-        logits = pipeline_prefill_logits(stage, prompts, guard=guard)
+        logits = pipeline_prefill_logits(stage, prompts, guard=guard, images=images)
     tokens = pipeline_generate(
         stage,
         prompts,
@@ -1142,6 +1370,7 @@ def _cmd_run(options) -> int:
         eos_ids=eos_ids,
         prefill_step=options.prefill_step,
         guard=guard,
+        images=images,
     )
     if options.dump and stage.is_last:
         import numpy as np
@@ -1163,6 +1392,75 @@ def _cmd_run(options) -> int:
     return 0
 
 
+def _load_vision_inputs(path: Path, rows: int) -> list[ImageInput | None]:
+    """``pixel_values_<row>`` / ``grid_thw_<row>`` arrays per row (npz)."""
+    import numpy as np
+
+    data = np.load(path)
+    return [
+        ImageInput(data[f"pixel_values_{row}"], data[f"grid_thw_{row}"].tolist())
+        if f"pixel_values_{row}" in data
+        else None
+        for row in range(rows)
+    ]
+
+
+def chat_image_prompt(vision, tokenizer, text: str, image_paths: list[str]):
+    """One user turn — the images, then ``text`` — rendered and expanded.
+
+    The same path the server takes: the checkpoint's chat template places one
+    ``<|vision_start|><|image_pad|><|vision_end|>`` per image, and mlx-vlm's
+    processor resizes each image and expands its pad into the image's tokens.
+    """
+    from PIL import Image
+
+    from ..utils.chat_template import apply_chat_template
+
+    if vision is None:
+        raise ValueError("--image needs a checkpoint with a vision tower")
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"} for _ in image_paths]
+            + [{"type": "text", "text": text}],
+        }
+    ]
+    prompt = apply_chat_template(
+        tokenizer, messages, enable_thinking=False, model_name="pipeline"
+    )
+    images = [Image.open(path).convert("RGB") for path in image_paths]
+    out = vision.processor(tokenizer)(text=[prompt], images=images, return_tensors="np")
+    return (
+        out["input_ids"][0].tolist(),
+        ImageInput(out["pixel_values"], out["image_grid_thw"].tolist()),
+    )
+
+
+def _agree_prompts(stage: PipelineStage, prompts: list[list[int]]) -> list[list[int]]:
+    """Rank 0's prompt ids on every rank (image expansion happens on rank 0)."""
+    if stage.size == 1:
+        return prompts
+    lengths = mx.distributed.all_sum(
+        mx.array(
+            [len(p) for p in prompts] if stage.is_first else [0] * len(prompts),
+            dtype=mx.int32,
+        ),
+        group=stage.group,
+    ).tolist()
+    flat = (
+        [token for p in prompts for token in p]
+        if stage.is_first
+        else [0] * sum(lengths)
+    )
+    flat = mx.distributed.all_sum(mx.array(flat, dtype=mx.int32), group=stage.group)
+    values = flat.tolist()
+    agreed, start = [], 0
+    for length in lengths:
+        agreed.append(values[start : start + length])
+        start += length
+    return agreed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m rapid_mlx.distributed.pipeline_qwen4"
@@ -1177,6 +1475,11 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--prefill-step", type=int)
     plan.add_argument("--split", help="forced starts for ranks 1..N-1, e.g. 20")
     plan.add_argument("--json", action="store_true", help="machine-readable plan")
+    plan.add_argument(
+        "--no-vision",
+        action="store_true",
+        help="plan text only (the vision tower is not loaded on rank 0)",
+    )
 
     from . import pipeline_qwen4_serve
 
@@ -1193,6 +1496,17 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--split")
     run.add_argument("--ignore-eos", action="store_true")
     run.add_argument("--dump", help="last rank writes prefill logits + tokens (npz)")
+    run.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="attach an image to the first --prompt (rendered as a chat turn)",
+    )
+    run.add_argument(
+        "--vision-inputs",
+        help="npz of pixel_values_<row>/grid_thw_<row> for --prompt-ids rows",
+    )
+    run.add_argument("--no-vision", action="store_true")
     run.add_argument(
         "--guard-limit-gib",
         type=float,
