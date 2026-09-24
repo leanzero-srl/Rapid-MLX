@@ -990,6 +990,7 @@ def cmd_stream(options) -> int:
                             "pipeline_margin": trace[step]["margin"],
                         }
                     )
+            by_step = [round(value, 6) for value in top1_diffs]
             top1_diffs.sort()
             entry = {
                 "row": name,
@@ -1000,6 +1001,7 @@ def cmd_stream(options) -> int:
                 "top1_logprob_diff_median": round(top1_diffs[len(top1_diffs) // 2], 6),
                 "top1_logprob_diff_max": round(top1_diffs[-1], 6),
                 "disagreements": disagreements,
+                "top1_logprob_diff_by_step": by_step,
             }
             report.append(entry)
             print(json.dumps(entry), flush=True)
