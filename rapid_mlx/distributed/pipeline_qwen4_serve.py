@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import queue
 import signal
@@ -218,13 +219,67 @@ class _Job:
         self.loop.call_soon_threadsafe(self.events.put_nowait, item)
 
 
+class _KvBudget:
+    """Admission by what a batch would hold on EVERY rank, in the planner's own terms.
+
+    The split was planned for ``slots`` full-context sequences (the planner's
+    ``batch``): each rank's budget for runtime state is its planned KV/recurrent
+    state plus prefill workspace at that shape.  A candidate batch reserves, on
+    each rank, the same two terms at ``rows`` x the longest row's
+    prompt + max_tokens (+1 for the step that ends the batch), rounded to the
+    caches' allocation steps by ``layer_state_bytes``.  Rows are left-padded to
+    one width, so a batch costs rows x its longest row, never the sum.
+    """
+
+    def __init__(self, plan, prefill_step: int):
+        self.plan = plan
+        self.prefill_step = prefill_step
+        self.args = plan.args
+        self.budgets = [
+            stage.state_bytes + stage.workspace_bytes for stage in plan.stages
+        ]
+        self.slots = plan.batch
+
+    def reserve(self, lengths: list[int]) -> list[int]:
+        size = len(self.plan.stages)
+        return [
+            (lambda planned: planned.state_bytes + planned.workspace_bytes)(
+                pipe._stage_plan(
+                    self.args,
+                    self.plan.checkpoint,
+                    stage.node,
+                    stage.rank,
+                    size,
+                    stage.start,
+                    stage.end,
+                    max(lengths),
+                    len(lengths),
+                    min(self.prefill_step, max(lengths)),
+                )
+            )
+            for stage in self.plan.stages
+        ]
+
+    def fits(self, lengths: list[int]) -> bool:
+        return all(
+            need <= budget for need, budget in zip(self.reserve(lengths), self.budgets)
+        )
+
+
+def _reservation_length(row: _Row) -> int:
+    return len(row.ids) + row.max_tokens + 1
+
+
 @dataclass
 class _State:
     served: str
     context: int
     max_batch: int
+    kv: _KvBudget | None = None
     jobs: queue.Queue = field(default_factory=queue.Queue)
+    held: object = None
     active: list = field(default_factory=list)
+    reserved: list = field(default_factory=list)
     steps: int = 0
     admission_open: bool = True
     admission_reason: str | None = None
@@ -328,9 +383,22 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int]):
     @app.get("/v1/status")
     async def status():
         running = sum(1 for job in state.active if not job.finished)
+        kv = state.kv
+        reserved = list(state.reserved)
+        if kv is not None and reserved:
+            share = max(r / b for r, b in zip(reserved, kv.budgets))
+        else:
+            share = 0.0
         return {
             "num_running": running,
-            "num_waiting": state.jobs.qsize(),
+            "num_waiting": state.jobs.qsize() + (1 if state.held is not None else 0),
+            "slots": kv.slots if kv is not None else None,
+            "slots_in_use": math.ceil(share * kv.slots - 1e-9)
+            if kv is not None
+            else None,
+            "sequences_in_flight": len(state.active),
+            "kv_reserved_bytes": reserved,
+            "kv_budget_bytes": kv.budgets if kv is not None else None,
             "status": "ok",
         }
 
@@ -667,11 +735,17 @@ def _run_jobs(
 def _rank0_loop(stage, guard, state: _State, prefill_step: int) -> None:
     group = stage.group
     while True:
-        first = state.jobs.get()
+        if state.held is not None:
+            first, state.held = state.held, None
+        else:
+            first = state.jobs.get()
         if first is None:
             _broadcast_batch(group, None, state.max_batch)
             return
+        if first.cancelled:
+            continue
         batch = [first]
+        lengths = [_reservation_length(first.row)]
         while len(batch) < state.max_batch:
             try:
                 extra = state.jobs.get_nowait()
@@ -680,14 +754,23 @@ def _rank0_loop(stage, guard, state: _State, prefill_step: int) -> None:
             if extra is None:
                 state.jobs.put(None)
                 break
+            if extra.cancelled:
+                continue
+            candidate = [*lengths, _reservation_length(extra.row)]
+            if state.kv is not None and not state.kv.fits(candidate):
+                # First come, first served: the request that does not fit
+                # beside this batch heads the next one, and nothing behind it
+                # jumps the line.
+                state.held = extra
+                break
             batch.append(extra)
-        batch = [job for job in batch if not job.cancelled]
-        if not batch:
-            continue
+            lengths = candidate
         state.active = batch
+        state.reserved = state.kv.reserve(lengths) if state.kv is not None else []
         _broadcast_batch(group, [job.row for job in batch], state.max_batch)
         _run_jobs(stage, guard, state, batch, prefill_step)
         state.active = []
+        state.reserved = []
 
 
 def _worker_loop(stage, guard, max_batch: int, prefill_step: int) -> None:
@@ -715,7 +798,7 @@ def serve(options, emit=None) -> int:
         model_dir,
         group,
         context=options.context,
-        batch=options.max_batch,
+        batch=options.slots,
         prefill_step=prefill_step,
         starts=pipe._parse_starts(options.split),
         log=lambda line: print(line, flush=True),
@@ -745,6 +828,7 @@ def serve(options, emit=None) -> int:
         served=options.served_model_name,
         context=context,
         max_batch=options.max_batch,
+        kv=_KvBudget(plan, prefill_step),
         eos_ids=frozenset(tokenizer.eos_token_ids),
     )
 
@@ -805,7 +889,18 @@ def add_arguments(parser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--context", type=int, required=True)
-    parser.add_argument("--max-batch", type=int, default=2)
+    parser.add_argument(
+        "--slots",
+        type=int,
+        default=2,
+        help="full-context sequences the split is planned (and KV-budgeted) for",
+    )
+    parser.add_argument(
+        "--max-batch",
+        type=int,
+        default=2,
+        help="most rows one batch may carry; the KV budget decides how many do",
+    )
     parser.add_argument("--prefill-step", type=int)
     parser.add_argument(
         "--split", help="pinned starts for ranks 1..N-1 (the preflighted plan)"

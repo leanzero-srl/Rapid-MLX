@@ -75,7 +75,7 @@ def checkpoint(tmp_path_factory) -> Path:
 
 
 class _Server:
-    def __init__(self, checkpoint: Path):
+    def __init__(self, checkpoint: Path, extra: tuple[str, ...] = ()):
         launcher = Path(sys.executable).parent / "mlx.launch"
         if not launcher.exists():
             pytest.skip("mlx.launch is not installed next to this interpreter")
@@ -107,6 +107,7 @@ class _Server:
                 "512",
                 "--split",
                 "4",
+                *extra,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -286,3 +287,76 @@ def test_sigterm_to_rank0_stops_every_rank(checkpoint):
         pid = running.ready[rank]["pid"]
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+def test_kv_budget_admits_what_the_plan_holds(checkpoint):
+    from rapid_mlx.distributed import pipeline_qwen4 as pipe
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _KvBudget
+
+    args = pipe.load_text_args(checkpoint)
+    ckpt = pipe.read_checkpoint_bytes(checkpoint, args.num_hidden_layers)
+    nodes = [pipe.NodeBudget(f"n{i}", 2**36, 2**35, "test") for i in range(2)]
+    plan = pipe.plan_pipeline(
+        args, ckpt, nodes, context=512, batch=1, prefill_step=256, starts=[0, 4]
+    )
+    kv = _KvBudget(plan, 256)
+    assert kv.slots == 1
+    assert kv.fits([512])
+    assert not kv.fits([512, 512])  # two full-context rows need two slots
+    assert kv.fits([40, 40])  # two short rows fit in one slot's bytes
+    assert not kv.fits([40, 512])  # padding makes the short row as long as the long one
+
+
+def test_a_second_long_request_waits_for_kv_and_both_complete(checkpoint):
+    running = _Server(checkpoint, ("--slots", "1", "--max-batch", "2"))
+    try:
+        status = running.get("/v1/status")
+        assert status["slots"] == 1 and status["slots_in_use"] == 0
+        results: dict[str, dict] = {}
+
+        def run(key: str, tokens: int) -> None:
+            results[key] = json.load(running.post(_chat("w3 w4", max_tokens=tokens)))
+
+        # A warm request holds the loop so both long requests are queued when
+        # the next batch forms: only the KV budget can keep them apart.
+        warm = threading.Thread(target=run, args=("hold", 60))
+        warm.start()
+        while running.get("/v1/status")["num_running"] == 0:
+            time.sleep(0.05)
+        longs = [threading.Thread(target=run, args=(k, 400)) for k in ("l1", "l2")]
+        for thread in longs:
+            thread.start()
+        while running.get("/v1/status")["num_waiting"] < 2:
+            time.sleep(0.05)
+        warm.join()
+        seen_waiting = False
+        most_in_flight = 0
+        while any(thread.is_alive() for thread in longs):
+            status = running.get("/v1/status")
+            most_in_flight = max(most_in_flight, status["sequences_in_flight"])
+            if status["num_waiting"] >= 1 and status["sequences_in_flight"] == 1:
+                seen_waiting = True
+                assert status["slots_in_use"] == 1
+            time.sleep(0.02)
+        for thread in longs:
+            thread.join()
+        assert seen_waiting and most_in_flight == 1
+        for key in ("l1", "l2"):
+            assert results[key]["usage"]["completion_tokens"] >= 1
+
+        before = running.get("/goose/progress")["steps"]
+        long_one = threading.Thread(target=run, args=("warm", 120))
+        long_one.start()
+        while running.get("/v1/status")["num_running"] == 0:
+            time.sleep(0.05)
+        shorts = [threading.Thread(target=run, args=(k, 20)) for k in ("s1", "s2")]
+        for thread in shorts:
+            thread.start()
+        for thread in [long_one, *shorts]:
+            thread.join()
+        steps = running.get("/goose/progress")["steps"] - before
+        produced = sum(results[k]["usage"]["completion_tokens"] for k in ("s1", "s2"))
+        assert steps - results["warm"]["usage"]["completion_tokens"] < produced
+    finally:
+        os.kill(running.ready[0]["pid"], signal.SIGTERM)
+        running.process.wait(timeout=60)

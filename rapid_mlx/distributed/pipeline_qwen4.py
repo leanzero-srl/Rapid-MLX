@@ -400,6 +400,7 @@ class PipelinePlan:
     prefill_step: int
     checkpoint: CheckpointBytes
     max_context: int | None = field(default=None)
+    args: TextModelArgs | None = field(default=None)
 
     @property
     def starts(self) -> list[int]:
@@ -528,7 +529,7 @@ def plan_pipeline(
     if starts[-1] >= args.num_hidden_layers:
         raise ValueError(f"split {starts} leaves the last rank without layers")
     stages = _stages_for_starts(args, ckpt, nodes, starts, context, batch, prefill_step)
-    plan = PipelinePlan(stages, context, batch, prefill_step, ckpt)
+    plan = PipelinePlan(stages, context, batch, prefill_step, ckpt, args=args)
     # Context ceiling on this split: the largest context every rank fits.
     low, high = 0, args.max_position_embeddings
     while low < high:
@@ -1027,6 +1028,7 @@ def plan_json(plan: PipelinePlan, wire: dict[str, int]) -> dict[str, Any]:
         "prefill_step": plan.prefill_step,
         "max_context": plan.max_context,
         "starts": plan.starts,
+        "slots": plan.batch,
         "fits": _fits(plan.stages),
         "checkpoint": {
             "text_bytes": ckpt.text_bytes,
