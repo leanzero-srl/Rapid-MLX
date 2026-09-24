@@ -5,6 +5,7 @@ ring`` on 127.0.0.1 and compare them against the fork's unmodified single
 process forward on the same quantized random-init checkpoint.
 """
 
+import argparse
 import json
 import random
 import shutil
@@ -371,7 +372,7 @@ def test_preflight_refuses_with_the_numbers(tiny_checkpoint):
     assert "starved" in message and "DOES NOT FIT" in message and "GiB" in message
 
 
-def test_guardrails_are_ratios_of_this_node(monkeypatch):
+def test_guardrails_sit_at_this_gpus_ceiling(monkeypatch):
     calls = {}
     monkeypatch.setattr(mx, "set_memory_limit", lambda v: calls.setdefault("memory", v))
     monkeypatch.setattr(mx, "set_wired_limit", lambda v: calls.setdefault("wired", v))
@@ -380,14 +381,44 @@ def test_guardrails_are_ratios_of_this_node(monkeypatch):
         mx, "device_info", lambda: {"max_recommended_working_set_size": 2**40}
     )
     total = 96 * 2**30
-    node = pipe.NodeMemory(total, total // 2, 50, 1)
+    # The M3 Ultra's measured ceiling (mx.device_info, 2026-09-24).
+    ceiling = 83_494_174_720
+    node = pipe.NodeMemory(total, total // 2, 50, 1, ceiling)
     limits = pipe.apply_memory_guardrails(node, 10 * 2**30)
-    assert calls["memory"] == int(total * pipe.MEMORY_LIMIT_RATIO)
-    assert calls["wired"] == int(total * pipe.WIRED_LIMIT_RATIO)
-    assert calls["cache"] == calls["memory"] - 10 * 2**30
-    assert limits["budget"] == total // 2 - int(total * pipe.PRESSURE_FLOOR_RATIO)
-    with pytest.raises(pipe.PipelineDoesNotFitError, match="budget"):
+    assert calls["memory"] == ceiling
+    assert calls["wired"] == ceiling
+    assert calls["cache"] == ceiling - 10 * 2**30
+    assert limits["budget"] == total // 2 - int(total * pipe.AVAILABLE_MARGIN_RATIO)
+    with pytest.raises(pipe.PipelineDoesNotFitError, match="GPU ceiling"):
         pipe.apply_memory_guardrails(node, total)
+
+
+def test_the_budget_is_the_gpu_ceiling_or_available_less_the_margin():
+    gib = 2**30
+    # M3 Ultra 96 GB after compaction: 79.0 GiB available, ceiling 77.76 GiB.
+    ceiling = 83_494_174_720
+    roomy = pipe.NodeMemory(96 * gib, int(79.0 * gib), 82, 1, ceiling)
+    assert roomy.budget_bytes == int(79.0 * gib) - int(96 * gib * 0.07)
+    # Nearly idle: the ceiling binds.
+    idle = pipe.NodeMemory(96 * gib, 95 * gib, 99, 1, ceiling)
+    assert idle.budget_bytes == ceiling
+    # The owner's app screenshot rule (available − 21% of RAM) on the same node
+    # gave 58.8 GiB; the new rule gives 72.3 GiB.
+    assert roomy.budget_bytes - (int(79.0 * gib) - int(96 * gib * 0.21)) > 13 * gib
+
+
+def test_node_arguments_carry_free_and_the_gpu_ceiling():
+    node = pipe._parse_node("workhorse:96:79:77.76")
+    assert node.available_bytes == 79 * 2**30
+    assert node.ceiling_bytes == int(77.76 * 2**30)
+    assert node.budget_bytes == 79 * 2**30 - int(96 * 2**30 * 0.07)
+    assert node.source == "free + GPU ceiling given"
+    idle = pipe._parse_node("m:128:127:107.52")
+    assert idle.budget_bytes == int(107.52 * 2**30)
+    legacy = pipe._parse_node("m:128:100")
+    assert legacy.ceiling_bytes == int(128 * 2**30 * pipe.MEMORY_LIMIT_RATIO)
+    with pytest.raises(argparse.ArgumentTypeError):
+        pipe._parse_node("m:1:2:3:4")
 
 
 def test_node_memory_reads_the_kernel_counters():
@@ -537,10 +568,10 @@ def test_a_slow_upstream_rank_cannot_trip_the_gpu_watchdog(tmp_path):
     assert "Timeout" not in output, output
 
 
-def test_a_node_below_its_pressure_floor_refuses_instead_of_crashing(tiny_checkpoint):
+def test_a_node_below_its_available_margin_refuses_instead_of_crashing(tiny_checkpoint):
     args = pipe.load_text_args(tiny_checkpoint)
     ckpt = pipe.read_checkpoint_bytes(tiny_checkpoint, args.num_hidden_layers)
-    starved = pipe.NodeMemory(96 * 2**30, 10 * 2**30, 10, 2)
+    starved = pipe.NodeMemory(96 * 2**30, 6 * 2**30, 6, 2, 80 * 2**30)
     assert starved.budget_bytes == 0
     nodes = [
         pipe.NodeBudget("big", 2**36, 2**35, "test"),
