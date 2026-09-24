@@ -453,3 +453,158 @@ def test_the_image_changes_the_answer(vision_checkpoint):
     logits_a, _ = _reference(vision_checkpoint, row, [first], 1)
     logits_b, _ = _reference(vision_checkpoint, row, [other], 1)
     assert float(np.max(np.abs(logits_a[0, -1] - logits_b[0, -1]))) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# The OpenAI server: image content parts end to end over two ring ranks
+# ---------------------------------------------------------------------------
+
+VISION_TEMPLATE = (
+    "{% for m in messages %}{% if m['content'] is string %}{{ m['content'] }}"
+    "{% else %}{% for c in m['content'] %}{% if c['type'] == 'image' %}"
+    "<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ c['text'] }}"
+    "{% endif %}{% endfor %}{% endif %} {% endfor %}"
+)
+SPECIALS = {
+    "<|image_pad|>": IMAGE,
+    "<|video_pad|>": VIDEO,
+    "<|vision_start|>": START,
+    "<|vision_end|>": END,
+}
+
+
+@pytest.fixture(scope="module")
+def vision_server_checkpoint(vision_checkpoint, tmp_path_factory) -> Path:
+    import shutil
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    path = tmp_path_factory.mktemp("qwen4_vision_serve")
+    for item in vision_checkpoint.iterdir():
+        shutil.copy(item, path / item.name)
+    by_id = {value: key for key, value in SPECIALS.items()}
+    vocab = {by_id.get(i, f"w{i}"): i for i in range(256)}
+    tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="w1"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer.add_special_tokens(list(SPECIALS))
+    tokenizer.save(str(path / "tokenizer.json"))
+    (path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "eos_token": "w255",
+                "unk_token": "w1",
+                "chat_template": VISION_TEMPLATE,
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture(scope="module")
+def vision_server(vision_server_checkpoint):
+    import os
+    import signal
+
+    from .test_pipeline_qwen4_serve import _Server
+
+    running = _Server(vision_server_checkpoint)
+    yield running
+    if running.process.poll() is None:
+        os.kill(running.ready[0]["pid"], signal.SIGTERM)
+        running.process.wait(timeout=60)
+
+
+def _png_data_url(height: int, width: int, seed: int) -> str:
+    import base64
+    import io
+
+    rng = np.random.default_rng(seed)
+    pixels = (rng.random((height, width, 3)) * 255).astype(np.uint8)
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def _image_chat(url: str, text: str = "w9 w31 w77", **extra) -> dict:
+    return {
+        "model": "tiny-flash-pipeline",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": url}},
+                    {"type": "text", "text": text},
+                ],
+            }
+        ],
+        "temperature": 0,
+        **extra,
+    }
+
+
+def test_server_advertises_vision_like_the_single_engine(vision_server):
+    (entry,) = vision_server.get("/v1/models")["data"]
+    assert entry["modality"] == "image"
+    assert entry["capabilities"][:2] == ["text", "vision"]
+    assert vision_server.ready[0]["vision"] is True
+
+
+def test_image_chat_is_answered_as_the_single_process_answers_it(
+    vision_server, vision_server_checkpoint
+):
+    from mlx_lm.utils import load_tokenizer
+
+    from rapid_mlx.utils.chat_template import apply_chat_template
+
+    url = _png_data_url(64, 96, 5)
+    body = _image_chat(url, max_tokens=24)
+    answer = json.load(vision_server.post(body))
+    again = json.load(vision_server.post(body))
+    assert answer["choices"][0]["message"] == again["choices"][0]["message"]
+
+    tokenizer = load_tokenizer(vision_server_checkpoint)
+    vision = load_vision_tower(vision_server_checkpoint)
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": "w9 w31 w77"}],
+        }
+    ]
+    prompt = apply_chat_template(tokenizer, messages, model_name="tiny-flash-pipeline")
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _load_image
+
+    processed = vision.processor(tokenizer)(
+        text=[prompt], images=[_load_image(url)], return_tensors="np"
+    )
+    ids = processed["input_ids"][0].tolist()
+    assert ids.count(IMAGE) == 6 and ids.count(START) == 1
+    assert answer["usage"]["prompt_tokens"] == len(ids)
+    image = pipe.ImageInput(
+        processed["pixel_values"], processed["image_grid_thw"].tolist()
+    )
+    _, tokens = _reference(vision_server_checkpoint, [ids], [image], 24)
+    expected = []
+    for token in tokens[0].tolist():
+        expected.append(token)
+        if token == EOS:
+            break
+    # The server counts the EOS it stops on and never prints it; its streaming
+    # detokenizer drops special tokens, as the single engine's does.
+    assert answer["usage"]["completion_tokens"] == len(expected)
+    words = (answer["choices"][0]["message"]["content"] or "").split()
+    shown = [token for token in expected if token != EOS]
+    assert words == tokenizer.decode(shown, skip_special_tokens=True).split()
+
+
+def test_images_that_cannot_be_read_are_a_named_400(vision_server):
+    import urllib.error
+
+    for url, needle in [
+        ("data:image/png;base64,bm90IGFuIGltYWdl", "image"),
+        ("file:///etc/hosts", "Cannot process image"),
+    ]:
+        with pytest.raises(urllib.error.HTTPError) as refusal:
+            vision_server.post(_image_chat(url))
+        assert refusal.value.code == 400
+        assert needle in json.load(refusal.value)["error"]["message"], url
