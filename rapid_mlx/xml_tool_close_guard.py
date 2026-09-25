@@ -7,12 +7,16 @@ The wire (``chat_template.jinja``) renders a call as::
 
 and a turn that calls tools ends right after its last ``</tool_call>``
 (another call is joined with ``\\n``; text goes BEFORE the calls). So at
-three positions the template admits no free text at all:
+four positions the template admits no free text at all:
 
 * after a value's close — ``</parameter>`` at the start of a line, inside a
   call: ``\\n<parameter`` or ``\\n</function>``;
+* after the function's close — ``</function>`` at the start of a line, inside
+  a call: ``\\n</tool_call>``;
 * after ``<tool_call>``: ``\\n<function``;
-* after ``</tool_call>``: ``\\n<tool_call>`` or the end of the turn.
+* after ``</tool_call>``: ``\\n<tool_call>`` or the end of the turn — and after
+  that newline the end of the turn is still allowed, so the guard can never
+  force a model that wanted to stop into another call.
 
 A model can leave the skeleton exactly there. Measured on
 Qwen3.8-27B-Atlassian-Q8 (a LoRA merge of Qwen3.8-27B) replaying goose
@@ -29,7 +33,10 @@ alone, the same model closed the call cleanly and then emitted ``!`` where
 the turn ends, continuing into invented tool results — hence the other two.
 With all three held (Studio, 10 replays), 3 of 10 left one token EARLIER:
 ``\\n\\n</parameter>!\\n</parameter>\\n</function>`` — so the first rule starts
-at the close marker itself, not at the newline after it.
+at the close marker itself, not at the newline after it. With that, 10/10
+values were clean, but one run went ``</function>\\n!`` — the call never
+closed, the model wrote prose and 28 more calls inside it until the repetition
+guard stopped it — hence the ``</function>`` rule.
 
 The parser cannot tell residue from a value that really contains
 ``</parameter>`` (the same bytes on this wire). The decoder can: at these
@@ -262,17 +269,26 @@ def xml_close_guard_spec(
     after_close = _continuations(
         tokenizer, "</parameter>", ("\n<parameter", "\n</function>")
     )
+    after_function = _continuations(tokenizer, "</function>", ("\n" + CALL_CLOSE,))
     after_open = _continuations(tokenizer, CALL_OPEN, ("\n<function",))
-    next_call = _continuations(tokenizer, CALL_CLOSE, ("\n" + CALL_OPEN,))
-    if after_close is None or after_open is None or next_call is None:
+    next_call = _continuations(tokenizer, CALL_CLOSE, ("\n" + CALL_OPEN, "\n"))
+    if any(
+        part is None for part in (after_close, after_function, after_open, next_call)
+    ):
         return None
     rules += _rules_for(
         after_close[0], after_close[1], inside_call=True, after_newline=True
     )
+    rules += _rules_for(
+        after_function[0], after_function[1], inside_call=True, after_newline=True
+    )
     rules += _rules_for(after_open[0], after_open[1], inside_call=False)
+    another_call, newline = next_call[1]
     rules += _rules_for(
         next_call[0],
-        next_call[1] + [(end_id,) for end_id in sorted(end_ids)],
+        [another_call]
+        + [(end_id,) for end_id in sorted(end_ids)]
+        + [newline + (end_id,) for end_id in sorted(end_ids)],
         inside_call=False,
     )
     return XmlCloseGuardSpec(

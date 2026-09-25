@@ -176,10 +176,12 @@ def test_spec_is_derived_from_the_tokenizer_not_assumed():
         "<tool_call>\n": {"<"},
         "<tool_call>\n<": {"function"},
         "</tool_call>": {"\n", "<|im_end|>"},
-        "</tool_call>\n": {"<tool_call>"},
+        "</function>": {"\n"},
+        "</function>\n": {"</tool_call>"},
+        "</tool_call>\n": {"<tool_call>", "<|im_end|>"},
     }
     inside = {tok.decode(r.window) for r in spec.rules if r.inside_call}
-    assert inside == {w for w in rules if w.startswith("</parameter>")}
+    assert inside == {w for w in rules if w.startswith(("</parameter>", "</function>"))}
 
 
 def test_no_spec_for_a_template_without_the_xml_call():
@@ -437,3 +439,28 @@ def test_guard_arms_through_mlx_lms_tokenizer_wrapper():
     guard = _scheduler_with(wrapped)._xml_tool_close_guard()
     assert isinstance(guard, XmlToolCloseGuard)
     assert guard.spec.newline_ids
+
+
+def test_the_function_close_admits_only_the_call_close():
+    """Studio run 3: ``</function>\\n!`` left the call open; 28 calls followed."""
+    tok = PieceTokenizer()
+    guard = XmlToolCloseGuard(_spec(tok))
+    close = RAW_WRITE.index("\n!\n</parameter>")
+    history = tok.encode(RAW_WRITE[:close] + "\n</function>")
+    step = guard(mx.array(history), _logits(tok, {"!": 0.0, "\n": -2.0}))
+    assert _top(tok, step) == "\n"
+    history += tok.encode("\n")
+    step = guard(mx.array(history), _logits(tok, {"!": 0.0, "</tool_call>": -4.0}))
+    assert _top(tok, step) == "</tool_call>"
+
+
+def test_after_the_call_newline_the_turn_may_still_end():
+    """The guard never forces another call on a model that wants to stop."""
+    tok = PieceTokenizer()
+    guard = XmlToolCloseGuard(_spec(tok))
+    history = tok.encode(RAW_WRITE + "\n")
+    step = guard(
+        mx.array(history),
+        _logits(tok, {"The": 0.0, "<|im_end|>": -3.0, "<tool_call>": -5.0}),
+    )
+    assert _top(tok, step) == "<|im_end|>"
