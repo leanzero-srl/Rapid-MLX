@@ -10,9 +10,10 @@ to the newest recurrent checkpoint. The marker moves only the snapshot boundary
 to before the block; the rendered prompt is untouched.
 
 The property pinned here is the one that pays: the boundary chosen for request N
-is an exact prefix of request N+1's rendered prompt, in both the merged shape
-(tail appended to the user's own message) and the separate-message shape (tail
-as its own user turn after a tool result).
+is an exact prefix of request N+1's rendered prompt, in the merged shape (tail
+appended to the user's own message), the separate-message shape (tail as its own
+user turn after a tool result) and the tool shape (tail appended to the tool
+result the request ends on).
 """
 
 import asyncio
@@ -136,6 +137,38 @@ def test_separate_message_tail_boundary_is_a_prefix_of_the_next_request(monkeypa
     assert _chatml(turn2)[:upstream] != _chatml(turn3)[:upstream]
 
 
+def test_a_tail_on_the_tool_results_boundary_is_a_prefix_of_the_next_request(
+    monkeypatch,
+):
+    """goose's chat shape (Q-94): the block is appended to the tool result the
+    request ends on. The boundary for this step must be an exact prefix of the
+    next step, which carries the same result without the block, the model's next
+    call, and a new result with a new block — and the tool message is never
+    dropped, even when the block was all it held."""
+    engine = _engine(monkeypatch)
+    history = [SYSTEM, {"role": "user", "content": TASK}, CALL]
+    step = [*history, {**RESULT, "content": f"{RESULT['content']}\n{TAIL}"}]
+    after = [
+        *history,
+        RESULT,
+        CALL,
+        {**RESULT, "content": f"2  fn route()\n{TAIL.replace('14:07', '14:09')}"},
+    ]
+
+    marked = _boundary(engine, step, "\n" + TAIL)
+    upstream = _boundary(engine, step, None)
+
+    assert _chatml(step)[:marked] == _chatml(after)[:marked]
+    assert "<turn-context>" not in _chatml(step)[:marked]
+    assert marked >= len(_chatml([*history, RESULT], add_generation_prompt=False)) - 20
+    assert _chatml(step)[:upstream] != _chatml(after)[:upstream]
+
+    only_block = [*history, {**RESULT, "content": TAIL}]
+    assert BatchedEngine._stable_messages_before_transient_tail(
+        only_block, None, TAIL
+    ) == [*history, {**RESULT, "content": ""}]
+
+
 def test_the_stable_prefix_drops_or_strips_exactly_the_tail():
     whole = [SYSTEM, {"role": "user", "content": TAIL}]
     assert BatchedEngine._stable_messages_before_transient_tail(whole, None, TAIL) == [
@@ -238,5 +271,6 @@ def test_the_request_field_parses_and_the_server_advertises_it():
     )
     assert "rapid_mlx_transient_tail" in REQUEST_EXTENSIONS
     assert ModelInfo(id="m").model_dump()["request_extensions"] == [
-        "rapid_mlx_transient_tail"
+        "rapid_mlx_transient_tail",
+        "rapid_mlx_transient_tail_on_tool",
     ]
