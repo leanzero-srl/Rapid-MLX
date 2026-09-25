@@ -177,7 +177,15 @@ def _newline_ids(tokenizer: Any) -> frozenset[int] | None:
     try:
         size = len(tokenizer)
     except TypeError:
-        return None
+        # mlx-lm's TokenizerWrapper forwards attributes to the HF tokenizer but
+        # not ``len()`` (the engine hands the scheduler that wrapper).
+        get_vocab = getattr(tokenizer, "get_vocab", None)
+        if not callable(get_vocab):
+            return None
+        vocab = get_vocab()
+        if not vocab:
+            return None
+        size = max(vocab.values()) + 1
     ids = [[i] for i in range(size)]
     batch_decode = getattr(tokenizer, "batch_decode", None)
     texts = (

@@ -115,6 +115,9 @@ class PieceTokenizer:
     def __len__(self) -> int:
         return VOCAB
 
+    def get_vocab(self) -> dict[str, int]:
+        return dict(self.vocab)
+
 
 VOCAB = 4096
 
@@ -417,3 +420,20 @@ def test_scheduler_guard_absent_for_other_wires_and_on_opt_out(monkeypatch):
     assert isinstance(
         _scheduler_with(PieceTokenizer())._xml_tool_close_guard(), XmlToolCloseGuard
     )
+
+
+def test_guard_arms_through_mlx_lms_tokenizer_wrapper():
+    """The engine hands the scheduler mlx-lm's TokenizerWrapper, which has no len().
+
+    Studio run 2 (02f173424): the spec refused ("cannot enumerate this
+    tokenizer's newline tokens") and 7 of 10 replays shipped the residue.
+    """
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    tok = PieceTokenizer()
+    wrapped = TokenizerWrapper(tok, eos_token_ids=[tok._id("<|im_end|>")])
+    with pytest.raises(TypeError):
+        len(wrapped)
+    guard = _scheduler_with(wrapped)._xml_tool_close_guard()
+    assert isinstance(guard, XmlToolCloseGuard)
+    assert guard.spec.newline_ids
