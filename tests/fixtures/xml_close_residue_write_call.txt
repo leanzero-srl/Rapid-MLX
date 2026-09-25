@@ -1,0 +1,46 @@
+<tool_call>
+<function=write>
+<parameter=path>
+/Users/mihaiperdum/goose-builds/quality/E2E-2b-remote-studio/work/notes/kickoff.md
+</parameter>
+<parameter=content>
+# Jira DC→Cloud Migration Readiness Assessment — Kickoff Notes
+
+- **Client:** Harbourline Freight (logistics, ~380 Jira users)
+- **Call:** 24/9 — attendees: Aoife Brennan (their PM), Marek (Jira admin), me
+- **Scope:** Jira **Data Center → Cloud** ONLY. Confluence is out of scope for now.
+- Next call: Friday 2/10
+
+## Decisions
+
+- Confluence is **out of scope** for now — Jira only.
+- Inactivity cutoff for the user review is **24 months** (no login in 24 months) — **Aoife's requirement**, not 12.
+- **Project leads are never dropped** — even if inactive, they own project/issue data. They are protected from removal.
+- Deliverables: a **readiness report + PDF for Aoife**, plus **scripts we can rerun**.
+- Next call: **Friday 2/10**.
+
+## Actions (with owner)
+
+| Action | Owner |
+|---|---|
+| Produce the readiness report + PDF for Aoife | Me |
+| Provide reusable scripts (rerunnable against the DC instance) | Me |
+| Archive assessment for ~3–4 dead projects | Me (to propose), Marek (executes) |
+| User hygiene: identify junk/dupe/no-email accounts | Me |
+| Standard vs Premium decision — bring numbers to the decision | Me |
+| Deep-dive the FRT project (~70k issues) | Me |
+| Prepare for Friday 2/10 call | All |
+
+## Open questions
+
+- Standard vs Premium plan — Aoife wants **numbers** before deciding (headcount-based estimate).
+- FRT project ~70k issues — is it one plan that caps it, or should it be split up / thinned?
+- Which exact projects to archive? Marek thinks 3–4 can go; need to confirm each is actually dead.
+- Users with **no email at all** — are these the contractor/integration accounts? Should they be retained?
+- Service accounts for integrations — which, and how are they mapped / retained post-migration?
+
+</parameter>
+!
+</parameter>
+</function>
+</tool_call>
