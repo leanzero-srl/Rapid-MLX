@@ -154,6 +154,8 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .runtime.model_performance import get_model_performance_ledger
 from .utils.decode import IncrementalDecoder
 from .utils.mamba_cache import ensure_mamba_support
+from .xml_tool_close_guard import OPT_OUT_ENV as XML_CLOSE_GUARD_OPT_OUT_ENV
+from .xml_tool_close_guard import XmlToolCloseGuard, xml_close_guard_spec
 
 logger = logging.getLogger(__name__)
 
@@ -4348,6 +4350,35 @@ class Scheduler:
             if self.memory_aware_cache is not None
             else None
         )
+
+    def _xml_tool_close_guard(self) -> XmlToolCloseGuard | None:
+        """A fresh skeleton guard for a tool request, when this model's wire needs one.
+
+        The rule is derived once from the tokenizer (``xml_close_guard_spec``);
+        a model whose template is not the parameterised XML tool call gets
+        ``None`` and decodes exactly as before.
+        """
+        if not hasattr(self, "_xml_close_guard_spec_cache"):
+            spec = None
+            opt_out = os.environ.get(XML_CLOSE_GUARD_OPT_OUT_ENV, "").strip().lower()
+            if opt_out in ("0", "off", "false", "no"):
+                logger.warning(
+                    "xml tool-call skeleton guard disabled by %s=%s",
+                    XML_CLOSE_GUARD_OPT_OUT_ENV,
+                    opt_out,
+                )
+            else:
+                spec = xml_close_guard_spec(
+                    self._actual_tokenizer, self._get_stop_tokens()
+                )
+                if spec is not None:
+                    logger.info(
+                        "xml tool-call skeleton guard armed: %s",
+                        [(r.window, sorted(r.allowed)) for r in spec.rules],
+                    )
+            self._xml_close_guard_spec_cache = spec
+        spec = self._xml_close_guard_spec_cache
+        return XmlToolCloseGuard(spec) if spec is not None else None
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
@@ -8735,6 +8766,11 @@ class Scheduler:
                 _loop_breaker = AgentRepetitionLogitsProcessor(request.output_token_ids)
                 request._repetition_logits_processor = _loop_breaker
                 request_processors.append(_loop_breaker)
+            _close_guard = None
+            if request.has_tools:
+                _close_guard = self._xml_tool_close_guard()
+                if _close_guard is not None:
+                    request_processors.append(_close_guard)
             # Penalty knobs (#355) — only add the processor when at least
             # one penalty is non-default. mlx-lm's make_logits_processors
             # returns an empty list when all knobs are at defaults, but
@@ -8799,6 +8835,7 @@ class Scheduler:
             request._mtp_safe_logits_processors = tuple(
                 ([_mtp_grammar] if _mtp_grammar is not None else [])
                 + ([_loop_breaker] if _loop_breaker is not None else [])
+                + ([_close_guard] if _close_guard is not None else [])
                 + penalty_processors
                 + ([_mtp_budget] if _mtp_budget is not None else [])
             )
