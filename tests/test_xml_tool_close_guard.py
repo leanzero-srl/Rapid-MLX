@@ -110,7 +110,10 @@ class PieceTokenizer:
         return ids
 
     def decode(self, ids, **_kwargs) -> str:
-        return "".join(self.inverse[int(i)] for i in ids)
+        return "".join(self.inverse.get(int(i), "") for i in ids)
+
+    def __len__(self) -> int:
+        return VOCAB
 
 
 VOCAB = 4096
@@ -161,6 +164,7 @@ def test_spec_is_derived_from_the_tokenizer_not_assumed():
         tok.decode(r.window): {tok.decode([i]) for i in r.allowed} for r in spec.rules
     }
     assert rules == {
+        "</parameter>": {"\n"},
         "</parameter>\n": {"<", "</"},
         "</parameter>\n<": {"parameter"},
         "</parameter>\n</": {"function"},
@@ -239,6 +243,28 @@ def test_guard_is_inert_outside_a_tool_call_and_inside_values():
         '<tool_call>\n<function=shell>\n<parameter=command>\nprint("</parameter>'
     )
     assert _top(tok, guard(mx.array(inline), _logits(tok, {'"': 0.0}))) == '"'
+    # An indented close-looking line is a value line, not the close.
+    indented = tok.encode(
+        "<tool_call>\n<function=write>\n<parameter=content>\n<a>\n  </parameter>"
+    )
+    assert _top(tok, guard(mx.array(indented), _logits(tok, junk))) == "!"
+
+
+def test_the_close_marker_itself_admits_only_the_newline():
+    """Studio, guard on rules 1-3: 3 of 10 replays went ``</parameter>!``."""
+    tok = PieceTokenizer()
+    guard = XmlToolCloseGuard(_spec(tok))
+    marker = RAW_WRITE.index("\n!\n</parameter>")  # the close ends here
+    history = tok.encode(RAW_WRITE[:marker])
+    assert tok.decode(history).endswith("?\n\n</parameter>")
+    step = guard(mx.array(history), _logits(tok, {"!": 0.0, "\n": -2.0}))
+    assert _top(tok, step) == "\n"
+    # The same marker right after the opener's newline (an empty value) too.
+    empty = tok.encode(
+        "<tool_call>\n<function=shell>\n<parameter=command>\n</parameter>"
+    )
+    step = guard(mx.array(empty), _logits(tok, {"!": 0.0, "\n": -2.0}))
+    assert _top(tok, step) == "\n"
 
 
 def test_mtp_path_applies_the_same_rule_statelessly():

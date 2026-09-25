@@ -9,7 +9,8 @@ and a turn that calls tools ends right after its last ``</tool_call>``
 (another call is joined with ``\\n``; text goes BEFORE the calls). So at
 three positions the template admits no free text at all:
 
-* after ``</parameter>\\n`` inside a call: ``<parameter`` or ``</function>``;
+* after a value's close — ``</parameter>`` at the start of a line, inside a
+  call: ``\\n<parameter`` or ``\\n</function>``;
 * after ``<tool_call>``: ``\\n<function``;
 * after ``</tool_call>``: ``\\n<tool_call>`` or the end of the turn.
 
@@ -26,6 +27,9 @@ payload: shell commands ending in ``</parameter>\\n!``, files with junk
 lines, a ``write`` that never got its ``path``. Held to the first position
 alone, the same model closed the call cleanly and then emitted ``!`` where
 the turn ends, continuing into invented tool results — hence the other two.
+With all three held (Studio, 10 replays), 3 of 10 left one token EARLIER:
+``\\n\\n</parameter>!\\n</parameter>\\n</function>`` — so the first rule starts
+at the close marker itself, not at the newline after it.
 
 The parser cannot tell residue from a value that really contains
 ``</parameter>`` (the same bytes on this wire). The decoder can: at these
@@ -39,11 +43,13 @@ no state for the verifier to snapshot. Its work stays on device: no host
 synchronisation joins the decode loop. It is inert inside an open
 ``<think>`` block, where a drafted call is not a call.
 
-Cost of the rule, stated: inside a ``<tool_call>`` a value can no longer hold
-``</parameter>`` + newline followed by anything but ``<parameter`` /
-``</function>`` — on this wire such a value was already indistinguishable
-from a closed parameter plus stray text. An inline ``</parameter>``
-(``print("</parameter>")``) is untouched.
+Cost of the rule, stated: inside a ``<tool_call>``, a value line that STARTS
+with ``</parameter>`` is read as the close — the template writes every close
+exactly so (``VALUE\\n</parameter>\\n``), and on this wire such a value was
+already indistinguishable from a closed parameter plus stray text. A
+``</parameter>`` anywhere else in a line (``print("</parameter>")``, an
+indented ``  </parameter>``) is untouched: the rule reads the token before
+the marker and arms only when it ends in a newline.
 """
 
 from __future__ import annotations
@@ -77,12 +83,14 @@ class SkeletonRule:
     """At ``window`` (the last tokens emitted), only ``allowed`` may come next.
 
     ``inside_call`` rules are armed only while a ``<tool_call>`` is open: their
-    window is ordinary text that prose may also contain.
+    window is ordinary text that prose may also contain. ``after_newline``
+    rules also need the token just before ``window`` to end with a newline.
     """
 
     window: tuple[int, ...]
     allowed: frozenset[int]
     inside_call: bool
+    after_newline: bool = False
 
 
 @dataclass
@@ -93,7 +101,21 @@ class XmlCloseGuardSpec:
     open_id: int
     close_id: int
     think_ids: tuple[int, int] | None
+    newline_ids: frozenset[int]
     _masks: dict[int, mx.array] = field(default_factory=dict, repr=False)
+    _newline_masks: dict[int, mx.array] = field(default_factory=dict, repr=False)
+
+    def newline_mask(self, vocab_size: int) -> mx.array:
+        """``(vocab_size,)`` bool: the ids whose text ends with a newline."""
+        mask = self._newline_masks.get(vocab_size)
+        if mask is None:
+            ids = sorted(i for i in self.newline_ids if i < vocab_size)
+            mask = mx.any(
+                mx.arange(vocab_size)[:, None] == mx.array(ids)[None, :], axis=1
+            )
+            mx.eval(mask)
+            self._newline_masks[vocab_size] = mask
+        return mask
 
     def allowed_masks(self, vocab_size: int) -> mx.array:
         """``(len(rules), vocab_size)`` bool rows, built once per vocab width."""
@@ -136,6 +158,7 @@ def _rules_for(
     trigger: tuple[int, ...],
     continuations: Iterable[tuple[int, ...]],
     inside_call: bool,
+    after_newline: bool = False,
 ) -> list[SkeletonRule]:
     """One rule per prefix of the continuations: the trie walked token by token."""
     trie: dict[tuple[int, ...], set[int]] = {}
@@ -143,9 +166,26 @@ def _rules_for(
         for depth in range(len(tail)):
             trie.setdefault(tail[:depth], set()).add(tail[depth])
     return [
-        SkeletonRule(trigger + prefix, frozenset(allowed), inside_call)
+        SkeletonRule(trigger + prefix, frozenset(allowed), inside_call, after_newline)
         for prefix, allowed in sorted(trie.items(), key=lambda item: len(item[0]))
     ]
+
+
+def _newline_ids(tokenizer: Any) -> frozenset[int] | None:
+    """Every id whose decoded text ends with a newline, or ``None`` when the
+    tokenizer cannot say how large its vocabulary is."""
+    try:
+        size = len(tokenizer)
+    except TypeError:
+        return None
+    ids = [[i] for i in range(size)]
+    batch_decode = getattr(tokenizer, "batch_decode", None)
+    texts = (
+        batch_decode(ids)
+        if callable(batch_decode)
+        else [tokenizer.decode(one) for one in ids]
+    )
+    return frozenset(i for i, text in enumerate(texts) if text.endswith("\n"))
 
 
 def _continuations(
@@ -203,15 +243,24 @@ def xml_close_guard_spec(
         else None
     )
 
+    newline_ids = _newline_ids(tokenizer)
+    if not newline_ids:
+        logger.warning(
+            "xml close guard: cannot enumerate this tokenizer's newline tokens; "
+            "guard not armed"
+        )
+        return None
     rules: list[SkeletonRule] = []
     after_close = _continuations(
-        tokenizer, "</parameter>\n", ("<parameter", "</function>")
+        tokenizer, "</parameter>", ("\n<parameter", "\n</function>")
     )
     after_open = _continuations(tokenizer, CALL_OPEN, ("\n<function",))
     next_call = _continuations(tokenizer, CALL_CLOSE, ("\n" + CALL_OPEN,))
     if after_close is None or after_open is None or next_call is None:
         return None
-    rules += _rules_for(after_close[0], after_close[1], inside_call=True)
+    rules += _rules_for(
+        after_close[0], after_close[1], inside_call=True, after_newline=True
+    )
     rules += _rules_for(after_open[0], after_open[1], inside_call=False)
     rules += _rules_for(
         next_call[0],
@@ -219,7 +268,11 @@ def xml_close_guard_spec(
         inside_call=False,
     )
     return XmlCloseGuardSpec(
-        rules=tuple(rules), open_id=open_id, close_id=close_id, think_ids=think_ids
+        rules=tuple(rules),
+        open_id=open_id,
+        close_id=close_id,
+        think_ids=think_ids,
+        newline_ids=newline_ids,
     )
 
 
@@ -255,7 +308,20 @@ class XmlToolCloseGuard:
             history, positions, self.spec.close_id
         )
         rows = mx.array(active)
-        armed = matched & (call_open | ~self._inside_call[rows])
+        newline = self.spec.newline_mask(logits.shape[-1])
+        after_newline = []
+        for row in active:
+            width = self._windows[row].shape[0]
+            if not self.spec.rules[row].after_newline:
+                after_newline.append(mx.array(True))
+            elif n > width:
+                before = mx.minimum(tail[n - width - 1], newline.shape[0] - 1)
+                after_newline.append(newline[before])
+            else:
+                after_newline.append(mx.array(False))
+        armed = (
+            matched & mx.stack(after_newline) & (call_open | ~self._inside_call[rows])
+        )
         if self.spec.think_ids is not None:
             think_open, think_close = self.spec.think_ids
             thinking = self._last(history, positions, think_open) > self._last(
