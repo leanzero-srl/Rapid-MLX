@@ -4229,6 +4229,9 @@ class Scheduler:
         # healthy EOS stops from model degeneration.
         self.num_repetition_loop_stops = 0
         self.num_repetition_loop_breaks = 0
+        # Generations stopped because decode filled memory (LeanZero fork:
+        # the bound that replaced the typed default budget).
+        self.num_memory_full_stops = 0
         # PFlash observability (M-02 reframe). When PFlash compresses a
         # prompt the request bypasses the prefix-cache fetch + store
         # paths entirely (positional-fiction safety; see comment block
@@ -7095,6 +7098,26 @@ class Scheduler:
             return 0
         return int(getattr(cache, "_current_memory", 0) or 0)
 
+    def _generation_fills_memory(self, request: Request) -> bool:
+        """True when ``request`` must stop because decode filled memory.
+
+        Fires only when the admission cap is configured and Metal active has
+        reached it, only for the running request with the most output tokens
+        (one stop frees the most and spares the rest), and only after the
+        prefix and paged caches were asked to give memory back first.
+        """
+        cap = self._resolve_metal_cap_bytes()
+        if cap <= 0 or self._current_metal_active_bytes() < cap:
+            return False
+        longest = max(
+            self.running.values(), key=lambda r: r.num_output_tokens, default=None
+        )
+        if longest is None or longest.request_id != request.request_id:
+            return False
+        self.evict_prefix_cache_under_pressure()
+        self.release_paged_cache_blocks_under_pressure()
+        return self._current_metal_active_bytes() >= cap
+
     def evict_prefix_cache_under_pressure(self, max_evict: int = 64) -> int:
         """LRU-evict prefix-cache entries while memory pressure persists.
 
@@ -9208,6 +9231,22 @@ class Scheduler:
                     else:
                         output.new_text = ""
 
+            # LeanZero fork: a request with no max_tokens now runs until the
+            # model stops or the window is full, so memory — not a typed
+            # budget — bounds decode growth. At the admission cap, after the
+            # prefix / paged caches gave back what they could, the LONGEST
+            # generation stops as ``length`` instead of growing Metal past
+            # the cap (the uncatchable-abort / IOGPU-panic path).
+            if finish_reason is None and self._generation_fills_memory(request):
+                finish_reason = "length"
+                self.num_memory_full_stops += 1
+                logger.warning(
+                    "Stopping request %s at %d completion tokens: Metal active "
+                    "memory reached the admission cap with nothing left to evict",
+                    request_id,
+                    request.num_output_tokens,
+                )
+
             # Check if finished
             if finish_reason is not None:
                 scheduler_generated_finish = response.finish_reason is None
@@ -10489,6 +10528,7 @@ class Scheduler:
             "num_requests_processed": self.num_requests_processed,
             "num_repetition_loop_stops": self.num_repetition_loop_stops,
             "num_repetition_loop_breaks": self.num_repetition_loop_breaks,
+            "num_memory_full_stops": self.num_memory_full_stops,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
             "configured_scheduling_policy": getattr(

@@ -160,8 +160,108 @@ async def test_chat_route_passes_resolved_max_tokens_to_engine(monkeypatch):
         _admission_acquired=[False],
     )
 
-    assert engine.captured_max_tokens == 777
+    assert engine.captured_max_tokens == 777, "no stated window: the resolved default"
     assert any(args and args[0] is None for args, _kwargs in resolver_calls)
+
+
+@pytest.mark.asyncio
+async def test_chat_route_without_max_tokens_runs_to_the_windows_room(monkeypatch):
+    """LeanZero fork (goose Q-65 class): a chat request with no max_tokens on a
+    model that states its window gets the room its counted prompt leaves — not
+    the typed serve default (32768), which capped every such answer. The
+    context guard sees the prompt alone (the default no longer refuses a prompt
+    within 32768 of the window)."""
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.routes import chat
+
+    engine = _CaptureChatEngine()
+    engine._model = SimpleNamespace(args=SimpleNamespace(max_position_embeddings=262_144))
+    _patch_common_route_deps(monkeypatch, chat, engine)
+    monkeypatch.setattr(
+        chat, "validate_content_blocks_for_capabilities", lambda *a, **k: None
+    )
+    guard_budgets = []
+
+    def fake_guard(*_a, **k):
+        guard_budgets.append(k.get("max_tokens"))
+        return 240_000
+
+    monkeypatch.setattr(chat, "enforce_context_length_for_messages", fake_guard)
+
+    for max_tokens, expected in ((None, 262_144 - 240_000), (50, 777)):
+        await chat._create_chat_completion_impl(
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=max_tokens,
+            ),
+            _RawRequest(),
+            engine,
+            _commit_state=[False],
+            _admission_acquired=[False],
+        )
+        assert engine.captured_max_tokens == expected
+
+    assert guard_budgets == [None, 777], "implicit: the prompt alone is checked"
+
+
+@pytest.mark.asyncio
+async def test_chat_route_prompt_filling_the_window_is_context_length_exceeded(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.routes import chat
+
+    engine = _CaptureChatEngine()
+    engine._model = SimpleNamespace(args=SimpleNamespace(max_position_embeddings=4096))
+    _patch_common_route_deps(monkeypatch, chat, engine)
+    monkeypatch.setattr(
+        chat, "validate_content_blocks_for_capabilities", lambda *a, **k: None
+    )
+    monkeypatch.setattr(chat, "enforce_context_length_for_messages", lambda *a, **k: 4096)
+
+    with pytest.raises(HTTPException) as refused:
+        await chat._create_chat_completion_impl(
+            ChatCompletionRequest(
+                model="test-model", messages=[{"role": "user", "content": "hi"}]
+            ),
+            _RawRequest(),
+            engine,
+            _commit_state=[False],
+            _admission_acquired=[False],
+        )
+    assert refused.value.status_code == 400
+    assert refused.value.detail["error"]["code"] == "context_length_exceeded"
+    assert engine.captured_max_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_completions_route_without_max_tokens_runs_to_the_windows_room(
+    monkeypatch,
+):
+    from rapid_mlx.api.models import CompletionRequest
+    from rapid_mlx.routes import completions
+
+    engine = _CaptureCompletionEngine()
+    engine._model = SimpleNamespace(args=SimpleNamespace(max_position_embeddings=8192))
+    engine.tokenizer = SimpleNamespace(encode=lambda text, **_k: [1], decode=lambda ids: "x")
+    _patch_common_route_deps(monkeypatch, completions, engine)
+    prechecks = []
+    monkeypatch.setattr(
+        completions,
+        "enforce_context_length_for_prompt",
+        lambda *a, **k: prechecks.append(k.get("max_tokens")),
+    )
+
+    await completions.create_completion(
+        CompletionRequest(model="test-model", prompt="hi", max_tokens=None),
+        _RawRequest(),
+    )
+
+    assert engine.captured_max_tokens == 8192 - 1, "the one-token prompt's room"
+    assert prechecks == [1], "the gate proves one token of room before the stream"
 
 
 @pytest.mark.asyncio

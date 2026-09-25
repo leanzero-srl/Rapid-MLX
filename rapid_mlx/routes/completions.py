@@ -41,13 +41,30 @@ from ..service.helpers import (
     _validate_model_name,
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
+    context_room,
+    count_prompt_tokens,
     enforce_context_length_for_prompt,
+    implicit_max_tokens,
     ensure_engine_ready,
     get_engine,
     get_usage,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _completion_budget(engine, request, prompt) -> int:
+    """LeanZero fork: a prompt sent with no max_tokens (and no operator
+    ``--max-tokens``) generates until the model stops or the window is full —
+    its budget is the room the prompt leaves. An uncountable prompt (MLLM,
+    tokenizer failure) or a model with no stated window keeps the resolved
+    default."""
+    if implicit_max_tokens(request.max_tokens) and not getattr(engine, "is_mllm", False):
+        prompt_tokens = count_prompt_tokens(engine, prompt)
+        room = context_room(engine, prompt_tokens) if prompt_tokens > 0 else None
+        if room is not None:
+            return room
+    return _resolve_max_tokens(request.max_tokens)
 
 router = APIRouter()
 
@@ -355,7 +372,13 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         # but the prompt-token budget still applies. Iterate the list
         # form because each entry hits prefill independently. See
         # ``service/helpers.py::enforce_context_length_for_prompt``.
-        _resolved_max = _resolve_max_tokens(request.max_tokens)
+        # An implicit budget is the prompt's room, so the gate proves one
+        # token of it before any stream starts.
+        _resolved_max = (
+            1
+            if implicit_max_tokens(request.max_tokens)
+            else _resolve_max_tokens(request.max_tokens)
+        )
         for _p in prompts:
             enforce_context_length_for_prompt(engine, _p, max_tokens=_resolved_max)
 
@@ -454,7 +477,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 _stream_yielded = False
                 stream_iter = engine.stream_generate(
                     prompt=prompt,
-                    max_tokens=_resolve_max_tokens(request.max_tokens),
+                    max_tokens=_completion_budget(engine, request, prompt),
                     temperature=_resolve_temperature(request.temperature),
                     top_p=_resolve_top_p(request.top_p),
                     stop=request.stop_sequences(),
@@ -529,7 +552,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 output = await _wait_with_disconnect(
                     engine.generate(
                         prompt=prompt,
-                        max_tokens=_resolve_max_tokens(request.max_tokens),
+                        max_tokens=_completion_budget(engine, request, prompt),
                         temperature=_resolve_temperature(request.temperature),
                         top_p=_resolve_top_p(request.top_p),
                         stop=request.stop_sequences(),
@@ -839,7 +862,7 @@ async def stream_completion(
 
     async for output in engine.stream_generate(
         prompt=prompt,
-        max_tokens=_resolve_max_tokens(request.max_tokens),
+        max_tokens=_completion_budget(engine, request, prompt),
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
         stop=request.stop_sequences(),
