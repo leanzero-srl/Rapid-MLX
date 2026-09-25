@@ -85,6 +85,7 @@ from ..engine import BaseEngine
 from ..middleware.auth import check_rate_limit, verify_api_key
 from ..reasoning import finalize_streaming_compat
 from ..service.helpers import (
+    _FALLBACK_MAX_CONTEXT_TOKENS,
     SSE_RESPONSE_HEADERS,
     _apply_reasoning_cutoff_notice,
     _build_response_metrics,
@@ -478,24 +479,26 @@ def _resolve_context_safe_implicit_responses_max_tokens(
     """Resolve an omitted Responses completion budget against context room.
 
     ``/v1/responses`` clients such as Codex often omit
-    ``max_output_tokens``. Rapid-MLX then supplies the operator/model
-    default (commonly 32768). For long but still valid prompts this can
-    make the *default* budget push ``prompt + completion`` past the
-    model window and raise ``context_length_exceeded`` even though a
-    shorter completion would fit. Explicit client caps remain strict;
-    this helper is used only for the omitted/implicit default case.
+    ``max_output_tokens``. LeanZero fork: such a request generates until the
+    model stops or the window is full — the budget is the room the prompt
+    leaves, not the typed serve default (which capped every omitted-budget
+    answer at 32768). Explicit client caps remain strict; this helper is used
+    only for the omitted/implicit default case.
     """
     if prompt_tokens is None:
         return resolved_max_tokens
 
-    remaining_tokens = get_model_max_context(engine) - int(prompt_tokens)
+    window = get_model_max_context(engine)
+    if window == _FALLBACK_MAX_CONTEXT_TOKENS:
+        return resolved_max_tokens
+    remaining_tokens = window - int(prompt_tokens)
     if remaining_tokens < 1:
         # Keep the caller's normal OpenAI-shaped context rejection path:
         # returning the positive resolved budget makes
         # ``prompt + completion`` exceed the window below.
         return resolved_max_tokens
 
-    return min(resolved_max_tokens, remaining_tokens)
+    return remaining_tokens
 
 
 def _resolved_sampling_kwargs(

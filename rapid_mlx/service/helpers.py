@@ -4991,6 +4991,65 @@ def _build_prompt_with_thinking_compat(
         return build_prompt(messages, tools=tools)
 
 
+def implicit_max_tokens(request_value: int | None) -> bool:
+    """True when neither the client nor the operator set a completion budget.
+
+    LeanZero fork: such a request generates until the model stops or the
+    context window is full (:func:`context_room`), never to a typed
+    default. An operator's ``serve --max-tokens`` stays a hard cap.
+    """
+    return request_value is None and not get_config().default_max_tokens_is_explicit
+
+
+def context_room(engine, prompt_tokens: int) -> int | None:
+    """The tokens a prompt of ``prompt_tokens`` leaves in the model's window:
+    the completion budget of a request that set none. A prompt that leaves
+    no room gets the OpenAI-shaped ``context_length_exceeded`` 400 (the
+    same error as a prompt over the window). ``None`` when the model states
+    no window (``get_model_max_context`` fell through to its DoS sentinel):
+    the caller keeps the resolved default rather than read the sentinel as
+    a window."""
+    window = get_model_max_context(engine)
+    if window == _FALLBACK_MAX_CONTEXT_TOKENS:
+        return None
+    room = window - int(prompt_tokens)
+    if room < 1:
+        enforce_context_length(engine, prompt_tokens, max_tokens=1)
+    return room
+
+
+def messages_prompt_tokens(
+    engine,
+    messages: list,
+    *,
+    tools: list | None = None,
+    enable_thinking: bool | None = None,
+    chat_template_kwargs: dict | None = None,
+) -> int | None:
+    """The rendered prompt's token count, or ``None`` when it cannot be
+    measured (MLLM engine, no ``build_prompt``, a render or tokenizer
+    failure, an empty prompt). Never raises."""
+    if getattr(engine, "is_mllm", False):
+        return None
+    build_prompt = getattr(engine, "build_prompt", None)
+    if build_prompt is None:
+        return None
+    try:
+        prompt = _build_prompt_with_thinking_compat(
+            build_prompt,
+            messages,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    except Exception:
+        return None
+    if not prompt:
+        return None
+    prompt_tokens = count_prompt_tokens(engine, prompt)
+    return prompt_tokens if prompt_tokens > 0 else None
+
+
 def enforce_context_length_for_messages(
     engine,
     messages: list,

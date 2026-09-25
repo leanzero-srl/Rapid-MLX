@@ -411,6 +411,8 @@ def test_scheduler_request_output_construction_carries_cached_tokens():
     # only the fields the method reads.
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._detokenizer_pool = {}
+    # No admission cap configured: the decode-time memory stop stays off.
+    scheduler._resolve_metal_cap_bytes = lambda: 0
     scheduler.uid_to_request_id = {1: "req-1"}
     scheduler.running = {}
     # Minimal tokenizer for ``_decode_tokens`` (called on the

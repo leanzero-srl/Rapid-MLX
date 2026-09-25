@@ -79,6 +79,7 @@ from ..response_cache import (
     make_cache_key,
 )
 from ..service.helpers import (
+    _FALLBACK_MAX_CONTEXT_TOKENS,
     _TOOL_USE_REQUIRED_SUFFIX,
     _TOOL_USE_SYSTEM_SUFFIX,
     SSE_RESPONSE_HEADERS,
@@ -115,14 +116,17 @@ from ..service.helpers import (
     _validate_tool_call_params,
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
+    context_room,
     enable_thinking_warning_header,
     enforce_context_length_for_messages,
     ensure_engine_ready,
     get_engine,
     get_model_max_context,
+    implicit_max_tokens,
     maybe_apply_reasoning_effort,
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
+    messages_prompt_tokens,
     repair_messages_fit_context,
     served_chat_template,
 )
@@ -4871,14 +4875,26 @@ async def _create_chat_completion_impl(
     # Capture the prompt-token count the context guard already paid for
     # (build_prompt + tokenize) so LINE①'s hard window check below reuses it
     # rather than re-rendering (#558 codex r4 #1).
+    #
+    # LeanZero fork: a request with no max_tokens (and no operator
+    # ``--max-tokens``) generates until the model stops or the window is full.
+    # The guard then checks the prompt alone, and the budget becomes the room
+    # the counted prompt leaves — never the typed serve default, which capped
+    # every such answer and refused any prompt within the default of the
+    # window (``prompt + default > window`` → 400).
+    _implicit_budget = implicit_max_tokens(request.max_tokens)
     _line1_prompt_tokens = enforce_context_length_for_messages(
         engine,
         messages,
         tools=request.tools,
-        max_tokens=chat_kwargs.get("max_tokens"),
+        max_tokens=None if _implicit_budget else chat_kwargs.get("max_tokens"),
         enable_thinking=resolved_thinking,
         chat_template_kwargs=chat_kwargs.get("chat_template_kwargs"),
     )
+    if _implicit_budget and _line1_prompt_tokens is not None:
+        _room = context_room(engine, _line1_prompt_tokens)
+        if _room is not None:
+            chat_kwargs["max_tokens"] = _room
 
     # LINE① (#558, codex r4 #1) — HARD context-window allowance check. With
     # ``max_tokens=None`` the guard above only proved ``prompt_tokens <= window``
@@ -5950,13 +5966,33 @@ async def _create_chat_completion_impl(
             # it's a copy of ``chat_kwargs`` (see line above), but we
             # resolve from ``chat_kwargs`` for symmetry with the
             # initial gate at line ~2066.
-            _repair_fits = repair_messages_fit_context(
-                engine,
-                repair_messages,
-                tools=None,
-                max_tokens=repair_kwargs.get("max_tokens"),
-                enable_thinking=chat_kwargs.get("enable_thinking"),
+            _repair_prompt_tokens = (
+                messages_prompt_tokens(
+                    engine,
+                    repair_messages,
+                    enable_thinking=chat_kwargs.get("enable_thinking"),
+                )
+                if _implicit_budget
+                else None
             )
+            _repair_window = get_model_max_context(engine)
+            if (
+                _repair_prompt_tokens is not None
+                and _repair_window != _FALLBACK_MAX_CONTEXT_TOKENS
+            ):
+                # The implicit budget is the room the REPAIR prompt leaves.
+                _repair_room = _repair_window - _repair_prompt_tokens
+                _repair_fits = _repair_room >= 1
+                if _repair_fits:
+                    repair_kwargs["max_tokens"] = _repair_room
+            else:
+                _repair_fits = repair_messages_fit_context(
+                    engine,
+                    repair_messages,
+                    tools=None,
+                    max_tokens=repair_kwargs.get("max_tokens"),
+                    enable_thinking=chat_kwargs.get("enable_thinking"),
+                )
             repair_output = None
             if not _repair_fits:
                 incr_strict_repair_skipped_context_overflow()
