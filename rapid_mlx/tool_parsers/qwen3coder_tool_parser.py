@@ -481,6 +481,18 @@ class Qwen3CoderToolParser(ToolParser):
             or []
         )
         for p_name, p_value in parsed:
+            if f"{self.parameter_end_token}\n" in p_value:
+                # Kept as sent (the wire cannot tell payload from residue), but
+                # said: an off-grammar re-close lands here, and so does a value
+                # that quotes the format. xml_tool_close_guard is what stops
+                # the former at decode time.
+                logger.warning(
+                    "qwen3_coder_xml: %s.%s carries an interior %r; kept as sent: %r",
+                    function_name,
+                    p_name,
+                    self.parameter_end_token,
+                    p_value[-80:],
+                )
             param_dict[p_name] = _convert_param_value(
                 p_value, p_name, param_config, function_name
             )
