@@ -3719,15 +3719,21 @@ class BatchedEngine(BaseEngine):
         """The stable message prefix left once a client-marked volatile tail is removed.
 
         LeanZero fork, request field ``rapid_mlx_transient_tail``: the client
-        names the exact trailing text of its LAST user message that changes on
-        every request (an agent's per-turn clock/budget block). The prompt
-        submitted is unchanged; only the non-trimmable-cache boundary snapshot
-        moves to before that text, so the next request — which drops this tail
-        and appends new turns — finds an exact-prefix entry.
+        names the exact trailing text of its LAST user or tool message that
+        changes on every request (an agent's per-turn clock/budget block). The
+        prompt submitted is unchanged; only the non-trimmable-cache boundary
+        snapshot moves to before that text, so the next request — which drops
+        this tail and appends new turns — finds an exact-prefix entry.
+
+        A tool message may carry the tail (``rapid_mlx_transient_tail_on_tool``):
+        a client that appends its block to the tool results a request ends on,
+        instead of posting it as a user turn of its own, gets the same boundary.
+        Chat templates render a trailing user message holding nothing but that
+        block as a new user turn, and models answer it as one.
 
         Returns ``None`` (upstream boundary behaviour) when no tail was sent.
-        A tail that is not the exact suffix of the last user message's string
-        content is logged and ignored rather than guessed at.
+        A tail that is not the exact suffix of that message's string content is
+        logged and ignored rather than guessed at.
         """
         if not transient_tail:
             return None
@@ -3737,21 +3743,25 @@ class BatchedEngine(BaseEngine):
             else transient_message_start
         )
         index = next(
-            (i for i in range(limit - 1, -1, -1) if messages[i].get("role") == "user"),
+            (
+                i
+                for i in range(limit - 1, -1, -1)
+                if messages[i].get("role") in ("user", "tool")
+            ),
             None,
         )
         content = messages[index].get("content") if index is not None else None
         if not isinstance(content, str) or not content.endswith(transient_tail):
             logger.warning(
                 "[prefix_boundary] rapid_mlx_transient_tail ignored: it is not the "
-                "exact suffix of the last user message's text (tail %d chars, "
-                "last user message %s)",
+                "exact suffix of the last user or tool message's text (tail %d "
+                "chars, that message %s)",
                 len(transient_tail),
                 "absent" if index is None else f"#{index}",
             )
             return None
         stable_content = content[: len(content) - len(transient_tail)]
-        if stable_content == "":
+        if stable_content == "" and messages[index].get("role") == "user":
             return list(messages[:index])
         return [*messages[:index], {**messages[index], "content": stable_content}]
 

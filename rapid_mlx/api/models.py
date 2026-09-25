@@ -1550,7 +1550,14 @@ class StreamOptions(BaseModel):
         return v
 
 
-REQUEST_EXTENSIONS: tuple[str, ...] = ("rapid_mlx_transient_tail",)
+# ``rapid_mlx_transient_tail_on_tool`` declares that the transient tail may end
+# the last TOOL message, not only the last user message (engine
+# ``_stable_messages_before_transient_tail``); a client that relies on it checks
+# for this name, since an older engine ignores such a tail.
+REQUEST_EXTENSIONS: tuple[str, ...] = (
+    "rapid_mlx_transient_tail",
+    "rapid_mlx_transient_tail_on_tool",
+)
 
 
 class ChatCompletionRequest(BaseModel):
