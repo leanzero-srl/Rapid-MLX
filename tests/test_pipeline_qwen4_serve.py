@@ -360,3 +360,166 @@ def test_a_second_long_request_waits_for_kv_and_both_complete(checkpoint):
     finally:
         os.kill(running.ready[0]["pid"], signal.SIGTERM)
         running.process.wait(timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# prefix cache (Q-75)
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_chunks_end_one_range_exactly_at_the_snapshot():
+    from rapid_mlx.distributed.pipeline_qwen4_serve import prefill_chunks
+
+    assert prefill_chunks(0, 10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert prefill_chunks(0, 10, 4, 6) == [(0, 4), (4, 6), (6, 10)]
+    assert prefill_chunks(3, 10, 4, 10) == [(3, 7), (7, 10)]
+    assert prefill_chunks(5, 9, 4, 3) == [(5, 9)]  # a split behind the start is none
+    assert prefill_chunks(5, 5, 4, 5) == []  # the whole prefill was restored
+
+
+class _FakeKv:
+    """Reserves rows x longest; a snapshot costs its tokens on rank 0, double on rank 1."""
+
+    def __init__(self, budgets: list[int]):
+        self.budgets = budgets
+
+    def reserve(self, lengths: list[int]) -> list[int]:
+        return [len(lengths) * max(lengths)] * len(self.budgets)
+
+    def entry_bytes(self, tokens: int) -> list[int]:
+        return [tokens, 2 * tokens]
+
+
+def _row(ids: list[int], boundary: int = 0):
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _Row
+
+    return _Row(ids, 4, 0.0, 1.0, boundary=boundary)
+
+
+def _store(index, row) -> None:
+    """What rank 0's on_stored callback does once every rank holds the snapshot."""
+    index.stored(
+        row.store_id, tuple(row.ids[: row.store_at]), index.kv.entry_bytes(row.store_at)
+    )
+
+
+def test_prefix_index_restores_only_an_exact_prefix_that_leaves_a_token_to_feed():
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _PrefixIndex
+
+    index = _PrefixIndex(_FakeKv([1000, 1000]))
+    cold = _row(list(range(20)), boundary=12)
+    assert index.admit([cold], [24]) == []
+    assert (cold.reuse_id, cold.cached, cold.store_at) == (0, 0, 12)
+    _store(index, cold)
+
+    warm = _row([*range(12), 99, 98, 97], boundary=13)
+    index.admit([warm], [19])
+    assert (warm.reuse_id, warm.cached) == (cold.store_id, 12)
+    assert warm.store_at == 13  # the longer boundary is a new entry
+
+    other = _row([7, *range(1, 20)], boundary=12)
+    index.admit([other], [24])
+    assert (other.reuse_id, other.cached) == (0, 0)  # the first token differs
+
+    exact = _row(list(range(12)))
+    index.admit([exact], [16])
+    # The prompt IS the entry: nothing would be left to feed, so no restore.
+    assert exact.cached == 0
+    assert index.status()["hits"] == 1
+
+
+def test_prefix_index_yields_its_bytes_to_the_batch_oldest_first_hits_refresh():
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _PrefixIndex
+
+    index = _PrefixIndex(_FakeKv([200, 200]))
+    first = _row([1] * 30, boundary=20)
+    index.admit([first], [30])
+    _store(index, first)  # held [20, 40]
+    second = _row([2] * 30, boundary=20)
+    index.admit([second], [30])
+    _store(index, second)  # held [40, 80]
+
+    hit = _row([1] * 25)
+    assert index.admit([hit], [25]) == []
+    assert hit.reuse_id == first.store_id  # `first` is now the most recent
+
+    # A batch reserving 150 leaves room 50 on each rank; rank 1 holds 80, so
+    # the least recently used entry (`second`) goes, and only it.
+    batch = [_row([3] * 10), _row([4] * 10)]
+    assert index.admit(batch, [75, 75]) == [second.store_id]
+    assert all(row.store_id == 0 and row.reuse_id == 0 for row in batch)
+    assert index.status()["bytes"] == [20, 40]
+    assert index.status()["evicted"] == 1
+
+
+def test_prefix_index_never_snapshots_what_cannot_fit_beside_the_batch():
+    from rapid_mlx.distributed.pipeline_qwen4_serve import _PrefixIndex
+
+    index = _PrefixIndex(_FakeKv([100, 100]))
+    big = _row([5] * 60, boundary=40)  # rank 1 would need 80 beside the batch's 60
+    assert index.admit([big], [60]) == []
+    assert (big.store_id, big.store_at) == (0, 0)
+    assert index.status()["skipped"] == {"no_room_beside_the_batch": 1}
+
+
+def _prefix_body(user: str, tail: str) -> dict:
+    system = " ".join(f"w{3 + (i * 7) % 250}" for i in range(200))
+    return {
+        "model": SERVED,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 16,
+        "temperature": 0,
+        "rapid_mlx_transient_tail": tail,
+    }
+
+
+def test_a_repeated_prefix_is_restored_on_every_rank_and_answers_as_a_cold_run(
+    server, checkpoint
+):
+    models = server.get("/v1/models")["data"][0]
+    assert models["request_extensions"] == ["rapid_mlx_transient_tail"]
+    bodies = [
+        _prefix_body("w5 w6 w7 turn w9", "turn w9"),
+        _prefix_body("w5 w6 w7 turn w10 w11", "turn w10 w11"),
+        _prefix_body("w5 w6 w7 turn w9", "turn w9"),
+    ]
+    answers = [json.load(server.post(body)) for body in bodies]
+    cached = [a["usage"]["prompt_tokens_details"]["cached_tokens"] for a in answers]
+    cache = server.get("/v1/status")["prefix_cache"]
+    assert cached[0] == 0
+    assert cached[1] == cached[2] > 0
+    assert cached[1] in cache["entry_tokens"]
+    assert len(cache["bytes"]) == 2 and all(held > 0 for held in cache["bytes"])
+    assert all(
+        held <= limit for held, limit in zip(cache["bytes"], cache["limit_bytes"])
+    )
+
+    # The control prefills cold, chunked exactly where the cached path splits
+    # (the snapshot boundary): QSA's top-k block selection makes a prefill's
+    # tokens depend on its chunk edges (measured here: --prefill-step 142 and
+    # 284 answer differently from one whole chunk, 63 does not), so the
+    # contract is "identical to the cold run with the same chunks", which is
+    # what the cache must reproduce bit for bit.
+    boundary = cached[1]
+    assert all(len(body["messages"][0]["content"]) for body in bodies)
+    assert max(a["usage"]["prompt_tokens"] for a in answers) - 1 <= 2 * boundary
+    control = _Server(
+        checkpoint, ("--no-prefix-cache", "--prefill-step", str(boundary))
+    )
+    try:
+        assert control.get("/v1/models")["data"][0]["request_extensions"] == []
+        assert control.get("/v1/status")["prefix_cache"]["enabled"] is False
+        for body, answer in zip(bodies, answers):
+            cold = json.load(control.post(body))
+            assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+            assert cold["choices"][0]["message"] == answer["choices"][0]["message"]
+            assert (
+                cold["usage"]["completion_tokens"]
+                == answer["usage"]["completion_tokens"]
+            )
+    finally:
+        os.kill(control.ready[0]["pid"], signal.SIGTERM)
+        control.process.wait(timeout=60)

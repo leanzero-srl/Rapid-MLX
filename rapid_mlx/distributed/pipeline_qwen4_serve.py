@@ -26,11 +26,28 @@ batches); requests arriving mid-batch wait for the next one.  A finished,
 EOS'd or cancelled row stops receiving tokens; the batch ends one decode
 step after its last live row finishes (the control word rides the next
 step's collective).
+
+Prefix cache (Q-75): every rank snapshots ITS OWN layers' caches at a stable
+prompt boundary and restores them for a later prompt that starts with the same
+tokens.  The layers are hybrid (GDN/PLE recurrent state cannot be trimmed), so
+only an exact stored prefix is reusable, and every rank must reuse the SAME
+prefix length or the collectives stop pairing.  So rank 0 alone decides — which
+entry to restore, where to snapshot, what to evict — and the batch header
+carries the decision; the other ranks hold snapshots by the id rank 0 assigned
+and never decide anything.  The boundary is the single engine's
+(``BatchedEngine._compute_prefix_boundary``, the ``rapid_mlx_transient_tail``
+extension included).  Bytes: the cache lives inside each rank's planned KV
+budget — at every admission it is trimmed to that budget minus the batch's
+own reservation, the new snapshot pre-charged — so it never holds memory the
+plan did not.  A request the cache acts on (restores or snapshots) runs as a
+batch of one: rows are left-padded to one width, so a restored prefix cannot
+share a batch.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import os
@@ -41,6 +58,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,14 +97,30 @@ class _Row:
     # Rank 0 only: the row's preprocessed images.  They never cross ranks —
     # rank 0 merges the tower's features and shares the RoPE table instead.
     images: Any = None
+    # The prefix-cache directive, identical on every rank (rank 0 decides, the
+    # batch header carries it; a batch of more than one row carries none):
+    # restore entry ``reuse_id`` holding the first ``cached`` tokens, and
+    # snapshot entry ``store_id`` after the first ``store_at`` tokens.
+    reuse_id: int = 0
+    cached: int = 0
+    store_id: int = 0
+    store_at: int = 0
+    # Rank 0 only: the stable-prefix boundary the HTTP side computed (0 = the
+    # request asks the cache for nothing: images, or no boundary).
+    boundary: int = 0
+
+
+# The header words after the rows: the one-row directive, then the evictions.
+_DIRECTIVE_FIELDS = len(("reuse_id", "cached", "store_id", "store_at", "evictions"))
 
 
 def _broadcast_batch(
-    group, rows: list[_Row] | None, max_batch: int
-) -> list[_Row] | None:
-    """Rank 0's batch, identical on every rank; None means shut down."""
+    group, rows: list[_Row] | None, max_batch: int, evict: list[int] | None = None
+) -> tuple[list[_Row], list[int]] | None:
+    """Rank 0's batch and prefix-cache evictions, identical on every rank; None = shut down."""
     rank0 = group.rank() == 0
-    header = [0] * (3 + 2 * max_batch)
+    header = [0] * (3 + 2 * max_batch + _DIRECTIVE_FIELDS)
+    directive = 3 + 2 * max_batch
     if rank0:
         if rows is None:
             header[0] = _CMD_SHUTDOWN
@@ -97,6 +131,15 @@ def _broadcast_batch(
             for index, row in enumerate(rows):
                 header[3 + index] = len(row.ids)
                 header[3 + max_batch + index] = row.max_tokens
+            if len(rows) == 1:
+                row = rows[0]
+                header[directive : directive + 4] = [
+                    row.reuse_id,
+                    row.cached,
+                    row.store_id,
+                    row.store_at,
+                ]
+            header[directive + 4] = len(evict or [])
     agreed = mx.distributed.all_sum(mx.array(header, dtype=mx.int32), group=group)
     header = agreed.tolist()
     if header[0] == _CMD_SHUTDOWN:
@@ -114,6 +157,14 @@ def _broadcast_batch(
     floats = mx.distributed.all_sum(
         mx.array(floats, dtype=mx.float32), group=group
     ).tolist()
+    evictions = header[directive + 4]
+    if evictions:
+        dropped = list(evict) if rank0 else [0] * evictions
+        evict = mx.distributed.all_sum(
+            mx.array(dropped, dtype=mx.int32), group=group
+        ).tolist()
+    else:
+        evict = []
     result = []
     for index in range(batch):
         length = header[3 + index]
@@ -126,7 +177,12 @@ def _broadcast_batch(
                 top_p=floats[2 * index + 1],
             )
         )
-    return result
+    if batch == 1:
+        row = result[0]
+        row.reuse_id, row.cached, row.store_id, row.store_at = header[
+            directive : directive + 4
+        ]
+    return result, evict
 
 
 def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
@@ -173,13 +229,97 @@ def _step(
     return values[:batch], values[batch + 1]
 
 
+def prefill_chunks(
+    start: int, end: int, step: int, split: int = 0
+) -> list[tuple[int, int]]:
+    """The ``[a, b)`` prefill ranges from ``start`` to ``end``, ``step`` tokens each.
+
+    When ``start < split <= end`` one range ends exactly at ``split`` (where
+    the prefix snapshot is taken); otherwise the ranges are the plain chunks.
+    """
+    ranges: list[tuple[int, int]] = []
+    edges = [split] if start < split < end else []
+    offset = start
+    for stop in [*edges, end]:
+        while offset < stop:
+            ranges.append((offset, min(offset + step, stop)))
+            offset = ranges[-1][1]
+    return ranges
+
+
+def _held_bytes(value, seen: set[int] | None = None) -> int:
+    """Bytes of every MLX array a cache object holds (whole buffers, not views)."""
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, mx.array):
+        return value.nbytes
+    if isinstance(value, (list, tuple)):
+        return sum(_held_bytes(item, seen) for item in value)
+    if isinstance(value, dict):
+        return sum(_held_bytes(item, seen) for item in value.values())
+    if hasattr(value, "__dict__"):
+        return sum(_held_bytes(item, seen) for item in vars(value).values())
+    return 0
+
+
+class _PrefixStore:
+    """One rank's prefix snapshots, by the id rank 0 assigned.  Decides nothing."""
+
+    def __init__(self):
+        self.entries: dict[int, list[Any]] = {}
+
+    def take(self, entry_id: int) -> list[Any]:
+        if entry_id not in self.entries:
+            raise RuntimeError(
+                f"prefix cache: rank 0 restores entry {entry_id}, which this rank "
+                f"does not hold (held: {sorted(self.entries)}) — the ranks diverged"
+            )
+        # Generation mutates offsets and writes into the KV buffers: the
+        # restored copy must not alias the stored entry (the single engine's
+        # MemoryAwarePrefixCache.fetch copies for the same reason).
+        return copy.deepcopy(self.entries[entry_id])
+
+    def put(self, entry_id: int, cache: list[Any]) -> int:
+        self.entries[entry_id] = copy.deepcopy(cache)
+        return _held_bytes(self.entries[entry_id])
+
+    def drop(self, entry_ids: list[int]) -> None:
+        for entry_id in entry_ids:
+            self.entries.pop(entry_id, None)
+
+
+def _agree_bytes(stage, local: int) -> list[int]:
+    """Every rank's measured bytes, rank-indexed (KiB over the wire: int32)."""
+    kib = [0] * stage.size
+    kib[stage.rank] = -(-local // 1024)
+    if stage.size > 1:
+        kib = mx.distributed.all_sum(
+            mx.array(kib, dtype=mx.int32), group=stage.group
+        ).tolist()
+    return [value * 1024 for value in kib]
+
+
 def run_batch(
-    stage, guard, rows: list[_Row], prefill_step: int, on_tokens=None, control_fn=None
+    stage,
+    guard,
+    rows: list[_Row],
+    prefill_step: int,
+    on_tokens=None,
+    control_fn=None,
+    store: _PrefixStore | None = None,
+    evict: list[int] | None = None,
+    on_stored=None,
 ) -> None:
     """Prefill + decode one batch on this rank.
 
     ``on_tokens(step, tokens)`` (rank 0) receives each step's sampled tokens;
     ``control_fn()`` (rank 0) returns 1 to end the batch at the next step.
+    A one-row batch may carry a prefix-cache directive: restore ``reuse_id``
+    and prefill from ``cached``; snapshot ``store_id`` after ``store_at``
+    tokens, then ``on_stored(store_id, bytes_per_rank)`` (rank 0).
+    ``evict`` entries are dropped after the restore copied its entry.
     """
     width = max(len(row.ids) for row in rows)
     padded = [[0] * (width - len(row.ids)) + row.ids for row in rows]
@@ -190,19 +330,33 @@ def run_batch(
         [row.ids for row in rows],
         [row.images for row in rows] if stage.is_first else None,
     )
-    cache = stage.make_cache(padding if len(rows) > 1 else None)
-    prefix = tokens[:, :-1]
-    for offset in range(0, prefix.shape[1], prefill_step):
+    head = rows[0]
+    directed = len(rows) == 1 and (head.reuse_id or head.store_id)
+    if directed and (store is None or embeddings is not None or rope is not None):
+        raise RuntimeError(
+            "prefix cache: a directive reached a rank without a store, or a row "
+            "with images (rank 0 never directs either)"
+        )
+    if len(rows) == 1 and head.reuse_id:
+        cache, start = store.take(head.reuse_id), head.cached
+    else:
+        cache, start = stage.make_cache(padding if len(rows) > 1 else None), 0
+    if store is not None and evict:
+        store.drop(evict)
+    split = head.store_at if len(rows) == 1 and head.store_id else 0
+    for offset, stop in prefill_chunks(start, width - 1, prefill_step, split):
         out = stage.forward(
-            prefix[:, offset : offset + prefill_step],
+            tokens[:, offset:stop],
             cache,
             logits=None,
-            embeddings=None
-            if embeddings is None
-            else embeddings[:, :-1][:, offset : offset + prefill_step],
+            embeddings=None if embeddings is None else embeddings[:, offset:stop],
             rope_positions=rope,
         )
         _step(stage, out, cache, rows, guard, 0, sample=False)
+        if split and stop == split:
+            measured = _agree_bytes(stage, store.put(head.store_id, cache))
+            if on_stored is not None:
+                on_stored(head.store_id, measured)
     current = tokens[:, -1:]
     current_embeddings = None if embeddings is None else embeddings[:, -1:]
     for step in range(max(row.max_tokens for row in rows)):
@@ -288,6 +442,153 @@ class _KvBudget:
             need <= budget for need, budget in zip(self.reserve(lengths), self.budgets)
         )
 
+    def entry_bytes(self, tokens: int) -> list[int]:
+        """Each rank's bound on one snapshot of ``tokens`` tokens (one sequence).
+
+        The planner's own state formula at ``tokens`` plus one KV allocation
+        step: a snapshot keeps its KV buffers whole, and a buffer runs at most
+        one step past the tokens it holds.
+        """
+        size = len(self.plan.stages)
+        span = tokens + pipe.KVCache.step
+        return [
+            pipe._stage_plan(
+                self.args,
+                self.plan.checkpoint,
+                stage.node,
+                stage.rank,
+                size,
+                stage.start,
+                stage.end,
+                span,
+                1,
+                min(self.prefill_step, span),
+            ).state_bytes
+            for stage in self.plan.stages
+        ]
+
+
+@dataclass
+class _Entry:
+    key: tuple[int, ...]
+    bytes: list[int]
+
+
+class _PrefixIndex:
+    """Rank 0's prefix-cache decisions: what to restore, snapshot and evict.
+
+    Bounded by bytes alone, per rank: at every admission the entries plus the
+    snapshot this batch will take must fit each rank's planned KV budget minus
+    the batch's own reservation (``_KvBudget``) — the cache holds only the
+    budget live requests leave idle, and yields it to them first.  LRU order,
+    refreshed on every hit.  No entry count bound: the count can never evict
+    before the bytes do.
+    """
+
+    def __init__(self, kv: _KvBudget):
+        self.kv = kv
+        self.entries: OrderedDict[int, _Entry] = OrderedDict()
+        self.next_id = 1
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.tokens_saved = 0
+        self.stores = 0
+        self.evicted = 0
+        self.skipped: dict[str, int] = {}
+
+    def _skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+    def lookup(self, ids: list[int]) -> tuple[int, int]:
+        """The longest stored exact prefix that still leaves a token to feed."""
+        best_id, best = 0, 0
+        for entry_id, entry in self.entries.items():
+            length = len(entry.key)
+            if best < length < len(ids) and tuple(ids[:length]) == entry.key:
+                best_id, best = entry_id, length
+        return best_id, best
+
+    def acts_on(self, row: _Row) -> bool:
+        return row.images is None and (row.boundary > 0 or self.lookup(row.ids)[1] > 0)
+
+    def admit(self, rows: list[_Row], lengths: list[int]) -> list[int]:
+        """Set the directive on a one-row batch; return the entries to evict."""
+        with self.lock:
+            room = [
+                budget - need
+                for budget, need in zip(self.kv.budgets, self.kv.reserve(lengths))
+            ]
+            new = [0] * len(room)
+            if len(rows) == 1 and rows[0].images is None:
+                row = rows[0]
+                row.reuse_id, row.cached = self.lookup(row.ids)
+                if row.reuse_id:
+                    self.hits += 1
+                    self.tokens_saved += row.cached
+                    self.entries.move_to_end(row.reuse_id)
+                else:
+                    self.misses += 1
+                if row.boundary <= row.cached:
+                    if row.boundary:
+                        self._skip("boundary_within_restored_prefix")
+                elif row.boundary >= len(row.ids):
+                    self._skip("boundary_past_prompt")
+                elif any(
+                    entry.key == tuple(row.ids[: row.boundary])
+                    for entry in self.entries.values()
+                ):
+                    self._skip("already_stored")
+                else:
+                    new = self.kv.entry_bytes(row.boundary)
+                    row.store_id, row.store_at = self.next_id, row.boundary
+                    self.next_id += 1
+            evict = []
+
+            def held() -> list[int]:
+                return [
+                    sum(entry.bytes[rank] for entry in self.entries.values())
+                    for rank in range(len(room))
+                ]
+
+            def over(extra: list[int]) -> bool:
+                return any(h + e > r for h, e, r in zip(held(), extra, room))
+
+            while self.entries and over(new):
+                entry_id, _ = self.entries.popitem(last=False)
+                evict.append(entry_id)
+                self.evicted += 1
+            if any(new) and over(new):
+                # Even an empty cache cannot hold this snapshot beside the batch.
+                self._skip("no_room_beside_the_batch")
+                rows[0].store_id = rows[0].store_at = 0
+            return evict
+
+    def stored(self, entry_id: int, key: tuple[int, ...], measured: list[int]) -> None:
+        with self.lock:
+            self.entries[entry_id] = _Entry(key, measured)
+            self.stores += 1
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            held = [
+                sum(entry.bytes[rank] for entry in self.entries.values())
+                for rank in range(len(self.kv.budgets))
+            ]
+            return {
+                "enabled": True,
+                "entries": len(self.entries),
+                "entry_tokens": [len(entry.key) for entry in self.entries.values()],
+                "bytes": held,
+                "limit_bytes": list(self.kv.budgets),
+                "hits": self.hits,
+                "misses": self.misses,
+                "tokens_saved": self.tokens_saved,
+                "stored": self.stores,
+                "evicted": self.evicted,
+                "skipped": dict(self.skipped),
+            }
+
 
 def _reservation_length(row: _Row) -> int:
     return len(row.ids) + row.max_tokens + 1
@@ -299,6 +600,7 @@ class _State:
     context: int
     max_batch: int
     kv: _KvBudget | None = None
+    prefix: _PrefixIndex | None = None
     jobs: queue.Queue = field(default_factory=queue.Queue)
     held: object = None
     active: list = field(default_factory=list)
@@ -408,14 +710,53 @@ def _merge_tool_call_deltas(deltas: list[dict]) -> list[dict]:
     return [merged[index] for index in sorted(merged)]
 
 
+class _BoundaryRenderer:
+    """What ``BatchedEngine._compute_prefix_boundary`` reads from its engine.
+
+    The boundary rule is the single engine's, reused as is; this server
+    renders prompts with the same shared ``apply_chat_template`` the engine's
+    ``_apply_chat_template`` ends in, so the two agree token for token.
+    """
+
+    def __init__(self, tokenizer, model_name: str):
+        self.tokenizer = tokenizer
+        self.model_name = model_name
+
+    def _apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        num_images: int = 0,
+        enable_thinking=None,
+        add_generation_prompt: bool = True,
+        chat_template_kwargs=None,
+    ) -> str:
+        from ..engine.batched import _normalize_tool_call_arguments_for_template
+        from ..utils.chat_template import apply_chat_template
+
+        return apply_chat_template(
+            self.tokenizer,
+            _normalize_tool_call_arguments_for_template(messages),
+            tools=tools,
+            enable_thinking=enable_thinking,
+            model_name=self.model_name,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+
 def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
 
+    from ..api.models import REQUEST_EXTENSIONS
     from ..api.tool_calling import convert_tools_for_template
     from ..config.server_config import ServerConfig
     from ..engine.base import GenerationOutput
-    from ..engine.batched import _normalize_tool_call_arguments_for_template
+    from ..engine.batched import (
+        BatchedEngine,
+        _normalize_tool_call_arguments_for_template,
+    )
     from ..service.helpers import _should_start_in_thinking
     from ..service.postprocessor import StreamingPostProcessor
     from ..utils.chat_template import apply_chat_template
@@ -435,6 +776,8 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         capabilities.append("vision")
     if tool_parser is not None:
         capabilities.append("tools")
+
+    boundary_renderer = _BoundaryRenderer(tokenizer, state.served)
 
     def error(status: int, message: str, kind: str) -> JSONResponse:
         return JSONResponse(
@@ -457,6 +800,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     "context_window": state.context,
                     "tool_call_parser": tool_parser,
                     "reasoning_parser": reasoning_parser,
+                    # The single engine's declaration: the transient-tail
+                    # field moves the prefix snapshot, so it is declared only
+                    # while there is a prefix cache to move it in.
+                    "request_extensions": list(REQUEST_EXTENSIONS)
+                    if state.prefix is not None
+                    else [],
                 }
             ],
         }
@@ -480,6 +829,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             "sequences_in_flight": len(state.active),
             "kv_reserved_bytes": reserved,
             "kv_budget_bytes": kv.budgets if kv is not None else None,
+            "prefix_cache": state.prefix.status()
+            if state.prefix is not None
+            else {"enabled": False, "reason": "--no-prefix-cache"},
             "status": "ok",
         }
 
@@ -559,6 +911,20 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             )
         else:
             ids = tokenizer.encode(prompt)
+        boundary = 0
+        if state.prefix is not None and images is None:
+            stable = BatchedEngine._stable_messages_before_transient_tail(
+                messages, None, body.get("rapid_mlx_transient_tail")
+            )
+            boundary = BatchedEngine._compute_prefix_boundary(
+                boundary_renderer,
+                messages,
+                tools,
+                stable_messages=stable,
+                generation_prompt=ids,
+                enable_thinking=enable_thinking,
+                chat_template_kwargs=kwargs or None,
+            )
         budget = state.context - len(ids) - 1
         requested = body.get("max_completion_tokens") or body.get("max_tokens")
         if budget < 1:
@@ -574,7 +940,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         stops = [stops] if isinstance(stops, str) else list(stops)
         loop = asyncio.get_running_loop()
         job = _Job(
-            _Row(ids, max_tokens, temperature, top_p, images), loop, asyncio.Queue()
+            _Row(ids, max_tokens, temperature, top_p, images, boundary=boundary),
+            loop,
+            asyncio.Queue(),
         )
         state.jobs.put(job)
         created = int(time.time())
@@ -747,6 +1115,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     "prompt_tokens": len(ids),
                     "completion_tokens": completion,
                     "total_tokens": len(ids) + completion,
+                    "prompt_tokens_details": {"cached_tokens": job.row.cached},
                 }
                 yield chunk({}, finish, usage)
                 yield "data: [DONE]\n\n"
@@ -792,6 +1161,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 "prompt_tokens": len(ids),
                 "completion_tokens": completion,
                 "total_tokens": len(ids) + completion,
+                "prompt_tokens_details": {"cached_tokens": job.row.cached},
             },
         }
 
@@ -799,7 +1169,13 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
 
 
 def _run_jobs(
-    stage, guard, state: _State, batch: list[_Job], prefill_step: int
+    stage,
+    guard,
+    state: _State,
+    batch: list[_Job],
+    prefill_step: int,
+    store: _PrefixStore | None = None,
+    evict: list[int] | None = None,
 ) -> None:
     def on_tokens(step: int, tokens: list[int]) -> None:
         state.steps += 1
@@ -818,9 +1194,21 @@ def _run_jobs(
     def control() -> int:
         return int(all(job.finished or job.cancelled for job in batch))
 
+    def on_stored(entry_id: int, measured: list[int]) -> None:
+        row = batch[0].row
+        state.prefix.stored(entry_id, tuple(row.ids[: row.store_at]), measured)
+
     try:
         run_batch(
-            stage, guard, [job.row for job in batch], prefill_step, on_tokens, control
+            stage,
+            guard,
+            [job.row for job in batch],
+            prefill_step,
+            on_tokens,
+            control,
+            store=store,
+            evict=evict,
+            on_stored=on_stored if state.prefix is not None else None,
         )
     except pipe.PipelineMemoryStopError as stop:
         for job in batch:
@@ -832,8 +1220,16 @@ def _run_jobs(
             job.push(("done", "length"))
 
 
-def _rank0_loop(stage, guard, state: _State, prefill_step: int, wake: _Wake) -> None:
+def _rank0_loop(
+    stage,
+    guard,
+    state: _State,
+    prefill_step: int,
+    wake: _Wake,
+    store: _PrefixStore | None = None,
+) -> None:
     group = stage.group
+    prefix = state.prefix
     while True:
         if state.held is not None:
             first, state.held = state.held, None
@@ -847,7 +1243,10 @@ def _rank0_loop(stage, guard, state: _State, prefill_step: int, wake: _Wake) -> 
             continue
         batch = [first]
         lengths = [_reservation_length(first.row)]
-        while len(batch) < state.max_batch:
+        # A request the prefix cache acts on runs alone: a restored prefix
+        # cannot share a left-padded batch.
+        alone = prefix is not None and prefix.acts_on(first.row)
+        while len(batch) < state.max_batch and not alone:
             try:
                 extra = state.jobs.get_nowait()
             except queue.Empty:
@@ -858,19 +1257,27 @@ def _rank0_loop(stage, guard, state: _State, prefill_step: int, wake: _Wake) -> 
             if extra.cancelled:
                 continue
             candidate = [*lengths, _reservation_length(extra.row)]
-            if state.kv is not None and not state.kv.fits(candidate):
+            if (state.kv is not None and not state.kv.fits(candidate)) or (
+                prefix is not None and prefix.acts_on(extra.row)
+            ):
                 # First come, first served: the request that does not fit
-                # beside this batch heads the next one, and nothing behind it
-                # jumps the line.
+                # beside this batch (by KV, or because the prefix cache acts
+                # on it) heads the next one, and nothing behind it jumps the
+                # line.
                 state.held = extra
                 break
             batch.append(extra)
             lengths = candidate
+        evict = (
+            prefix.admit([job.row for job in batch], lengths)
+            if prefix is not None
+            else []
+        )
         state.active = batch
         state.reserved = state.kv.reserve(lengths) if state.kv is not None else []
         wake.ring()
-        _broadcast_batch(group, [job.row for job in batch], state.max_batch)
-        _run_jobs(stage, guard, state, batch, prefill_step)
+        _broadcast_batch(group, [job.row for job in batch], state.max_batch, evict)
+        _run_jobs(stage, guard, state, batch, prefill_step, store, evict)
         state.active = []
         state.reserved = []
 
@@ -934,14 +1341,22 @@ class _Wake:
         return self.link.recv(1) == b"\x01"
 
 
-def _worker_loop(stage, guard, max_batch: int, prefill_step: int, wake: _Wake) -> None:
+def _worker_loop(
+    stage,
+    guard,
+    max_batch: int,
+    prefill_step: int,
+    wake: _Wake,
+    store: _PrefixStore | None = None,
+) -> None:
     while True:
         if not wake.wait():
             return
-        rows = _broadcast_batch(stage.group, None, max_batch)
-        if rows is None:
+        batch = _broadcast_batch(stage.group, None, max_batch)
+        if batch is None:
             return
-        run_batch(stage, guard, rows, prefill_step)
+        rows, evict = batch
+        run_batch(stage, guard, rows, prefill_step, store=store, evict=evict)
 
 
 def serve(options, emit=None) -> int:
@@ -974,6 +1389,7 @@ def serve(options, emit=None) -> int:
     run_batch(stage, guard, warm, prefill_step)
     wake = _Wake(group)
     context = options.context or plan.context
+    store = None if options.no_prefix_cache else _PrefixStore()
     if not stage.is_first:
         emit(
             "READY",
@@ -983,17 +1399,19 @@ def serve(options, emit=None) -> int:
                 "layers": [stage.start, stage.end],
             },
         )
-        _worker_loop(stage, guard, options.max_batch, prefill_step, wake)
+        _worker_loop(stage, guard, options.max_batch, prefill_step, wake, store)
         return 0
 
     from mlx_lm.utils import load_tokenizer
 
     tokenizer = load_tokenizer(model_dir)
+    kv = _KvBudget(plan, prefill_step)
     state = _State(
         served=options.served_model_name,
         context=context,
         max_batch=options.max_batch,
-        kv=_KvBudget(plan, prefill_step),
+        kv=kv,
+        prefix=None if store is None else _PrefixIndex(kv),
         eos_ids=frozenset(tokenizer.eos_token_ids),
     )
 
@@ -1040,10 +1458,11 @@ def serve(options, emit=None) -> int:
             "context": context,
             "starts": plan.starts,
             "vision": stage.vision is not None,
+            "prefix_cache": store is not None,
         },
     )
     try:
-        _rank0_loop(stage, guard, state, prefill_step, wake)
+        _rank0_loop(stage, guard, state, prefill_step, wake, store)
     finally:
         server.should_exit = True
     return 0
@@ -1070,6 +1489,11 @@ def add_arguments(parser) -> None:
     parser.add_argument("--prefill-step", type=int)
     parser.add_argument(
         "--split", help="pinned starts for ranks 1..N-1 (the preflighted plan)"
+    )
+    parser.add_argument(
+        "--no-prefix-cache",
+        action="store_true",
+        help="keep no prefix cache: every request prefills its whole prompt",
     )
     parser.add_argument(
         "--no-vision",
