@@ -120,7 +120,7 @@ class _Server:
         while (job := self.state.jobs.get()) is not None:
             row, index = job.row, self.state.prefix
             if index is not None:
-                index.admit(row, [len(row.ids) + row.max_tokens + 1])
+                index.admit(row, index.kv.reserve([len(row.ids) + row.max_tokens + 1]))
                 if row.store_id:
                     key = tuple(row.ids[: row.store_at])
                     index.stored(row.store_id, key, index.kv.entry_bytes(row.store_at))

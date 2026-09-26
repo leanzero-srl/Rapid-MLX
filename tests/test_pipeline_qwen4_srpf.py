@@ -589,18 +589,18 @@ def test_a_pending_snapshot_is_charged_until_it_is_stored_or_forgotten():
     """Rows prefill interleaved, so a directed snapshot can still be untaken at the next admission."""
     index = serve._PrefixIndex(_BytesKv([100, 100]))
     first = serve._Row([1] * 30, 4, 0.0, 1.0, boundary=20)
-    assert index.admit(first, [30]) == []
+    assert index.admit(first, index.kv.reserve([30])) == []
     assert first.store_at == 20 and index.pending == {first.store_id: [20, 40]}
     # Beside it, the batch leaves room 40 per rank: the pending [20, 40] plus
     # a second [20, 40] would not fit rank 1, so the second is not directed.
     second = serve._Row([2] * 30, 4, 0.0, 1.0, boundary=20)
-    index.admit(second, [30, 30])
+    index.admit(second, index.kv.reserve([30, 30]))
     assert second.store_id == 0
     assert index.status()["skipped"] == {"no_room_beside_the_batch": 1}
     # The first row was aborted before its snapshot: the charge goes.
     index.forget(first.store_id)
     third = serve._Row([3] * 30, 4, 0.0, 1.0, boundary=20)
-    index.admit(third, [30, 30])
+    index.admit(third, index.kv.reserve([30, 30]))
     assert third.store_id and index.pending == {third.store_id: [20, 40]}
     version = index.version
     index.stored(third.store_id, tuple(third.ids[:20]), [20, 40])

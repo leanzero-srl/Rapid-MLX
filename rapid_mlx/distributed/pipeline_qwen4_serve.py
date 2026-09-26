@@ -23,9 +23,11 @@ applies when it launches the single engine.
 
 Scheduling is continuous (Q-134).  Every rank runs the same TICK: one decode
 step for the running rows, then — when rank 0 grants it — one prefill chunk
-of ONE prefilling request (the one with the fewest prompt tokens left, Q-145).  A queued request joins the moment a row
-slot is free (``--max-batch``) and its KV fits every rank's planned budget
-beside the running rows (``_KvBudget``: rows x the longest reservation); it
+of ONE prefilling request (the one with the fewest prompt tokens left, Q-145).  A queued request joins the moment every
+rank's planned budget has room for what it needs beside the rows already
+there (``_KvBudget``, goose Q-160: its own prompt and max_tokens, what the
+padded batch will hold until its last step, and what the running rows
+will still grow into); it
 prefills in its own cache, ``--prefill-step`` tokens a chunk (the chunk
 edges a solo run uses), samples its first token from its last chunk, and is
 merged into the running batch by extracting each row's caches and merging
@@ -41,6 +43,28 @@ so a steady decode pays no extra collective.  Before Q-134 a batch formed
 only when the previous one ended and a request the prefix cache acted on
 ran alone: one long generation froze every other request (a 69-token
 canary waited 308 s beside a free slot and half an unreserved KV budget).
+
+Admission is by memory, never by a row count (goose Q-160).  The batch is
+one merged cache with every row left-padded to the longest, so a row costs
+the batch's width for as long as it is in it; but a row also LEAVES by its
+horizon (prompt + max_tokens + 1), so a 600-token helper call with 256
+tokens to write, joining two chats 45k tokens in, holds three 45.3k-token
+rows for 256 steps and is gone long before the chats could grow into the
+room it used.  ``_KvBudget.held`` prices exactly that: the largest of rows
+alive x their width at each row's last step, prefilling rows at their
+prompts in their own caches, the transient of one decode step or one solo
+chunk.  A request is admitted when that fits with it prefilling, with every
+prefilling row joined at once (so its own join never waits and stalls the
+shorter-first order), and with any prefilling row grown to its horizon
+beside the others (so no join waits for good once the batch has drained);
+its last chunk — the merge — runs only once the batch it makes still fits,
+prefix-cache entries yielding first.  The plan header's per-row flags are
+sized by the most one-token rows the budgets hold, derived and agreed on
+every rank, which admission never reaches.  Before Q-160 ``--max-batch``
+(goose passed the planned slots, 2) capped the rows and every row was
+priced at the longest horizon for its whole life: two chats that reserve the
+whole context (goose sends them no max_tokens) filled both slots, and a
+helper call waited for a whole multi-minute decode to leave.
 
 Prefill order is shortest-remaining-prefill-first at chunk granularity
 (Q-145).  Prefill is compute-bound, so the chunks still run one at a time;
@@ -624,6 +648,19 @@ class _PrefixStore:
             self.entries.pop(entry_id, None)
 
 
+def _agree_rows(stage, local: int) -> int:
+    """The plan header's row count, proven equal on every rank (its shape must pair)."""
+    counts = [0] * stage.size
+    counts[stage.rank] = local
+    counts = _all_sum(stage.group, mx.array(counts, dtype=mx.int32)).tolist()
+    if len(set(counts)) != 1:
+        raise RuntimeError(
+            f"pipeline plan header: the ranks derive {counts} rows from their "
+            "KV budgets — the plans diverged"
+        )
+    return local
+
+
 def _agree_bytes(stage, local: int) -> list[int]:
     """Every rank's measured bytes, rank-indexed (KiB over the wire: int32)."""
     kib = [0] * stage.size
@@ -937,15 +974,47 @@ class _Job:
 
 
 class _KvBudget:
-    """Admission by what a batch would hold on EVERY rank, in the planner's own terms.
+    """Admission by what the rows will hold on EVERY rank, priced in the planner's own terms.
 
     The split was planned for ``slots`` full-context sequences (the planner's
     ``batch``): each rank's budget for runtime state is its planned KV/recurrent
-    state plus prefill workspace at that shape.  A candidate batch reserves, on
-    each rank, the same two terms at ``rows`` x the longest row's
-    prompt + max_tokens (+1 for the step that ends the batch), rounded to the
-    caches' allocation steps by ``layer_state_bytes``.  Rows are left-padded to
-    one width, so a batch costs rows x its longest row, never the sum.
+    state plus prefill workspace at that shape.  What rows hold is priced per
+    rank with the planner's one-sequence formulas (``_stage_plan`` at batch 1,
+    rounded to the caches' allocation steps by ``layer_state_bytes``) over the
+    shapes the engine really builds:
+
+    * the running batch is ONE merged cache, every row left-padded to the
+      longest (mlx-lm's ``BatchKVCache.merge``), so it holds rows x its
+      longest row's tokens — the padding is memory, not bookkeeping;
+    * a prefilling row holds its own cache, its prompt at most, until its
+      last chunk merges it into the batch;
+    * a prefill chunk runs alone (one row over its own cache) and a decode
+      step runs the batch; they never overlap, so the transient is the
+      larger of the two.  A join or a departure also rebuilds a batch of two
+      rows or more one layer at a time (``_Engine._regroup``: the rows'
+      copies of one layer beside the old layer) — a transient the planner
+      does not budget, so a batch within the planned ``slots`` is priced as
+      the plan was (its promise of ``slots`` full-context rows holds; the
+      pipeline has always run that way), and a batch of MORE rows than the
+      plan was made for — the room Q-160 opens — is admitted only with room
+      for that copy too.
+
+    Widths are rounded as the planner rounds them (``layer_state_bytes``: up
+    to the caches' allocation step), the rounding the plan's own budget was
+    made with.  A merged buffer can run up to one step past that (a merge
+    leaves it exact, the next token adds a whole step) — under one step per
+    row, the same gap the planner and the rows x longest reservation had.
+
+    A running row grows one token a step and has left by its horizon (prompt
+    + max_tokens + 1), so what the rows hold before anything else joins
+    (``held``) peaks at some row's LAST step — between two departures the
+    width only grows — and is the largest of rows alive x their width there.
+    Before goose Q-160 every row was priced at the longest horizon for its
+    whole life (rows x longest) and ``--max-batch`` capped the rows at the
+    planned slots: two chats that reserve the whole context (goose sends no
+    max_tokens) filled both, and a 600-token helper call waited for a
+    multi-minute decode to end though it would have left long before the
+    long rows grew into the room it used.
     """
 
     def __init__(self, plan, prefill_step: int):
@@ -956,11 +1025,19 @@ class _KvBudget:
             stage.state_bytes + stage.workspace_bytes for stage in plan.stages
         ]
         self.slots = plan.batch
+        # (width, chunk tokens) -> each rank's (state, workspace, largest
+        # layer's state) for ONE row.
+        # Emptied at every plan (``_Scheduler.applied``), so it holds only the
+        # widths priced since the rows last changed.
+        self.priced: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
 
-    def reserve(self, lengths: list[int]) -> list[int]:
-        size = len(self.plan.stages)
-        return [
-            (lambda planned: planned.state_bytes + planned.workspace_bytes)(
+    def _price(self, width: int, tokens: int) -> list[tuple[int, int, int]]:
+        """Each rank's (state, workspace, largest layer's state) for one row
+        ``width`` tokens long running ``tokens`` at once."""
+        key = (width, tokens)
+        if key not in self.priced:
+            size = len(self.plan.stages)
+            planned = [
                 pipe._stage_plan(
                     self.args,
                     self.plan.checkpoint,
@@ -969,17 +1046,93 @@ class _KvBudget:
                     size,
                     stage.start,
                     stage.end,
-                    max(lengths),
-                    len(lengths),
-                    min(self.prefill_step, max(lengths)),
+                    width,
+                    1,
+                    tokens,
                 )
-            )
-            for stage in self.plan.stages
-        ]
+                for stage in self.plan.stages
+            ]
+            act = self.plan.checkpoint.activation_bytes
+            self.priced[key] = [
+                (
+                    planned_stage.state_bytes,
+                    planned_stage.workspace_bytes,
+                    max(
+                        pipe.layer_state_bytes(self.args, index, width, 1, act)
+                        for index in range(stage.start, stage.end)
+                    ),
+                )
+                for stage, planned_stage in zip(self.plan.stages, planned)
+            ]
+        return self.priced[key]
 
-    def fits(self, lengths: list[int]) -> bool:
-        return all(
-            need <= budget for need, budget in zip(self.reserve(lengths), self.budgets)
+    def held(
+        self, batch: list[tuple[int, int]], prefilling: list[tuple[int, int]]
+    ) -> list[int]:
+        """The most each rank holds until a row joins or is admitted.
+
+        ``batch``: the running rows as (tokens in their cache, horizon);
+        ``prefilling``: the rows prefilling in their own caches, as (prompt
+        tokens, horizon) — priced at their whole prompt for as long as they
+        wait, since the batch decides when they may join.
+        """
+        size = len(self.budgets)
+        solo = [0] * size
+        chunk = [0] * size
+        for length, _ in prefilling:
+            for rank, (state, workspace, _) in enumerate(
+                self._price(length, min(self.prefill_step, length))
+            ):
+                solo[rank] += state
+                chunk[rank] = max(chunk[rank], workspace)
+        peak = [solo[rank] + chunk[rank] for rank in range(size)]
+        left = [max(horizon - length, 0) for length, horizon in batch]
+        for last in set(left):
+            alive = [
+                length + last
+                for (length, _), remaining in zip(batch, left)
+                if remaining >= last
+            ]
+            rows = len(alive)
+            for rank, (state, workspace, layer) in enumerate(
+                self._price(max(alive), 1)
+            ):
+                merge = rows * layer if rows > self.slots else 0
+                transient = max(rows * workspace, merge, chunk[rank])
+                peak[rank] = max(peak[rank], rows * state + solo[rank] + transient)
+        return peak
+
+    def admission(
+        self, batch: list[tuple[int, int]], prefilling: list[tuple[int, int]]
+    ) -> list[int]:
+        """What each rank must have room for to admit the last of ``prefilling``.
+
+        The largest of: what the rows then hold (``held``); what they would
+        hold had every prefilling row joined the batch now, so an admitted
+        row is never one whose own join must wait for a departure (it would
+        be the shortest prefill and stall every other one behind it); and,
+        for each prefilling row, what it holds grown to its horizon beside
+        the others' prompts, so a join is never held for good once the
+        batch has drained.
+        """
+        need = self.held(batch, prefilling)
+        needs = [need, self.held([*batch, *prefilling], [])]
+        for index, row in enumerate(prefilling):
+            needs.append(self.held([row], prefilling[:index] + prefilling[index + 1 :]))
+        return [max(values) for values in zip(*needs)]
+
+    def fits(self, need: list[int]) -> bool:
+        return all(n <= budget for n, budget in zip(need, self.budgets))
+
+    def rows(self) -> int:
+        """The most rows the budgets could hold, each one token long (the wire's row count).
+
+        Every row holds at least that, so admission by ``fits`` never
+        reaches it; it only sizes the plan header's per-row flags.
+        """
+        least = self._price(1, 1)
+        return min(
+            budget // state for budget, (state, _, _) in zip(self.budgets, least)
         )
 
     def entry_bytes(self, tokens: int) -> list[int]:
@@ -1019,10 +1172,12 @@ class _PrefixIndex:
 
     Bounded by bytes alone, per rank: at every admission the entries plus the
     snapshot this batch will take must fit each rank's planned KV budget minus
-    the batch's own reservation (``_KvBudget``) — the cache holds only the
-    budget live requests leave idle, and yields it to them first.  LRU order,
-    refreshed on every hit.  No entry count bound: the count can never evict
-    before the bytes do.
+    what the rows need then (``_KvBudget.admission``), and before a prefilling
+    row's last chunk merges it into the batch they must fit beside what the
+    batch will hold (``yield_to``) — the cache holds only the budget live
+    requests leave idle, and yields it to them first.  LRU order, refreshed
+    on every hit.  No entry count bound: the count can never evict before the
+    bytes do.
     """
 
     def __init__(self, kv: _KvBudget):
@@ -1056,17 +1211,46 @@ class _PrefixIndex:
                 best_id, best = entry_id, length
         return best_id, best
 
-    def admit(self, row: _Row, lengths: list[int]) -> list[int]:
+    def _held(self, pending_only: bool = False) -> list[int]:
+        """Each rank's bytes: the pending snapshots' bounds, and the entries unless ``pending_only``."""
+        entries = [] if pending_only else list(self.entries.values())
+        return [
+            sum(entry.bytes[rank] for entry in entries)
+            + sum(bound[rank] for bound in self.pending.values())
+            for rank in range(len(self.kv.budgets))
+        ]
+
+    def room(self, need: list[int]) -> str:
+        """Beside rows that need ``need``: "fits", "evict" (dropping entries makes it fit) or "full"."""
+        with self.lock:
+            if self.kv.fits([n + h for n, h in zip(need, self._held())]):
+                return "fits"
+            if self.kv.fits([n + h for n, h in zip(need, self._held(True))]):
+                return "evict"
+            return "full"
+
+    def yield_to(self, need: list[int]) -> list[int]:
+        """Evict entries, oldest first, until they fit beside rows that need ``need``."""
+        with self.lock:
+            evict = []
+            while self.entries and not self.kv.fits(
+                [n + h for n, h in zip(need, self._held())]
+            ):
+                entry_id, _ = self.entries.popitem(last=False)
+                evict.append(entry_id)
+                self.evicted += 1
+            if evict:
+                self.version += 1
+            return evict
+
+    def admit(self, row: _Row, need: list[int]) -> list[int]:
         """Set the joining row's directive; return the entries to evict.
 
-        ``lengths`` are the reservations of every row the batch will hold once
-        the row joins, its own included.
+        ``need`` is what each rank must keep for the rows once the row is
+        admitted, its own included (``_KvBudget.admission``).
         """
         with self.lock:
-            room = [
-                budget - need
-                for budget, need in zip(self.kv.budgets, self.kv.reserve(lengths))
-            ]
+            room = [budget - n for budget, n in zip(self.kv.budgets, need)]
             new = [0] * len(room)
             if row.images is None:
                 row.reuse_id, row.cached = self.lookup(row.ids)
@@ -1092,15 +1276,8 @@ class _PrefixIndex:
                     self.next_id += 1
             evict = []
 
-            def held() -> list[int]:
-                return [
-                    sum(entry.bytes[rank] for entry in self.entries.values())
-                    + sum(bound[rank] for bound in self.pending.values())
-                    for rank in range(len(room))
-                ]
-
             def over(extra: list[int]) -> bool:
-                return any(h + e > r for h, e, r in zip(held(), extra, room))
+                return any(h + e > r for h, e, r in zip(self._held(), extra, room))
 
             while self.entries and over(new):
                 entry_id, _ = self.entries.popitem(last=False)
@@ -1157,6 +1334,8 @@ def _reservation_length(row: _Row) -> int:
 class _State:
     served: str
     context: int
+    # The rows the plan header can name (``_KvBudget.rows`` on every rank):
+    # running and prefilling rows together.  Memory admits fewer.
     max_batch: int
     # Further names the served model answers to (``--served-model-alias``),
     # listed after ``served`` on /v1/models.
@@ -1802,16 +1981,20 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
 class _Scheduler:
     """Rank 0's decisions: which rows leave, which queued request is admitted, when chunks run.
 
-    Admission is by slots and memory, in ``_head``'s order (Q-145): the queued
-    request first in that order is admitted when a row slot is free (running
-    and prefilling rows share ``max_batch``), ``_KvBudget`` fits every row the
-    batch would hold on every rank, and — while other rows are prefilling —
-    the request has fewer prompt tokens left than every one of them, so it
-    is exactly the row ``_shortest`` runs next on every rank.  The order
-    only lets a request go ahead of an earlier one while it takes at most
-    half that one's ``_slack``.  A request that cannot be admitted waits at
-    the head of the order and nothing behind it jumps it.  Chunks are spaced by
-    ``_PREFILL_SHARE`` of the measured pipeline time.
+    Admission is by memory, in ``_head``'s order (Q-145): the queued request
+    first in that order is admitted when every rank has room for what the
+    rows would then need (``_KvBudget.admission``: its own prompt and
+    max_tokens, beside what the running rows will still grow into — goose
+    Q-160) and — while other rows are prefilling — the request has fewer
+    prompt tokens left than every one of them, so it is exactly the row
+    ``_shortest`` runs next on every rank.  ``max_batch`` (the rows the plan
+    header can name, derived from the same budgets) never binds before the
+    memory does.  The order only lets a request go ahead of an earlier one
+    while it takes at most half that one's ``_slack``.  A request that cannot
+    be admitted waits at the head of the order and nothing behind it jumps
+    it.  Chunks are spaced by ``_PREFILL_SHARE`` of the measured pipeline
+    time, and a prefilling row's last chunk — the one that merges it into
+    the batch — runs only once the batch it makes fits (``_join_room``).
     """
 
     def __init__(self, state: _State, engine: _Engine):
@@ -1823,7 +2006,8 @@ class _Scheduler:
         # The request the plan being broadcast admits (prefilling once applied).
         self.admitted: _Job | None = None
         self.stopping = False
-        self.fitted: dict[tuple[int, ...], bool] = {}
+        # The target's last chunk is held this step: its join would not fit.
+        self.holding = False
         # Seconds of pipeline time the prefills may still spend before the
         # running rows' decode has had its share (both measured here).
         self.credit = 0.0
@@ -1933,18 +2117,51 @@ class _Scheduler:
         self.state.waiting = [other for other in self.state.waiting if other is not job]
         self.lefts.pop(job.id, None)
 
-    def _fits(self, job: _Job, beside: list[_Job]) -> bool:
-        if len(beside) + 1 > self.state.max_batch:
+    @staticmethod
+    def _decoding(jobs: list[_Job]) -> list[tuple[int, int]]:
+        """Running rows as ``_KvBudget`` prices them: (cache tokens after the step in flight, horizon)."""
+        return [
+            (len(job.row.ids) + job.produced, _reservation_length(job.row))
+            for job in jobs
+        ]
+
+    @staticmethod
+    def _prompts(jobs: list[_Job]) -> list[tuple[int, int]]:
+        """Prefilling rows as ``_KvBudget`` prices them: (prompt tokens, horizon)."""
+        return [(len(job.row.ids), _reservation_length(job.row)) for job in jobs]
+
+    def _admission(
+        self, job: _Job, running: list[_Job], prefilling: list[_Job]
+    ) -> list[int]:
+        return self.state.kv.admission(
+            self._decoding(running), self._prompts([*prefilling, job])
+        )
+
+    def _fits(self, job: _Job, running: list[_Job], prefilling: list[_Job]) -> bool:
+        if len(running) + len(prefilling) + 1 > self.state.max_batch:
             return False
         kv = self.state.kv
-        if kv is None:
-            return True
-        # Asked before every decode step while a request waits: the same
-        # question until the rows change, and each plan clears the memo.
-        lengths = tuple(_reservation_length(other.row) for other in [*beside, job])
-        if lengths not in self.fitted:
-            self.fitted[lengths] = kv.fits(list(lengths))
-        return self.fitted[lengths]
+        return kv is None or kv.fits(self._admission(job, running, prefilling))
+
+    def _join_room(self, running: list[_Job], pairs: list[tuple[_Job, _Joining]]):
+        """Whether the next chunk may run: "fits", "evict" or "full", with the join's need.
+
+        ``pairs`` are the prefilling rows (job, the engine's row).  Only the
+        target's LAST chunk changes what the rows hold — it moves the row
+        from its own cache into the padded batch — so any other chunk fits.
+        """
+        kv = self.state.kv
+        target = _shortest([joining for _, joining in pairs])
+        if kv is None or target is None or len(pairs[target][1].ranges) != 1:
+            return "fits", None
+        job = pairs[target][0]
+        others = [other for other, _ in pairs if other is not job]
+        need = kv.held(self._decoding([*running, job]), self._prompts(others))
+        if not kv.fits(need):
+            return "full", need
+        if self.state.prefix is None:
+            return "fits", need
+        return self.state.prefix.room(need), need
 
     def _admissible(
         self, running: list[_Job], prefilling: list[tuple[_Job, int]]
@@ -1952,7 +2169,7 @@ class _Scheduler:
         """The head, if it is admitted beside ``running`` and ``prefilling`` (job, tokens left)."""
         head = self._head(prefilling)
         if head is None or not self._fits(
-            head, [*running, *(job for job, _ in prefilling)]
+            head, running, [job for job, _ in prefilling]
         ):
             return None
         if prefilling and self._queued_left(head) >= min(
@@ -2007,10 +2224,18 @@ class _Scheduler:
         leave = self._leaving()
         abort = self._aborting()
         survivors = [job for i, job in enumerate(self.running) if i not in leave]
-        prefilling = [
-            pair for i, pair in enumerate(self._prefilling_lefts()) if i not in abort
+        pairs = [
+            pair
+            for i, pair in enumerate(zip(self.prefilling, self.engine.prefilling))
+            if i not in abort
         ]
+        prefilling = [(job, joining.left) for job, joining in pairs]
         joiner, evict = None, []
+        if state.prefix is not None and survivors:
+            # The target's merge waits on prefix entries: they go first.
+            room, need = self._join_room(survivors, pairs)
+            if room == "evict":
+                evict = state.prefix.yield_to(need)
         self._collect(block=block and not survivors and not prefilling)
         while not (self.stopping or state.shutting_down):
             head = self._admissible(survivors, prefilling)
@@ -2019,12 +2244,11 @@ class _Scheduler:
                 self.admitted = head
                 joiner = head.row
                 if state.prefix is not None:
-                    evict = state.prefix.admit(
+                    evict += state.prefix.admit(
                         head.row,
-                        [
-                            _reservation_length(job.row)
-                            for job in [*survivors, *(j for j, _ in prefilling), head]
-                        ],
+                        self._admission(
+                            head, survivors, [job for job, _ in prefilling]
+                        ),
                     )
                 break
             head = self._head(prefilling)
@@ -2034,7 +2258,7 @@ class _Scheduler:
             # (a lone row at <= context always fits the plan's first slot,
             # so this names a planner defect rather than waiting forever).
             self._take(head)
-            needed = state.kv.reserve([_reservation_length(head.row)])
+            needed = self._admission(head, [], [])
             head.finished = True
             head.push(
                 (
@@ -2049,7 +2273,8 @@ class _Scheduler:
         return _Plan(leave=leave, abort=abort, joiner=joiner, evict=evict)
 
     def applied(self, plan: _Plan) -> None:
-        self.fitted.clear()
+        if self.state.kv is not None:
+            self.state.kv.priced.clear()
         leaving = set(plan.leave)
         self.running = [job for i, job in enumerate(self.running) if i not in leaving]
         if plan.abort:
@@ -2075,7 +2300,7 @@ class _Scheduler:
         active = [*self.running, *self.prefilling]
         kv = self.state.kv
         self.state.reserved = (
-            kv.reserve([_reservation_length(job.row) for job in active])
+            kv.held(self._decoding(self.running), self._prompts(self.prefilling))
             if kv is not None and active
             else []
         )
@@ -2094,16 +2319,21 @@ class _Scheduler:
             job.push(("done", "length"))
 
     def decode_words(self) -> list[int]:
-        chunk = bool(self.prefilling) and self.credit >= 0
+        room, _ = self._join_room(
+            self.running, list(zip(self.prefilling, self.engine.prefilling))
+        )
+        # A held join is no prefill work to share time with.
+        self.holding = room != "fits"
+        chunk = bool(self.prefilling) and self.credit >= 0 and not self.holding
         # When a chunk follows, its own collective carries the plan word.
-        plan = False if chunk else self.wants_plan(chunk=False)
+        plan = False if chunk else room == "evict" or self.wants_plan(chunk=False)
         return [int(plan), int(chunk)]
 
     def decoded(self, tokens: list[int], seconds: float) -> None:
         self.state.steps += 1
         for job, token in zip(self.running, tokens):
             self._give(job, token)
-        if self.prefilling:
+        if self.prefilling and not self.holding:
             self.credit += seconds * _PREFILL_SHARE / (1 - _PREFILL_SHARE)
 
     def chunk_words(self) -> list[int]:
@@ -2337,6 +2567,8 @@ def serve(options, emit=None) -> int:
     engine = _Engine(stage, guard, prefill_step, store, close_guard=close_guard)
     # A readiness probe that succeeds means a request can run.
     _warm(engine)
+    kv = _KvBudget(plan, prefill_step)
+    rows = _agree_rows(stage, kv.rows())
     wake = _Wake(group)
     context = options.context or plan.context
     if not stage.is_first:
@@ -2348,7 +2580,7 @@ def serve(options, emit=None) -> int:
                 "layers": [stage.start, stage.end],
             },
         )
-        _ticks(engine, group, options.max_batch, wake)
+        _ticks(engine, group, rows, wake)
         return 0
 
     from mlx_lm.utils import load_tokenizer
@@ -2361,12 +2593,11 @@ def serve(options, emit=None) -> int:
             "GENERATION_CONFIG_UNREAD",
             {"error": sampling.error, "in_force": sampling.report()["engine_fallback"]},
         )
-    kv = _KvBudget(plan, prefill_step)
     state = _State(
         served=options.served_model_name,
         aliases=tuple(options.served_model_alias or ()),
         context=context,
-        max_batch=options.max_batch,
+        max_batch=rows,
         kv=kv,
         prefix=None if store is None else _PrefixIndex(kv),
         eos_ids=frozenset(tokenizer.eos_token_ids),
@@ -2446,13 +2677,9 @@ def add_arguments(parser) -> None:
         "--slots",
         type=int,
         default=2,
-        help="full-context sequences the split is planned (and KV-budgeted) for",
-    )
-    parser.add_argument(
-        "--max-batch",
-        type=int,
-        default=2,
-        help="most rows one batch may carry; the KV budget decides how many do",
+        help="full-context sequences the split is planned (and KV-budgeted) for; "
+        "requests are admitted by what each one needs of that budget (its prompt "
+        "and max_tokens), not by this count",
     )
     parser.add_argument("--prefill-step", type=int)
     parser.add_argument(

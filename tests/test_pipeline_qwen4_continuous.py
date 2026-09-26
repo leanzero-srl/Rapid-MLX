@@ -182,21 +182,38 @@ def test_a_queued_request_joins_a_running_generation_between_decode_steps(stage,
     assert got == _solo(stage, LONG, len(got))
 
 
-class _FakeKv:
-    """The 14:39 budgets; every reservation of a full context costs one slot."""
+class _FakeKv(serve._KvBudget):
+    """The 14:39 budgets — two full-context slots, each a row's state plus one
+    2,048-token chunk's transient — priced linearly: a row's state grows with
+    its width, a chunk's transient with its tokens.  ``STATE_SHARE`` is Flash's
+    own split of a slot at 131,072 tokens (the planner's formulas over the
+    real Qwen3.8-Flash-Next-4bit: 3.201 GiB state, 2.665 GiB for the chunk);
+    ``_KvBudget``'s own rules decide everything else.
+    """
 
     budgets = [7_465_986_080, 9_720_686_592]
     slots = 2
+    STATE_SHARE = 3.201 / (3.201 + 2.665)
 
-    def __init__(self, context: int):
+    def __init__(self, context: int, prefill_step: int = 2048):
         self.context = context
+        self.prefill_step = prefill_step
+        self.priced = {}
 
-    def reserve(self, lengths: list[int]) -> list[int]:
-        rows = len(lengths) * max(lengths) / self.context
-        return [int(rows * budget / self.slots) for budget in self.budgets]
-
-    def fits(self, lengths: list[int]) -> bool:
-        return all(n <= b for n, b in zip(self.reserve(lengths), self.budgets))
+    def _price(self, width: int, tokens: int) -> list[tuple[int, int, int]]:
+        return [
+            (
+                int(width * self.STATE_SHARE * budget / (self.slots * self.context)),
+                int(
+                    tokens
+                    * (1 - self.STATE_SHARE)
+                    * budget
+                    / (self.slots * self.prefill_step)
+                ),
+                0,
+            )
+            for budget in self.budgets
+        ]
 
 
 def _start_fake(engine: serve._Engine, row: serve._Row) -> None:
@@ -246,11 +263,16 @@ def _chunk(scheduler: serve._Scheduler, seconds: float = 0.0) -> int | None:
     return first
 
 
+def _share(state: serve._State) -> float:
+    """The largest share of a rank's budget the rows hold (``/v1/status``'s slots_in_use / slots)."""
+    return max(r / b for r, b in zip(state.reserved, state.kv.budgets))
+
+
 def test_the_1439_queue_admits_the_canary_first_beside_the_running_row():
     """The 14:39 status walked through the scheduler (no engine work)."""
     context = 131_072
-    state = serve._State(served="flash", context=context, max_batch=2)
-    state.kv = _FakeKv(context)
+    kv = _FakeKv(context)
+    state = serve._State(served="flash", context=context, max_batch=kv.rows(), kv=kv)
 
     def default_request(prompt: int) -> _Collected:
         # No max_tokens: the HTTP side grants context - prompt - 1.
@@ -265,49 +287,64 @@ def test_the_1439_queue_admits_the_canary_first_beside_the_running_row():
     scheduler = serve._Scheduler(state, serve._Engine(None, None, 2048))
     scheduler.running = [running]
     scheduler._publish()
-    assert state.reserved == [3_732_993_040, 4_860_343_296]  # "kv_reserved" at 14:39
+    # 14:39 read "kv_reserved" [3,732,993,040, 4,860,343,296] (half of each
+    # budget: the row's state and a chunk it no longer runs); what it holds
+    # is its state grown to the whole context, one slot's state share.
+    assert 0.5 * _FakeKv.STATE_SHARE <= _share(state) < 0.5
 
-    # A slot is free and two full-context reservations fit: the next decode
-    # step's collective announces a plan, and the plan admits the request
-    # with the fewest prompt tokens left — the canary (Q-145), not the oldest.
+    # Two full-context rows fit: the next decode step's collective announces
+    # a plan, and the plan admits the request with the fewest prompt tokens
+    # left — the canary (Q-145), not the oldest.
     assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
     assert plan.joiner is canary.row and plan.leave == []
     _apply(scheduler, plan)
-    assert state.reserved == _FakeKv.budgets
 
-    # Both slots are held (the running row and the prefilling canary), so
-    # nothing else is admitted; the canary's one chunk samples its first
-    # token and it joins the running batch at once.
+    # While the canary prefills, a long one is not admitted: it would not be
+    # the shortest prefill.  The canary's one chunk samples its first token
+    # and it joins the running batch at once, both rows then priced at the
+    # full context.  That chunk's collective announces the next plan: the
+    # budget holds a third row that may fill the context (goose Q-160: the
+    # plan budgets one chunk's transient per slot and chunks run alone, so
+    # three rows' state is 82% of it), and the oldest long one is admitted —
+    # first-come: 39,132 would take more than half its slack (39,194 less
+    # the canary's 69).
     assert not scheduler.wants_plan(chunk=False)
-    assert not scheduler.wants_plan(chunk=True)
+    assert scheduler.wants_plan(chunk=True)
     assert _chunk(scheduler) == 5
     assert scheduler.running == [running, canary]
     assert canary.produced == 1
+    assert _FakeKv.STATE_SHARE <= _share(state) < 1
+    plan = scheduler.plan(block=False)
+    assert plan.leave == [] and plan.joiner is waiting[0].row
+    _apply(scheduler, plan)
+    assert state.waiting == [waiting[1], waiting[2]] and state.jobs.qsize() == 0
+    # A fourth would not fit, and when a row leaves the other two keep
+    # first-come order behind the one prefilling.
+    assert not scheduler.wants_plan(chunk=False)
     running.finished = True
     assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
-    # The long three keep first-come order: 39,132 would take more than half
-    # the oldest one's slack (39,194 less the canary's 69).
-    assert plan.leave == [0] and plan.joiner is waiting[0].row
-    assert state.waiting == [waiting[1], waiting[2]] and state.jobs.qsize() == 0
+    assert plan.leave == [0] and plan.joiner is None
 
 
 def test_a_request_that_does_not_fit_waits_at_the_head_until_a_row_leaves():
-    context = 1_000
-    state = serve._State(served="t", context=context, max_batch=4)
-    state.kv = _FakeKv(context)
-    running = [_job([1] * 10, 989), _job([1] * 10, 989)]  # two full slots
-    short = _job([2] * 5, 3)  # fits by length, but a third row is 3 x longest
-    state.jobs.put(short)
+    context = 100_000
+    kv = _FakeKv(context, PREFILL_STEP)
+    state = serve._State(served="t", context=context, max_batch=kv.rows(), kv=kv)
+    # Three rows that may each grow to the whole context (these budgets hold
+    # three: a slot's state is 55% of it), and a fourth that may too.
+    running = [_job([1] * 10, context - 11) for _ in range(3)]
+    chat = _job([2] * 5, context - 6)
+    state.jobs.put(chat)
     scheduler = serve._Scheduler(state, serve._Engine(None, None, PREFILL_STEP))
     scheduler.running = list(running)
     assert not scheduler.wants_plan(chunk=False)
-    assert state.waiting == [short]  # held at the head, never dropped
+    assert state.waiting == [chat]  # held at the head, never dropped
     running[1].cancelled = True
     assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
-    assert plan.leave == [1] and plan.joiner is short.row
+    assert plan.leave == [1] and plan.joiner is chat.row
 
 
 def test_the_prefill_share_spaces_chunks_by_measured_time():

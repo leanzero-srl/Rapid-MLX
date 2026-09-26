@@ -331,19 +331,41 @@ def test_kv_budget_admits_what_the_plan_holds(checkpoint):
     args = pipe.load_text_args(checkpoint)
     ckpt = pipe.read_checkpoint_bytes(checkpoint, args.num_hidden_layers)
     nodes = [pipe.NodeBudget(f"n{i}", 2**36, 2**35, "test") for i in range(2)]
+    # A small chunk, so the plan's two slots are mostly their rows' state.
     plan = pipe.plan_pipeline(
-        args, ckpt, nodes, context=512, batch=1, prefill_step=256, starts=[0, 4]
+        args, ckpt, nodes, context=4096, batch=2, prefill_step=16, starts=[0, 4]
     )
-    kv = _KvBudget(plan, 256)
-    assert kv.slots == 1
-    assert kv.fits([512])
-    assert not kv.fits([512, 512])  # two full-context rows need two slots
-    assert kv.fits([40, 40])  # two short rows fit in one slot's bytes
-    assert not kv.fits([40, 512])  # padding makes the short row as long as the long one
+    kv = _KvBudget(plan, 16)
+    assert kv.slots == 2
+
+    def admits(batch, *prefilling):
+        return kv.fits(kv.admission(batch, list(prefilling)))
+
+    full = (100, 4096)  # (tokens now, horizon): may grow to the whole context
+    assert admits([], (40, 4096))
+    assert admits([full], (40, 4096))  # the plan's two full-context slots
+    assert not admits([full, full], (40, 4096))  # a third may not fit
+    # goose Q-160: a short request fits beside both — it leaves long before
+    # the two could grow into the room it uses (rows x longest refused it).
+    assert admits([full, full], (20, 30))
+    # While it is in the batch it is padded to the longest row.
+    beside = kv.held([(3000, 4096), (20, 30)], [])
+    alone = kv.held([(3000, 4096)], [])
+    short_alone = kv.held([(20, 30)], [])
+    assert all(b - a > s for b, a, s in zip(beside, alone, short_alone))
 
 
-def test_a_second_long_request_waits_for_kv_and_both_complete(checkpoint):
-    running = _Server(checkpoint, ("--slots", "1", "--max-batch", "2"))
+def test_two_long_requests_share_one_slot_the_budget_holds_and_both_complete(
+    checkpoint,
+):
+    """goose Q-160: admission is by what each request needs, not by the slot count.
+
+    One slot of this checkpoint's plan is a full-context row plus a chunk's
+    transient, and chunks run alone, so two 400-token requests fit it
+    together (before Q-160 the second waited for the first: rows x longest,
+    and ``--max-batch``).
+    """
+    running = _Server(checkpoint, ("--slots", "1"))
     try:
         status = running.get("/v1/status")
         assert status["slots"] == 1 and status["slots_in_use"] == 0
@@ -353,7 +375,7 @@ def test_a_second_long_request_waits_for_kv_and_both_complete(checkpoint):
             results[key] = json.load(running.post(_chat("w3 w4", max_tokens=tokens)))
 
         # A warm request holds the loop so both long requests are queued when
-        # the next batch forms: only the KV budget can keep them apart.
+        # it leaves: only the KV budget decides whether they run together.
         warm = threading.Thread(target=run, args=("hold", 60))
         warm.start()
         while running.get("/v1/status")["num_running"] == 0:
@@ -364,18 +386,15 @@ def test_a_second_long_request_waits_for_kv_and_both_complete(checkpoint):
         while running.get("/v1/status")["num_waiting"] < 2:
             time.sleep(0.05)
         warm.join()
-        seen_waiting = False
         most_in_flight = 0
         while any(thread.is_alive() for thread in longs):
             status = running.get("/v1/status")
             most_in_flight = max(most_in_flight, status["sequences_in_flight"])
-            if status["num_waiting"] >= 1 and status["sequences_in_flight"] == 1:
-                seen_waiting = True
-                assert status["slots_in_use"] == 1
+            assert status["slots_in_use"] <= status["slots"]
             time.sleep(0.02)
         for thread in longs:
             thread.join()
-        assert seen_waiting and most_in_flight == 1
+        assert most_in_flight == 2
         for key in ("l1", "l2"):
             assert results[key]["usage"]["completion_tokens"] >= 1
 
@@ -443,21 +462,21 @@ def test_prefix_index_restores_only_an_exact_prefix_that_leaves_a_token_to_feed(
 
     index = _PrefixIndex(_FakeKv([1000, 1000]))
     cold = _row(list(range(20)), boundary=12)
-    assert index.admit(cold, [24]) == []
+    assert index.admit(cold, index.kv.reserve([24])) == []
     assert (cold.reuse_id, cold.cached, cold.store_at) == (0, 0, 12)
     _store(index, cold)
 
     warm = _row([*range(12), 99, 98, 97], boundary=13)
-    index.admit(warm, [19])
+    index.admit(warm, index.kv.reserve([19]))
     assert (warm.reuse_id, warm.cached) == (cold.store_id, 12)
     assert warm.store_at == 13  # the longer boundary is a new entry
 
     other = _row([7, *range(1, 20)], boundary=12)
-    index.admit(other, [24])
+    index.admit(other, index.kv.reserve([24]))
     assert (other.reuse_id, other.cached) == (0, 0)  # the first token differs
 
     exact = _row(list(range(12)))
-    index.admit(exact, [16])
+    index.admit(exact, index.kv.reserve([16]))
     # The prompt IS the entry: nothing would be left to feed, so no restore.
     assert exact.cached == 0
     assert index.status()["hits"] == 1
@@ -468,21 +487,21 @@ def test_prefix_index_yields_its_bytes_to_the_batch_oldest_first_hits_refresh():
 
     index = _PrefixIndex(_FakeKv([200, 200]))
     first = _row([1] * 30, boundary=20)
-    index.admit(first, [30])
+    index.admit(first, index.kv.reserve([30]))
     _store(index, first)  # held [20, 40]
     second = _row([2] * 30, boundary=20)
-    index.admit(second, [30])
+    index.admit(second, index.kv.reserve([30]))
     _store(index, second)  # held [40, 80]
 
     hit = _row([1] * 25)
-    assert index.admit(hit, [25]) == []
+    assert index.admit(hit, index.kv.reserve([25])) == []
     assert hit.reuse_id == first.store_id  # `first` is now the most recent
 
     # A row joining one running row reserves 150 between them, leaving room 50
     # on each rank; rank 1 holds 80, so the least recently used entry
     # (`second`) goes, and only it.
     joiner = _row([3] * 10)
-    assert index.admit(joiner, [75, 75]) == [second.store_id]
+    assert index.admit(joiner, index.kv.reserve([75, 75])) == [second.store_id]
     assert joiner.store_id == 0 and joiner.reuse_id == 0
     assert index.status()["bytes"] == [20, 40]
     assert index.status()["evicted"] == 1
@@ -493,7 +512,7 @@ def test_prefix_index_never_snapshots_what_cannot_fit_beside_the_batch():
 
     index = _PrefixIndex(_FakeKv([100, 100]))
     big = _row([5] * 60, boundary=40)  # rank 1 would need 80 beside the batch's 60
-    assert index.admit(big, [60]) == []
+    assert index.admit(big, index.kv.reserve([60])) == []
     assert (big.store_id, big.store_at) == (0, 0)
     assert index.status()["skipped"] == {"no_room_beside_the_batch": 1}
 
