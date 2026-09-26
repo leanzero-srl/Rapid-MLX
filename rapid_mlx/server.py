@@ -39,6 +39,7 @@ import asyncio
 import gc
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -2125,6 +2126,18 @@ def _resolve_serving_checkpoint(
     )
 
 
+def _entry_aliases(
+    served: str, catalog_alias: str | None, served_model_aliases: Iterable[str]
+) -> set[str]:
+    """The registry aliases of the served model: the catalog alias it was started by and
+    every ``--served-model-alias``, less the served name itself."""
+    aliases = {name for name in served_model_aliases if name}
+    if catalog_alias:
+        aliases.add(catalog_alias)
+    aliases.discard(served)
+    return aliases
+
+
 def load_model(
     model_name: str,
     scheduler_config=None,
@@ -2135,6 +2148,7 @@ def load_model(
     prefill_step_size: int | None = None,
     *,
     served_model_name: str | None = None,
+    served_model_aliases: Iterable[str] = (),
     mtp: bool = False,
     max_tokens_is_explicit: bool | None = None,
     force_text: bool = False,
@@ -2177,6 +2191,10 @@ def load_model(
             ``load_model(..., mtp=True)`` callers still opt into MTP while the
             public runtime moves to ``--speculative-config`` /
             ``SchedulerConfig(spec_decode="mtp")``.
+        served_model_aliases: Keyword-only. Further names the served model
+            answers to (``serve --served-model-alias``): registered as the
+            entry's aliases, so a request naming one resolves to this engine
+            and ``/v1/models`` lists them after the served name.
         force_text: Keyword-only. Force loading as text-only LLM even when
             auto-detection would route as MLLM. Escape hatch for incomplete
             vision-tower checkpoints (#393) and text-only forks of multimodal
@@ -2743,9 +2761,7 @@ def load_model(
     logger.info(f"Default max tokens: {_default_max_tokens}")
 
     # Register in multi-model registry
-    aliases = set()
-    if effective_model_alias and effective_model_alias != _model_name:
-        aliases.add(effective_model_alias)
+    aliases = _entry_aliases(_model_name, effective_model_alias, served_model_aliases)
     entry = ModelEntry(
         engine=_engine,
         model_name=_model_name,

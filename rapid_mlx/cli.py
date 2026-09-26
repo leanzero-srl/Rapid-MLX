@@ -816,6 +816,20 @@ def _resolve_audio_download_alias(command: str | None, model: str) -> str | None
     return entry.hf_id if entry is not None else None
 
 
+def _refuse_served_model_aliases(args, lane: str) -> None:
+    """``--served-model-alias`` is honored by the text/MLLM ``load_model`` lane only: a
+    lane that would serve without it exits here, never answering 404 for a name the
+    operator asked it to accept."""
+    aliases = getattr(args, "served_model_alias", None)
+    if aliases:
+        print(
+            f"error: --served-model-alias ({', '.join(aliases)}) is not supported by "
+            f"{lane}; it serves only its --served-model-name.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def _serve_audio_mode(args, entry) -> None:
     """Bind the audio-only serve path for a resolved registry entry.
 
@@ -887,6 +901,7 @@ def _serve_audio_mode(args, entry) -> None:
     # on ``_model_path`` (cache dir / engine input), and the friendly
     # short alias stays on ``_model_alias`` so ``/v1/models`` lists
     # both the custom name AND the alias — same wire shape as text.
+    _refuse_served_model_aliases(args, "the audio serve mode")
     _served_name = getattr(args, "served_model_name", None)
     server._model_name = _served_name or entry.hf_id
     server._model_path = entry.hf_id
@@ -2968,6 +2983,7 @@ def _serve_native_mtp_if_requested(
     if pair is None:
         pair = _preflight_native_mtp_or_exit(args)
 
+    _refuse_served_model_aliases(args, "the native MTP server")
     from .speculative.native_mtp.server import run_native_mtp_server
 
     alias_name = getattr(args, "_original_alias", None) or args.model
@@ -4875,6 +4891,7 @@ def serve_command(args):
                 file=sys.stderr,
             )
             raise SystemExit(2)
+        _refuse_served_model_aliases(args, "the DeepSeek V4.1 serial server")
         from .models.deepseek_v41_native.server import run_server as run_v41_server
 
         server._sync_config()
@@ -4925,6 +4942,7 @@ def serve_command(args):
             )
             sys.exit(2)
 
+        _refuse_served_model_aliases(args, "the DFlash server")
         from .model_aliases import resolve_profile
         from .speculative.dflash.server import run_dflash_server
 
@@ -5638,6 +5656,7 @@ def serve_command(args):
             force_text=args.no_mllm,
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
+            served_model_aliases=args.served_model_alias or (),
             adapter_path=_adapter_path,
             force_hybrid=getattr(args, "force_hybrid", False),
             no_hybrid=getattr(args, "no_hybrid", False),
@@ -11769,6 +11788,18 @@ Examples:
         type=str,
         default=None,
         help="The model name used in the API. If not specified, the model argument is used.",
+    )
+    serve_parser.add_argument(
+        "--served-model-alias",
+        dest="served_model_alias",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Another name the served model answers to (repeatable). A request "
+            "naming it is served by the same model, and /v1/models lists it "
+            "after --served-model-name; any other name is still refused."
+        ),
     )
     serve_parser.add_argument(
         "--adapter-path",
