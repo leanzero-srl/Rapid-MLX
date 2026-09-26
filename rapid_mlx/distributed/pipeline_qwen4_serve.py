@@ -599,6 +599,9 @@ class _State:
     served: str
     context: int
     max_batch: int
+    # Further names the served model answers to (``--served-model-alias``),
+    # listed after ``served`` on /v1/models.
+    aliases: tuple[str, ...] = ()
     kv: _KvBudget | None = None
     prefix: _PrefixIndex | None = None
     jobs: queue.Queue = field(default_factory=queue.Queue)
@@ -745,6 +748,17 @@ class _BoundaryRenderer:
         )
 
 
+def _served_names(state: _State) -> list[str]:
+    """Every name the served model answers to, the served name first."""
+    return [state.served, *(name for name in state.aliases if name != state.served)]
+
+
+def _not_served(state: _State, model: str) -> str:
+    also = [name for name in state.aliases if name != state.served]
+    names = f" (also answering to {', '.join(repr(n) for n in also)})" if also else ""
+    return f"model '{model}' is not served here; this engine serves '{state.served}'{names}"
+
+
 def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -790,7 +804,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             "object": "list",
             "data": [
                 {
-                    "id": state.served,
+                    "id": name,
                     "object": "model",
                     "owned_by": "rapid-mlx-pipeline",
                     # The single engine's /v1/models shape (routes/models.py
@@ -807,6 +821,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     if state.prefix is not None
                     else [],
                 }
+                for name in _served_names(state)
             ],
         }
 
@@ -863,12 +878,8 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             )
         body = await request.json()
         model = body.get("model")
-        if model not in (None, state.served):
-            return error(
-                404,
-                f"model '{model}' is not served here; this engine serves '{state.served}'",
-                "model_not_found",
-            )
+        if model is not None and model not in _served_names(state):
+            return error(404, _not_served(state, model), "model_not_found")
         tools = body.get("tools") or None
         if tools and tool_parser is None:
             return error(
@@ -1409,6 +1420,7 @@ def serve(options, emit=None) -> int:
     kv = _KvBudget(plan, prefill_step)
     state = _State(
         served=options.served_model_name,
+        aliases=tuple(options.served_model_alias or ()),
         context=context,
         max_batch=options.max_batch,
         kv=kv,
@@ -1456,6 +1468,7 @@ def serve(options, emit=None) -> int:
             "layers": [stage.start, stage.end],
             "port": options.port,
             "served": state.served,
+            "aliases": list(state.aliases),
             "context": context,
             "starts": plan.starts,
             "vision": stage.vision is not None,
@@ -1472,6 +1485,15 @@ def serve(options, emit=None) -> int:
 def add_arguments(parser) -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name", required=True)
+    parser.add_argument(
+        "--served-model-alias",
+        dest="served_model_alias",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="Another name the served model answers to (repeatable); listed after "
+        "--served-model-name on /v1/models. Any other name is refused.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--context", type=int, required=True)
