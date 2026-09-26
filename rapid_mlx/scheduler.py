@@ -10075,6 +10075,8 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+        _dbg_t0 = time.perf_counter()
+        _dbg_guest = self._prefill_guest_rid
 
         # Process pending aborts FIRST (in executor thread, safe for MLX)
         self._process_pending_aborts()
@@ -10219,10 +10221,17 @@ class Scheduler:
                         responses = raw_next
 
                     if responses:
+                        _dbg_c = time.perf_counter()
                         outputs, finished_ids = self._process_batch_responses(responses)
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
+                        if finished_ids:
+                            logger.info(
+                                "[dbg-step] cleanup %.3fs finished=%d",
+                                time.perf_counter() - _dbg_c,
+                                len(finished_ids),
+                            )
 
                 # #558 PR-3: reconcile grammar processors when idle. The realign
                 # guard (which scrubs leaked slots AND flushes tombstones) only
@@ -10293,6 +10302,8 @@ class Scheduler:
         if self._step_timing_enabled and hasattr(self, "_steptime"):
             self._steptime[3] = time.perf_counter()
 
+        if _dbg_guest is not None or self._prefill_guest_rid is not None:
+            logger.info("[dbg-step] step %.3fs", time.perf_counter() - _dbg_t0)
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
