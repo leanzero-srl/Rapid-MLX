@@ -248,6 +248,21 @@ def checkpoint_bytes(cache: Sequence[Any]) -> int:
     return sum(h.nbytes for h in collect_checkpoints(cache) if h is not None)
 
 
+def _owned_states(states: dict[int, tuple[Any, ...]]) -> dict[int, tuple[Any, ...]]:
+    """Copies that own their bytes (Q-110). ``extract_cache`` hands back
+    ``state[i:i+1]`` VIEWS of the live batch's recurrent state; a checkpoint
+    holding a view pins every row of that batch buffer for as long as the
+    checkpoint lives, while ``nbytes`` charges one row."""
+    try:
+        import mlx.core as mx
+    except ImportError:  # pragma: no cover - MLX absent in some test envs
+        return states
+    return {
+        i: tuple(mx.contiguous(a) if isinstance(a, mx.array) else a for a in arrays)
+        for i, arrays in states.items()
+    }
+
+
 def _materialise(states: dict[int, tuple[Any, ...]]) -> bool:
     """Force the checkpointed arrays now. A failure (allocation, Metal
     error) must not leave a lazily-built graph registered as a checkpoint
@@ -298,6 +313,7 @@ def record_checkpoints(
     newest = probe.positions[-1] if probe is not None and probe.positions else None
     if newest is not None and (position <= newest or position - newest < stride):
         return False
+    states = _owned_states(states)
     if not _materialise(states):
         return False
     for i in recurrent:

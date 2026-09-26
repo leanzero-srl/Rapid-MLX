@@ -1636,6 +1636,77 @@ def _cache_has_non_trimmable(cache: list[Any]) -> bool:
     return any(_layer_is_non_trimmable(layer) for layer in cache)
 
 
+def _owned(value: Any) -> Any:
+    """``value`` with every MLX array replaced by one that owns exactly its bytes."""
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        return mx.contiguous(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_owned(item) for item in value)
+    return value
+
+
+def _own_layer(layer: Any, out: list[Any]) -> None:
+    """Give one cache layer its own buffers, in place; collect them in ``out``."""
+    from .turboquant import TurboQuantKVCache
+
+    if layer is None or isinstance(layer, (dict, TurboQuantKVCache)):
+        return
+    caches = getattr(layer, "caches", None)
+    if isinstance(caches, (list, tuple)):
+        for inner in caches:
+            _own_layer(inner, out)
+        return
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    if keys is not None and not callable(keys) and not callable(values):
+        layer.keys = _owned(keys)
+        layer.values = _owned(values)
+        out.extend(_arrays_in((layer.keys, layer.values)))
+        return
+    arrays = getattr(layer, "cache", None)
+    if isinstance(arrays, list):
+        layer.cache = _owned(arrays)
+        out.extend(_arrays_in(layer.cache))
+
+
+def _arrays_in(value: Any):
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _arrays_in(item)
+
+
+def own_cache_bytes(cache: list[Any]) -> list[Any]:
+    """Make a prefix-cache entry own exactly the bytes it is charged for (Q-110).
+
+    mlx-lm's ``extract_cache`` hands over one row of a live batch as a VIEW
+    (``ArraysCache.extract``: ``state[i:i+1]``) or an unevaluated
+    ``contiguous(keys[i, :, pad:idx])`` (``BatchKVCache.extract``), and
+    ``_trim_to_offset`` slices -- also a view. A view keeps the WHOLE batch
+    buffer alive, every row padded to the longest, while the byte ledger
+    (shape x dtype) charges one row. Measured on the Studio, 27B Q8 with
+    decode batched: one 8k-token turn beside four short requests left MLX
+    holding 28.8 GB beyond the idle engine while the cache said it grew
+    6.95 GB, and every later request died on Metal out-of-memory. A
+    contiguous copy of each array, evaluated now, drops the batch buffer, so
+    the ledger is the truth the byte bound enforces (mlx 0.32.2: a
+    contiguous copy of a 1-of-5-row view holds 4 of the 20 MiB).
+    """
+    import mlx.core as mx
+
+    owned: list[Any] = []
+    for layer in cache:
+        _own_layer(layer, owned)
+    if owned:
+        mx.eval(owned)
+    return cache
+
+
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
@@ -2326,7 +2397,7 @@ class MemoryAwarePrefixCache:
 
         # Trim oversized KV arrays to actual used size (pure compute, no shared
         # state — kept outside the lock so concurrent fetch isn't blocked).
-        cache = _trim_to_offset(cache)
+        cache = own_cache_bytes(_trim_to_offset(cache))
 
         # Compress cache for storage (TurboQuant or standard quantization)
         if (
