@@ -150,8 +150,8 @@ class _Row:
     tools: bool = False
     # The sampling rank only: that guard and the token history it reads
     # (the prompt, then every sampled token).
-    close_guard: Any = None
-    history: Any = None
+    close_guard: Any = field(default=None, compare=False, repr=False)
+    history: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass
