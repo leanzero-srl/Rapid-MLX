@@ -9777,6 +9777,20 @@ class Scheduler:
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
+        try:
+            from .spec_decode.mtp import draft_k_controller_v2 as _dk
+
+            for _rid in finished_ids:
+                _r = self.running.get(_rid)
+                for _c in list(_dk._controllers.values()):
+                    logger.info(
+                        "[dbg-controller] finish=%s out=%s %s",
+                        _rid[:12],
+                        len(getattr(_r, "output_token_ids", []) or []),
+                        _c.diagnostics(),
+                    )
+        except Exception as _e:  # noqa: BLE001
+            logger.info("[dbg-controller] %s", _e)
         for request_id in finished_ids:
             request = self.running.get(request_id)
 
