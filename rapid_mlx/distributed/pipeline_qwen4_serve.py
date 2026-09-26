@@ -23,7 +23,7 @@ applies when it launches the single engine.
 
 Scheduling is continuous (Q-134).  Every rank runs the same TICK: one decode
 step for the running rows, then — when rank 0 grants it — one prefill chunk
-of the ONE request that is joining.  A queued request joins the moment a row
+of ONE prefilling request (the one with the fewest prompt tokens left, Q-145).  A queued request joins the moment a row
 slot is free (``--max-batch``) and its KV fits every rank's planned budget
 beside the running rows (``_KvBudget``: rows x the longest reservation); it
 prefills in its own cache, ``--prefill-step`` tokens a chunk (the chunk
@@ -41,6 +41,30 @@ so a steady decode pays no extra collective.  Before Q-134 a batch formed
 only when the previous one ended and a request the prefix cache acted on
 ran alone: one long generation froze every other request (a 69-token
 canary waited 308 s beside a free slot and half an unreserved KV budget).
+
+Prefill order is shortest-remaining-prefill-first at chunk granularity
+(Q-145).  Prefill is compute-bound, so the chunks still run one at a time;
+what changed is WHICH request's chunk runs.  Several requests may be
+prefilling at once, each in its own cache and each holding a row slot and
+its KV reservation; every rank runs the next chunk of the prefilling row
+with the fewest prompt tokens left (ties: the earlier admitted), a rule
+over state every rank holds identically (the rows the plans admitted, the
+ranges their chunks have consumed), so no extra word crosses the ranks.
+Rank 0 alone decides admission: of the queued requests it picks the one
+first in ``_Scheduler._order`` and admits it only when it would be that
+rule's pick — fewer tokens left than every prefilling row — so a short
+request (goose's title, fact checker, compaction) is prefilled between two
+chunks of a long one and joins the running batch the moment its last chunk
+samples.  Aging, in prefill tokens (the pipeline's own prefill rate
+cancels, so no clock): a request is PROTECTED once the tokens prefilled for
+others while it waited reach the tokens it still has to prefill — its own
+expected prefill time; a protected request goes before every later arrival
+and, while one is prefilling, nothing new is admitted ahead of it, so no
+stream of short requests stretches a long one past about twice its own
+prefill.  Before Q-145 one request prefilled at a time, first come first
+served: on the Flash split three ~39k-token prompts and a 13-token canary
+arriving together got their first tokens at 115 / 232 / 347 s, the canary
+last.
 
 Prefix cache (Q-75): every rank snapshots ITS OWN layers' caches at a stable
 prompt boundary and restores them for a later prompt that starts with the same
@@ -97,7 +121,8 @@ from . import pipeline_qwen4 as pipe
 _CMD_SHUTDOWN = 1
 _CMD_PLAN = 2
 # Rank 0's words on every step's collective: [a plan opens the next tick,
-# a prefill chunk of the joining row runs after this decode step].
+# a prefill chunk (of the row ``_Engine.target`` names) runs after this
+# decode step].
 _CONTROL_WORDS = 2
 # The running rows' decode and a joining row's prefill split the pipeline's
 # time equally while both have work.  A policy ratio (Q-134): the owner weighs
@@ -160,9 +185,10 @@ class _Plan:
 
     # Running-row indices (batch order) that leave: finished or cancelled.
     leave: list[int] = field(default_factory=list)
-    # The joining row leaves before it joined (its request was cancelled).
-    abort: bool = False
-    # The request that starts prefilling (at most one prefills at a time).
+    # Prefilling-row indices (admission order) that leave before they joined
+    # (their requests were cancelled).
+    abort: list[int] = field(default_factory=list)
+    # The request that starts prefilling (appended to the prefilling rows).
     joiner: _Row | None = None
     # Prefix-cache entries every rank drops once the joiner restored its own.
     evict: list[int] = field(default_factory=list)
@@ -175,8 +201,9 @@ def _all_sum(group, value: mx.array) -> mx.array:
     return mx.distributed.all_sum(value, group=group)
 
 
-# The plan header after [cmd, abort, one leave flag per slot]: the joiner's
-# fields (length 0 = no joiner), then the eviction count.
+# The plan header after [cmd, one leave flag per slot, one abort flag per
+# slot]: the joiner's fields (length 0 = no joiner), then the eviction count.
+# Running and prefilling rows share the slots, so neither list outgrows them.
 _PLAN_TAIL = len(
     (
         "length",
@@ -199,16 +226,17 @@ def _broadcast_plan(
     ``deciding`` is rank 0 (``plan`` None there means shut down); every other
     rank passes None and learns the plan from the collectives alone.
     """
-    tail = 2 + max_batch
+    tail = 1 + 2 * max_batch
     header = [0] * (tail + _PLAN_TAIL)
     if deciding:
         if plan is None:
             header[0] = _CMD_SHUTDOWN
         else:
             header[0] = _CMD_PLAN
-            header[1] = int(plan.abort)
             for index in plan.leave:
-                header[2 + index] = 1
+                header[1 + index] = 1
+            for index in plan.abort:
+                header[1 + max_batch + index] = 1
             row = plan.joiner
             if row is not None:
                 header[tail : tail + 7] = [
@@ -256,8 +284,8 @@ def _broadcast_plan(
         dropped = list(plan.evict) if deciding else [0] * evictions
         evict = _all_sum(group, mx.array(dropped, dtype=mx.int32)).tolist()
     return _Plan(
-        leave=[index for index in range(max_batch) if header[2 + index]],
-        abort=bool(header[1]),
+        leave=[index for index in range(max_batch) if header[1 + index]],
+        abort=[index for index in range(max_batch) if header[1 + max_batch + index]],
         joiner=joiner,
         evict=evict,
     )
@@ -467,7 +495,7 @@ def _batch_rope(ropes: list[Any]):
 
 @dataclass
 class _Joining:
-    """The one row still prefilling, in its own cache, before it joins the batch."""
+    """A row still prefilling, in its own cache, before it joins the batch."""
 
     row: _Row
     cache: list[Any]
@@ -476,13 +504,27 @@ class _Joining:
     rope: Any
     ranges: list[tuple[int, int]]
 
+    @property
+    def left(self) -> int:
+        """Prompt tokens this row still has to prefill."""
+        return sum(stop - start for start, stop in self.ranges)
+
+
+def _shortest(prefilling: list[_Joining]) -> int | None:
+    """The prefilling row whose chunk runs next: fewest tokens left, then the earliest admitted."""
+    if not prefilling:
+        return None
+    return min(range(len(prefilling)), key=lambda i: (prefilling[i].left, i))
+
 
 class _Engine:
-    """One rank's rows: the running batch and at most one row still prefilling.
+    """One rank's rows: the running batch and the rows still prefilling.
 
     Every rank holds the same rows in the same order and applies the same
     plans, so every forward and every collective pairs across ranks; what a
-    plan holds is rank 0's decision alone (``_Scheduler``).
+    plan holds is rank 0's decision alone (``_Scheduler``).  Which prefilling
+    row's chunk runs is not in any plan: ``target`` derives it from the rows
+    and their remaining ranges, which every rank holds identically.
     """
 
     def __init__(
@@ -508,19 +550,31 @@ class _Engine:
         self.current: list[int] = []
         self.ropes: list[Any] = []
         self.rope = None
-        self.joining: _Joining | None = None
+        self.prefilling: list[_Joining] = []
 
     @property
     def idle(self) -> bool:
-        return not self.rows and self.joining is None
+        return not self.rows and not self.prefilling
 
     @property
-    def last_chunk(self) -> bool:
-        return self.joining is not None and len(self.joining.ranges) == 1
+    def target(self) -> int | None:
+        """The index (in ``prefilling``) of the row whose chunk ``prefill`` runs next."""
+        return _shortest(self.prefilling)
+
+    @property
+    def joining(self) -> _Joining | None:
+        """The prefilling row whose chunk runs next (None: nothing is prefilling)."""
+        target = self.target
+        return None if target is None else self.prefilling[target]
 
     def apply(self, plan: _Plan) -> None:
         if plan.abort:
-            self.joining = None
+            aborted = set(plan.abort)
+            self.prefilling = [
+                joining
+                for index, joining in enumerate(self.prefilling)
+                if index not in aborted
+            ]
         if plan.leave:
             leaving = set(plan.leave)
             self._regroup([i for i in range(len(self.rows)) if i not in leaving])
@@ -532,11 +586,6 @@ class _Engine:
             self.store.drop(plan.evict)
 
     def _start(self, row: _Row) -> None:
-        if self.joining is not None:
-            raise RuntimeError(
-                "pipeline plan: a second row started prefilling beside the first "
-                "— rank 0 admits one at a time"
-            )
         embeddings, rope = pipe.prepare_multimodal(
             self.stage,
             [row.ids],
@@ -561,7 +610,7 @@ class _Engine:
             # The whole prompt: whether a call or a <think> is open is read
             # from the last opener, which may be in the generation prompt.
             row.history = mx.array(row.ids, dtype=mx.int32)
-        self.joining = _Joining(
+        joining = _Joining(
             row=row,
             cache=cache,
             tokens=mx.array([row.ids], dtype=mx.int32),
@@ -574,6 +623,7 @@ class _Engine:
                 row.store_at if row.store_id else 0,
             ),
         )
+        self.prefilling.append(joining)
 
     def decode(self, words: list[int] | None) -> tuple[list[int], list[int]]:
         """One decode step of every running row; its tokens and rank 0's words."""
@@ -592,7 +642,7 @@ class _Engine:
         return sampled, control
 
     def prefill(self, words: list[int] | None) -> tuple[int | None, list[int]]:
-        """The joining row's next chunk; its first token when the prompt is done.
+        """The target row's next chunk; its first token when the prompt is done.
 
         The last chunk ends at the prompt's last token and samples from it; the
         row then joins the running batch with that token as its next input.
@@ -668,7 +718,7 @@ class _Engine:
             self.rows.append(joining.row)
             self.current.append(first)
             self.ropes.append(joining.rope)
-            self.joining = None
+            self.prefilling = [row for row in self.prefilling if row is not joining]
         self.cache = rebuilt if self.rows else None
         self.rope = _batch_rope(self.ropes) if self.rows else None
 
@@ -682,7 +732,7 @@ def _warm(engine: _Engine) -> None:
     engine.apply(
         _Plan(joiner=_Row(ids=[0] * 8, max_tokens=2, temperature=0.0, top_p=1.0))
     )
-    while engine.joining is not None:
+    while engine.prefilling:
         engine.prefill(None)
     engine.decode(None)
     engine.apply(_Plan(leave=[0]))
@@ -702,6 +752,11 @@ class _Job:
     cancelled: bool = False
     finished: bool = False
     produced: int = 0
+    # Rank 0's arrival order (set when the scheduler takes the job off the queue).
+    seq: int = 0
+    # Prompt tokens prefilled for OTHER requests since this one arrived: its
+    # wait in the pipeline's own prefill time (``_Scheduler._protected``).
+    waited: int = 0
 
     def push(self, item) -> None:
         self.loop.call_soon_threadsafe(self.events.put_nowait, item)
@@ -799,6 +854,13 @@ class _PrefixIndex:
     def __init__(self, kv: _KvBudget):
         self.kv = kv
         self.entries: OrderedDict[int, _Entry] = OrderedDict()
+        # Snapshots directed but not yet taken (their rows are still
+        # prefilling): charged at their bound until ``stored`` or ``forget``.
+        # Rows prefill interleaved (Q-145), so a snapshot can still be pending
+        # when the next request is admitted.
+        self.pending: dict[int, list[int]] = {}
+        # Bumped whenever ``lookup`` could answer differently.
+        self.version = 0
         self.next_id = 1
         self.lock = threading.Lock()
         self.hits = 0
@@ -859,6 +921,7 @@ class _PrefixIndex:
             def held() -> list[int]:
                 return [
                     sum(entry.bytes[rank] for entry in self.entries.values())
+                    + sum(bound[rank] for bound in self.pending.values())
                     for rank in range(len(room))
                 ]
 
@@ -873,12 +936,23 @@ class _PrefixIndex:
                 # Even an empty cache cannot hold this snapshot beside the batch.
                 self._skip("no_room_beside_the_batch")
                 row.store_id = row.store_at = 0
+            elif row.store_id:
+                self.pending[row.store_id] = new
+            if evict:
+                self.version += 1
             return evict
 
     def stored(self, entry_id: int, key: tuple[int, ...], measured: list[int]) -> None:
         with self.lock:
+            self.pending.pop(entry_id, None)
             self.entries[entry_id] = _Entry(key, measured)
             self.stores += 1
+            self.version += 1
+
+    def forget(self, entry_id: int) -> None:
+        """A directed snapshot that will never be taken (its row was aborted)."""
+        with self.lock:
+            self.pending.pop(entry_id, None)
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -916,7 +990,10 @@ class _State:
     kv: _KvBudget | None = None
     prefix: _PrefixIndex | None = None
     jobs: queue.Queue = field(default_factory=queue.Queue)
-    held: object = None
+    # Rank 0's queued requests, taken off ``jobs`` in arrival order and not
+    # yet admitted.  Replaced whole, never mutated, so the HTTP thread can
+    # read it without a lock.
+    waiting: list = field(default_factory=list)
     active: list = field(default_factory=list)
     reserved: list = field(default_factory=list)
     steps: int = 0
@@ -1168,7 +1245,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             share = 0.0
         return {
             "num_running": running,
-            "num_waiting": state.jobs.qsize() + (1 if state.held is not None else 0),
+            "num_waiting": state.jobs.qsize() + len(state.waiting),
             "slots": kv.slots if kv is not None else None,
             "slots_in_use": math.ceil(share * kv.slots - 1e-9)
             if kv is not None
@@ -1186,7 +1263,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     async def progress():
         return {
             "steps": state.steps,
-            "inflight": len(state.active) + state.jobs.qsize(),
+            "inflight": len(state.active) + state.jobs.qsize() + len(state.waiting),
             "admission_open": state.admission_open,
             "active": mx.get_active_memory(),
             "peak": mx.get_peak_memory(),
@@ -1540,51 +1617,98 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
 
 
 class _Scheduler:
-    """Rank 0's decisions: which rows leave, which queued request joins, when its chunks run.
+    """Rank 0's decisions: which rows leave, which queued request is admitted, when chunks run.
 
-    Admission is by slots and memory alone: the oldest live queued request
-    joins when no other request is prefilling, a row slot is free
-    (``max_batch``) and ``_KvBudget`` fits every row the batch would hold on
-    every rank.  First come, first served: a request that does not fit waits
-    at the head and nothing behind it jumps the line.  The joining prefill's
-    chunks are spaced by ``_PREFILL_SHARE`` of the measured pipeline time.
+    Admission is by slots and memory, in ``_order`` (Q-145): the queued
+    request first in that order is admitted when a row slot is free (running
+    and prefilling rows share ``max_batch``), ``_KvBudget`` fits every row the
+    batch would hold on every rank, and — while other rows are prefilling —
+    no prefilling row is protected and the request has fewer prompt tokens
+    left than every one of them, so it is exactly the row ``_shortest`` runs
+    next on every rank.  A request that cannot be admitted waits at the head
+    of the order and nothing behind it jumps it.  Chunks are spaced by
+    ``_PREFILL_SHARE`` of the measured pipeline time.
     """
 
     def __init__(self, state: _State, engine: _Engine):
         self.state = state
         self.engine = engine
         self.running: list[_Job] = []
-        self.joining: _Job | None = None
-        # The request the plan being broadcast admits (joining once applied).
+        # The engine's prefilling rows' jobs, in the engine's order.
+        self.prefilling: list[_Job] = []
+        # The request the plan being broadcast admits (prefilling once applied).
         self.admitted: _Job | None = None
         self.stopping = False
         self.fitted: dict[tuple[int, ...], bool] = {}
-        # Seconds of pipeline time the joining prefill may still spend before
-        # the running rows' decode has had its share (both measured here).
+        # Seconds of pipeline time the prefills may still spend before the
+        # running rows' decode has had its share (both measured here).
         self.credit = 0.0
+        self.arrivals = 0
+        # A queued job's prompt tokens left, by job id: (prefix-cache version, tokens).
+        self.lefts: dict[str, tuple[int, int]] = {}
         if state.prefix is not None:
             engine.on_stored = self._stored
 
     def _stored(self, row: _Row, measured: list[int]) -> None:
         self.state.prefix.stored(row.store_id, tuple(row.ids[: row.store_at]), measured)
 
-    def _head(self, block: bool) -> _Job | None:
-        """The oldest live queued request (it stays held until it joins)."""
+    def _collect(self, block: bool) -> None:
+        """Take every queued job off ``jobs``; ``block``: until one live job waits."""
         state = self.state
+        waiting = [job for job in state.waiting if not job.cancelled]
+        for job in state.waiting:
+            if job.cancelled:
+                self.lefts.pop(job.id, None)
         while not self.stopping:
-            if state.held is not None:
-                if not state.held.cancelled:
-                    return state.held
-                state.held = None
             try:
-                job = state.jobs.get() if block else state.jobs.get_nowait()
+                job = (
+                    state.jobs.get()
+                    if block and not waiting
+                    else state.jobs.get_nowait()
+                )
             except queue.Empty:
-                return None
+                break
             if job is None:
                 self.stopping = True
-            else:
-                state.held = job
-        return None
+            elif not job.cancelled:
+                self.arrivals += 1
+                job.seq = self.arrivals
+                waiting.append(job)
+        if len(waiting) != len(state.waiting):
+            state.waiting = waiting
+
+    def _queued_left(self, job: _Job) -> int:
+        """Prompt tokens a queued job would prefill if admitted now (after its prefix restore)."""
+        prefix = self.state.prefix
+        if prefix is None or job.row.images is not None:
+            return len(job.row.ids)
+        memo = self.lefts.get(job.id)
+        if memo is None or memo[0] != prefix.version:
+            with prefix.lock:
+                _, cached = prefix.lookup(job.row.ids)
+            memo = (prefix.version, len(job.row.ids) - cached)
+            self.lefts[job.id] = memo
+        return memo[1]
+
+    @staticmethod
+    def _protected(job: _Job, left: int) -> bool:
+        """Waited, in prefill spent on others, as long as its own prefill will take."""
+        return job.waited >= left
+
+    def _order(self, job: _Job) -> tuple[int, int, int]:
+        """Protected requests first, oldest first; then the fewest tokens left."""
+        left = self._queued_left(job)
+        if self._protected(job, left):
+            return (0, job.seq, 0)
+        return (1, left, job.seq)
+
+    def _head(self) -> _Job | None:
+        waiting = [job for job in self.state.waiting if not job.cancelled]
+        return min(waiting, key=self._order) if waiting else None
+
+    def _take(self, job: _Job) -> None:
+        self.state.waiting = [other for other in self.state.waiting if other is not job]
+        self.lefts.pop(job.id, None)
 
     def _fits(self, job: _Job, beside: list[_Job]) -> bool:
         if len(beside) + 1 > self.state.max_batch:
@@ -1599,6 +1723,28 @@ class _Scheduler:
             self.fitted[lengths] = kv.fits(list(lengths))
         return self.fitted[lengths]
 
+    def _admissible(
+        self, running: list[_Job], prefilling: list[tuple[_Job, int]]
+    ) -> _Job | None:
+        """The head, if it is admitted beside ``running`` and ``prefilling`` (job, tokens left)."""
+        head = self._head()
+        if head is None or not self._fits(
+            head, [*running, *(job for job, _ in prefilling)]
+        ):
+            return None
+        if prefilling:
+            if any(self._protected(job, left) for job, left in prefilling):
+                return None
+            if self._queued_left(head) >= min(left for _, left in prefilling):
+                return None
+        return head
+
+    def _prefilling_lefts(self) -> list[tuple[_Job, int]]:
+        return [
+            (job, joining.left)
+            for job, joining in zip(self.prefilling, self.engine.prefilling)
+        ]
+
     def _leaving(self) -> list[int]:
         return [
             index
@@ -1606,60 +1752,76 @@ class _Scheduler:
             if job.finished or job.cancelled
         ]
 
-    def wants_plan(self, joined: bool) -> bool:
-        """Whether the next tick opens with a plan (``joined``: the joiner joins this tick)."""
+    def _aborting(self) -> list[int]:
+        return [index for index, job in enumerate(self.prefilling) if job.cancelled]
+
+    def wants_plan(self, chunk: bool) -> bool:
+        """Whether the next tick opens with a plan (``chunk``: the target's chunk runs this step)."""
         if self.stopping or self.state.shutting_down or self._leaving():
             return True
-        if self.joining is not None:
-            if self.joining.cancelled:
-                return True
-            if not joined:
-                return False
-        beside = [*self.running, *([self.joining] if self.joining else [])]
-        head = self._head(block=False)
-        return self.stopping or (head is not None and self._fits(head, beside))
+        if self._aborting():
+            return True
+        self._collect(block=False)
+        if self.stopping:
+            return True
+        running = list(self.running)
+        prefilling = self._prefilling_lefts()
+        if chunk:
+            # The state after this step's chunk: the target has that many
+            # tokens fewer left, or it joined the running batch.
+            target = self.engine.target
+            start, stop = self.engine.prefilling[target].ranges[0]
+            job, left = prefilling[target]
+            if left - (stop - start):
+                prefilling[target] = (job, left - (stop - start))
+            else:
+                del prefilling[target]
+                running.append(job)
+        return self._admissible(running, prefilling) is not None
 
     def plan(self, block: bool) -> _Plan | None:
         """The next tick's plan; None = shut down.  ``block``: the engine is idle."""
         state = self.state
         leave = self._leaving()
-        abort = self.joining is not None and self.joining.cancelled
+        abort = self._aborting()
         survivors = [job for i, job in enumerate(self.running) if i not in leave]
+        prefilling = [
+            pair for i, pair in enumerate(self._prefilling_lefts()) if i not in abort
+        ]
         joiner, evict = None, []
+        self._collect(block=block and not survivors and not prefilling)
         while not (self.stopping or state.shutting_down):
-            if (self.joining is not None and not abort) or len(
-                survivors
-            ) >= state.max_batch:
-                break
-            head = self._head(block=block and not survivors)
-            if head is None:
-                break
-            if self._fits(head, survivors):
-                state.held = None
+            head = self._admissible(survivors, prefilling)
+            if head is not None:
+                self._take(head)
                 self.admitted = head
                 joiner = head.row
                 if state.prefix is not None:
                     evict = state.prefix.admit(
                         head.row,
-                        [_reservation_length(job.row) for job in [*survivors, head]],
+                        [
+                            _reservation_length(job.row)
+                            for job in [*survivors, *(j for j, _ in prefilling), head]
+                        ],
                     )
                 break
-            if not survivors:
-                # Alone it still does not fit: the plan cannot hold it at all
-                # (a lone row at <= context always fits the plan's first slot,
-                # so this names a planner defect rather than waiting forever).
-                state.held = None
-                needed = state.kv.reserve([_reservation_length(head.row)])
-                head.finished = True
-                head.push(
-                    (
-                        "error",
-                        f"the pipeline's KV budget {state.kv.budgets} cannot hold "
-                        f"this request alone ({needed} bytes per rank)",
-                    )
+            head = self._head()
+            if head is None or survivors or prefilling:
+                break
+            # Alone it still does not fit: the plan cannot hold it at all
+            # (a lone row at <= context always fits the plan's first slot,
+            # so this names a planner defect rather than waiting forever).
+            self._take(head)
+            needed = state.kv.reserve([_reservation_length(head.row)])
+            head.finished = True
+            head.push(
+                (
+                    "error",
+                    f"the pipeline's KV budget {state.kv.budgets} cannot hold "
+                    f"this request alone ({needed} bytes per rank)",
                 )
-                continue
-            break
+            )
+            self._collect(block=block)
         if self.stopping or state.shutting_down:
             return None
         return _Plan(leave=leave, abort=abort, joiner=joiner, evict=evict)
@@ -1669,14 +1831,23 @@ class _Scheduler:
         leaving = set(plan.leave)
         self.running = [job for i, job in enumerate(self.running) if i not in leaving]
         if plan.abort:
-            self.joining = None
+            aborted = set(plan.abort)
+            for index in aborted:
+                row = self.prefilling[index].row
+                if self.state.prefix is not None and row.store_id:
+                    self.state.prefix.forget(row.store_id)
+            self.prefilling = [
+                job for i, job in enumerate(self.prefilling) if i not in aborted
+            ]
         if plan.joiner is not None:
-            self.joining, self.admitted = self.admitted, None
-            self.credit = 0.0
+            if not self.prefilling:
+                self.credit = 0.0
+            self.prefilling.append(self.admitted)
+            self.admitted = None
         self._publish()
 
     def _publish(self) -> None:
-        active = [*self.running, *([self.joining] if self.joining else [])]
+        active = [*self.running, *self.prefilling]
         kv = self.state.kv
         self.state.reserved = (
             kv.reserve([_reservation_length(job.row) for job in active])
@@ -1698,34 +1869,41 @@ class _Scheduler:
             job.push(("done", "length"))
 
     def decode_words(self) -> list[int]:
-        chunk = self.joining is not None and self.credit >= 0
+        chunk = bool(self.prefilling) and self.credit >= 0
         # When a chunk follows, its own collective carries the plan word.
-        plan = False if chunk else self.wants_plan(joined=False)
+        plan = False if chunk else self.wants_plan(chunk=False)
         return [int(plan), int(chunk)]
 
     def decoded(self, tokens: list[int], seconds: float) -> None:
         self.state.steps += 1
         for job, token in zip(self.running, tokens):
             self._give(job, token)
-        if self.joining is not None:
+        if self.prefilling:
             self.credit += seconds * _PREFILL_SHARE / (1 - _PREFILL_SHARE)
 
-    def chunk_words(self, last: bool) -> list[int]:
-        return [int(self.wants_plan(joined=last)), 0]
+    def chunk_words(self) -> list[int]:
+        return [int(self.wants_plan(chunk=True)), 0]
 
-    def chunked(self, first: int | None, seconds: float) -> None:
+    def chunked(
+        self, index: int, tokens: int, first: int | None, seconds: float
+    ) -> None:
+        """Prefilling row ``index`` ran a chunk of ``tokens`` tokens (``first``: it joined)."""
         self.credit -= seconds
+        job = self.prefilling[index]
+        for other in [*self.state.waiting, *self.prefilling]:
+            if other is not job:
+                other.waited += tokens
         if first is None:
             return
-        job, self.joining = self.joining, None
+        self.prefilling = [other for other in self.prefilling if other is not job]
         self.running.append(job)
         self._give(job, first)
         self._publish()
 
     def tell(self, message: str) -> None:
         """Every request the engine holds or has queued ends with ``message``."""
-        held = [self.state.held] if self.state.held is not None else []
-        for job in [*self.running, *([self.joining] if self.joining else []), *held]:
+        admitted = [self.admitted] if self.admitted is not None else []
+        for job in [*self.running, *self.prefilling, *admitted, *self.state.waiting]:
             if not job.finished:
                 job.finished = True
                 job.push(("error", message))
@@ -1741,8 +1919,8 @@ def _ticks(
     """The tick loop every rank runs; only rank 0 passes its ``scheduler``.
 
     Every branch below depends only on what every rank holds (the rows, the
-    joining row, the collectives' words), so the forwards and collectives
-    pair across ranks.
+    prefilling rows and their ranges, the collectives' words), so the
+    forwards and collectives pair across ranks.
     """
     deciding = scheduler is not None
     pending = True
@@ -1766,7 +1944,7 @@ def _ticks(
             pending = engine.idle
             if pending:
                 continue
-        chunk = engine.joining is not None
+        chunk = bool(engine.prefilling)
         if engine.rows:
             words = scheduler.decode_words() if deciding else None
             began = time.perf_counter()
@@ -1775,11 +1953,18 @@ def _ticks(
                 scheduler.decoded(tokens, time.perf_counter() - began)
             pending, chunk = bool(words[0]), chunk and bool(words[1])
         if chunk:
-            words = scheduler.chunk_words(engine.last_chunk) if deciding else None
+            if deciding:
+                target = engine.target
+                start, stop = engine.prefilling[target].ranges[0]
+                words = scheduler.chunk_words()
+            else:
+                words = None
             began = time.perf_counter()
             first, words = engine.prefill(words)
             if deciding:
-                scheduler.chunked(first, time.perf_counter() - began)
+                scheduler.chunked(
+                    target, stop - start, first, time.perf_counter() - began
+                )
             pending = bool(words[0])
         pending = pending or engine.idle
 
