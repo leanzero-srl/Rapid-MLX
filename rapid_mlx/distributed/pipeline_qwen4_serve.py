@@ -51,7 +51,9 @@ entry to restore, where to snapshot, what to evict — and the plan that admits
 the request carries the decision; the other ranks hold snapshots by the id rank 0 assigned
 and never decide anything.  The boundary is the single engine's
 (``BatchedEngine._compute_prefix_boundary``, the ``rapid_mlx_transient_tail``
-extension included).  Bytes: the cache lives inside each rank's planned KV
+extension included, on the last user or tool message — ``_on_tool``, so goose
+keeps its turn-context block joined to the tool results instead of posting it
+as a user turn of its own, goose Q-94/Q-143).  Bytes: the cache lives inside each rank's planned KV
 budget — at every admission it is trimmed to that budget minus the batch's
 own reservation, the new snapshot pre-charged — so it never holds memory the
 plan did not.  The cache acts on a request while it prefills in its own
@@ -1037,9 +1039,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     "context_window": state.context,
                     "tool_call_parser": tool_parser,
                     "reasoning_parser": reasoning_parser,
-                    # The single engine's declaration: the transient-tail
-                    # field moves the prefix snapshot, so it is declared only
-                    # while there is a prefix cache to move it in.
+                    # The single engine's declaration (REQUEST_EXTENSIONS: the
+                    # tail and its _on_tool form): the transient-tail field
+                    # moves the prefix snapshot, so it is declared only while
+                    # there is a prefix cache to move it in.
                     "request_extensions": list(REQUEST_EXTENSIONS)
                     if state.prefix is not None
                     else [],
@@ -1103,6 +1106,14 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         model = body.get("model")
         if model is not None and model not in _served_names(state):
             return error(404, _not_served(state, model), "model_not_found")
+        transient_tail = body.get("rapid_mlx_transient_tail")
+        if transient_tail is not None and not isinstance(transient_tail, str):
+            return error(
+                400,
+                "rapid_mlx_transient_tail must be a string: the exact trailing text "
+                "of the last user or tool message",
+                "invalid_request_error",
+            )
         tools = body.get("tools") or None
         if tools and tool_parser is None:
             return error(
@@ -1148,7 +1159,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         boundary = 0
         if state.prefix is not None and images is None:
             stable = BatchedEngine._stable_messages_before_transient_tail(
-                messages, None, body.get("rapid_mlx_transient_tail")
+                messages, None, transient_tail
             )
             boundary = BatchedEngine._compute_prefix_boundary(
                 boundary_renderer,

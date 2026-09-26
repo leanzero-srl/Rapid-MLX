@@ -509,7 +509,10 @@ def test_a_repeated_prefix_is_restored_on_every_rank_and_answers_as_a_cold_run(
     server, checkpoint
 ):
     models = server.get("/v1/models")["data"][0]
-    assert models["request_extensions"] == ["rapid_mlx_transient_tail"]
+    assert models["request_extensions"] == [
+        "rapid_mlx_transient_tail",
+        "rapid_mlx_transient_tail_on_tool",
+    ]
     bodies = [
         _prefix_body("w5 w6 w7 turn w9", "turn w9"),
         _prefix_body("w5 w6 w7 turn w10 w11", "turn w10 w11"),
