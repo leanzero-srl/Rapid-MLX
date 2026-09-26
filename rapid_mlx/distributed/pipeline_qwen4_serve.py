@@ -4,11 +4,12 @@
 Every rank runs :func:`serve`.  Rank 0 also runs an HTTP thread (FastAPI +
 uvicorn) and owns the scheduling; the generation loop stays on each rank's
 main thread because MLX work and the collectives must be issued in the same
-order on every rank.  Rank 0 hands each batch to the other ranks as three
-``all_sum`` broadcasts (an int header, the left-padded token ids, the
-sampling floats); every decode step then closes with one ``all_sum`` that
-carries the sampled tokens, the memory-guard stop flag and rank 0's control
-word (end the batch).
+order on every rank.  Rank 0 hands each change to the other ranks as a PLAN
+(``_broadcast_plan``: an int header, then the joining row's token ids and
+sampling floats); every decode step and prefill chunk closes with one
+``all_sum`` that carries the sampled tokens, the memory-guard stop flag and
+rank 0's control words (a plan opens the next tick; a prefill chunk runs
+after this decode step).
 
 What the HTTP side reuses from the single engine, unchanged:
 ``utils.chat_template.apply_chat_template`` (the same rendering, tool-loop
@@ -20,28 +21,42 @@ XML tool contract -> ``qwen3_coder_xml``; ``<think>`` + ``enable_thinking``
 -> ``deepseek_r1``) — the same rule goose-sidecar's ``model_parsers.rs``
 applies when it launches the single engine.
 
-Scheduling: a batch is formed from whatever is queued when the previous batch
-ends (up to ``--max-batch``, 2 proven bit-exact against single-process
-batches); requests arriving mid-batch wait for the next one.  A finished,
-EOS'd or cancelled row stops receiving tokens; the batch ends one decode
-step after its last live row finishes (the control word rides the next
-step's collective).
+Scheduling is continuous (Q-134).  Every rank runs the same TICK: one decode
+step for the running rows, then — when rank 0 grants it — one prefill chunk
+of the ONE request that is joining.  A queued request joins the moment a row
+slot is free (``--max-batch``) and its KV fits every rank's planned budget
+beside the running rows (``_KvBudget``: rows x the longest reservation); it
+prefills in its own cache, ``--prefill-step`` tokens a chunk (the chunk
+edges a solo run uses), samples its first token from its last chunk, and is
+merged into the running batch by extracting each row's caches and merging
+them again (mlx-lm's own batching path; ``filter`` is not used — measured,
+``QSAIndexCache.filter`` desyncs from ``BatchKVCache.filter`` when the
+surviving row was the padded one).  A finished or cancelled row leaves the
+same way at the next plan.  While both have work, the joining prefill and
+the running decode share the pipeline's time equally (``_PREFILL_SHARE``,
+rank 0's measured step and chunk times): the share decides only WHEN a
+chunk runs — never whether a request is admitted, nor where its prompt is
+cut.  A plan is broadcast only when the previous collective announced one,
+so a steady decode pays no extra collective.  Before Q-134 a batch formed
+only when the previous one ended and a request the prefix cache acted on
+ran alone: one long generation froze every other request (a 69-token
+canary waited 308 s beside a free slot and half an unreserved KV budget).
 
 Prefix cache (Q-75): every rank snapshots ITS OWN layers' caches at a stable
 prompt boundary and restores them for a later prompt that starts with the same
 tokens.  The layers are hybrid (GDN/PLE recurrent state cannot be trimmed), so
 only an exact stored prefix is reusable, and every rank must reuse the SAME
 prefix length or the collectives stop pairing.  So rank 0 alone decides — which
-entry to restore, where to snapshot, what to evict — and the batch header
-carries the decision; the other ranks hold snapshots by the id rank 0 assigned
+entry to restore, where to snapshot, what to evict — and the plan that admits
+the request carries the decision; the other ranks hold snapshots by the id rank 0 assigned
 and never decide anything.  The boundary is the single engine's
 (``BatchedEngine._compute_prefix_boundary``, the ``rapid_mlx_transient_tail``
 extension included).  Bytes: the cache lives inside each rank's planned KV
 budget — at every admission it is trimmed to that budget minus the batch's
 own reservation, the new snapshot pre-charged — so it never holds memory the
-plan did not.  A request the cache acts on (restores or snapshots) runs as a
-batch of one: rows are left-padded to one width, so a restored prefix cannot
-share a batch.
+plan did not.  The cache acts on a request while it prefills in its own
+cache, before it joins the batch, so a restored prefix never shares a
+padded prefill.
 """
 
 from __future__ import annotations
@@ -69,7 +84,17 @@ from fastapi import Request
 from . import pipeline_qwen4 as pipe
 
 _CMD_SHUTDOWN = 1
-_CMD_BATCH = 2
+_CMD_PLAN = 2
+# Rank 0's words on every step's collective: [a plan opens the next tick,
+# a prefill chunk of the joining row runs after this decode step].
+_CONTROL_WORDS = 2
+# The running rows' decode and a joining row's prefill split the pipeline's
+# time equally while both have work.  A policy ratio (Q-134): the owner weighs
+# the running row's decode rate and the queued request's wait alike.  Q-103's
+# single-engine fair prefill shrank the chunks instead (50-60 tokens a row)
+# and cost decode -67%; here the chunk stays the planned --prefill-step and
+# the share only spaces the chunks out between decode steps.
+_PREFILL_SHARE = 0.5
 _TOOL_XML_MARKERS = (
     "tool_calls",
     "arguments",
@@ -98,9 +123,9 @@ class _Row:
     # rank 0 merges the tower's features and shares the RoPE table instead.
     images: Any = None
     # The prefix-cache directive, identical on every rank (rank 0 decides, the
-    # batch header carries it; a batch of more than one row carries none):
-    # restore entry ``reuse_id`` holding the first ``cached`` tokens, and
-    # snapshot entry ``store_id`` after the first ``store_at`` tokens.
+    # plan that admits the row carries it): restore entry ``reuse_id`` holding
+    # the first ``cached`` tokens, and snapshot entry ``store_id`` after the
+    # first ``store_at`` tokens.
     reuse_id: int = 0
     cached: int = 0
     store_id: int = 0
@@ -110,79 +135,102 @@ class _Row:
     boundary: int = 0
 
 
-# The header words after the rows: the one-row directive, then the evictions.
-_DIRECTIVE_FIELDS = len(("reuse_id", "cached", "store_id", "store_at", "evictions"))
+@dataclass
+class _Plan:
+    """What changes at the start of a tick, decided by rank 0 alone."""
+
+    # Running-row indices (batch order) that leave: finished or cancelled.
+    leave: list[int] = field(default_factory=list)
+    # The joining row leaves before it joined (its request was cancelled).
+    abort: bool = False
+    # The request that starts prefilling (at most one prefills at a time).
+    joiner: _Row | None = None
+    # Prefix-cache entries every rank drops once the joiner restored its own.
+    evict: list[int] = field(default_factory=list)
 
 
-def _broadcast_batch(
-    group, rows: list[_Row] | None, max_batch: int, evict: list[int] | None = None
-) -> tuple[list[_Row], list[int]] | None:
-    """Rank 0's batch and prefix-cache evictions, identical on every rank; None = shut down."""
-    rank0 = group.rank() == 0
-    header = [0] * (3 + 2 * max_batch + _DIRECTIVE_FIELDS)
-    directive = 3 + 2 * max_batch
-    if rank0:
-        if rows is None:
+def _all_sum(group, value: mx.array) -> mx.array:
+    """Every collective of the tick loop (one seam, so a test can replay them)."""
+    if group is None or group.size() == 1:
+        return value
+    return mx.distributed.all_sum(value, group=group)
+
+
+# The plan header after [cmd, abort, one leave flag per slot]: the joiner's
+# fields (length 0 = no joiner), then the eviction count.
+_PLAN_TAIL = len(
+    ("length", "max_tokens", "reuse_id", "cached", "store_id", "store_at", "evictions")
+)
+
+
+def _broadcast_plan(
+    group, plan: _Plan | None, max_batch: int, *, deciding: bool
+) -> _Plan | None:
+    """Rank 0's plan, identical on every rank; None = shut down.
+
+    ``deciding`` is rank 0 (``plan`` None there means shut down); every other
+    rank passes None and learns the plan from the collectives alone.
+    """
+    tail = 2 + max_batch
+    header = [0] * (tail + _PLAN_TAIL)
+    if deciding:
+        if plan is None:
             header[0] = _CMD_SHUTDOWN
         else:
-            header[0] = _CMD_BATCH
-            header[1] = len(rows)
-            header[2] = max(len(row.ids) for row in rows)
-            for index, row in enumerate(rows):
-                header[3 + index] = len(row.ids)
-                header[3 + max_batch + index] = row.max_tokens
-            if len(rows) == 1:
-                row = rows[0]
-                header[directive : directive + 4] = [
+            header[0] = _CMD_PLAN
+            header[1] = int(plan.abort)
+            for index in plan.leave:
+                header[2 + index] = 1
+            row = plan.joiner
+            if row is not None:
+                header[tail : tail + 6] = [
+                    len(row.ids),
+                    row.max_tokens,
                     row.reuse_id,
                     row.cached,
                     row.store_id,
                     row.store_at,
                 ]
-            header[directive + 4] = len(evict or [])
-    agreed = mx.distributed.all_sum(mx.array(header, dtype=mx.int32), group=group)
-    header = agreed.tolist()
+            header[tail + 6] = len(plan.evict)
+    header = _all_sum(group, mx.array(header, dtype=mx.int32)).tolist()
     if header[0] == _CMD_SHUTDOWN:
         return None
-    batch, width = header[1], header[2]
-    ids = [0] * (batch * width)
-    floats = [0.0] * (2 * batch)
-    if rank0:
-        for index, row in enumerate(rows):
-            offset = index * width + width - len(row.ids)
-            ids[offset : offset + len(row.ids)] = row.ids
-            floats[2 * index] = row.temperature
-            floats[2 * index + 1] = row.top_p
-    ids = mx.distributed.all_sum(mx.array(ids, dtype=mx.int32), group=group).tolist()
-    floats = mx.distributed.all_sum(
-        mx.array(floats, dtype=mx.float32), group=group
-    ).tolist()
-    evictions = header[directive + 4]
-    if evictions:
-        dropped = list(evict) if rank0 else [0] * evictions
-        evict = mx.distributed.all_sum(
-            mx.array(dropped, dtype=mx.int32), group=group
-        ).tolist()
-    else:
-        evict = []
-    result = []
-    for index in range(batch):
-        length = header[3 + index]
-        row_ids = ids[index * width + width - length : (index + 1) * width]
-        result.append(
-            _Row(
-                ids=row_ids,
-                max_tokens=header[3 + max_batch + index],
-                temperature=floats[2 * index],
-                top_p=floats[2 * index + 1],
-            )
+    if header[0] != _CMD_PLAN:
+        raise RuntimeError(
+            f"pipeline plan: unknown command {header[0]} — the ranks diverged"
         )
-    if batch == 1:
-        row = result[0]
-        row.reuse_id, row.cached, row.store_id, row.store_at = header[
-            directive : directive + 4
-        ]
-    return result, evict
+    length = header[tail]
+    joiner = None
+    if length:
+        ids = plan.joiner.ids if deciding else [0] * length
+        floats = (
+            [plan.joiner.temperature, plan.joiner.top_p] if deciding else [0.0, 0.0]
+        )
+        ids = _all_sum(group, mx.array(ids, dtype=mx.int32)).tolist()
+        floats = _all_sum(group, mx.array(floats, dtype=mx.float32)).tolist()
+        if deciding:
+            joiner = plan.joiner
+        else:
+            joiner = _Row(
+                ids=ids,
+                max_tokens=header[tail + 1],
+                temperature=floats[0],
+                top_p=floats[1],
+            )
+            joiner.reuse_id, joiner.cached, joiner.store_id, joiner.store_at = header[
+                tail + 2 : tail + 6
+            ]
+    evictions = header[tail + 6]
+    evict = []
+    if evictions:
+        dropped = list(plan.evict) if deciding else [0] * evictions
+        evict = _all_sum(group, mx.array(dropped, dtype=mx.int32)).tolist()
+    return _Plan(
+        leave=[index for index in range(max_batch) if header[2 + index]],
+        abort=bool(header[1]),
+        joiner=joiner,
+        evict=evict,
+    )
 
 
 def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
@@ -201,32 +249,32 @@ def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
 
 
 def _step(
-    stage, out, cache, rows, guard, control: int, *, sample: bool
-) -> tuple[list[int], int]:
-    """One step's collective: tokens, the guard's stop flag, rank 0's control."""
+    stage, out, cache, rows, guard, words: list[int] | None, *, sample: bool
+) -> tuple[list[int], list[int]]:
+    """One step's collective: tokens, the guard's stop flag, rank 0's words.
+
+    ``words`` are rank 0's ``_CONTROL_WORDS`` (None elsewhere: zeros).
+    """
     batch = len(rows)
     reason = guard.check() if guard is not None else None
     if stage.is_last and sample:
         tokens = _sample(out[:, -1, :], rows)
     else:
         tokens = mx.depends(mx.zeros((batch,), dtype=mx.int32), out)
-    payload = mx.concatenate(
-        [
-            tokens,
-            mx.array(
-                [1 if reason else 0, control if stage.is_first else 0], dtype=mx.int32
-            ),
-        ]
+    control = (
+        list(words) if stage.is_first and words is not None else [0] * _CONTROL_WORDS
     )
-    if stage.size > 1:
-        payload = mx.distributed.all_sum(payload, group=stage.group)
+    payload = mx.concatenate(
+        [tokens, mx.array([1 if reason else 0, *control], dtype=mx.int32)]
+    )
+    payload = _all_sum(stage.group, payload)
     mx.eval(payload, [layer_cache.state for layer_cache in cache])
     values = payload.tolist()
     if values[batch]:
         raise pipe.PipelineMemoryStopError(
             reason or "a peer rank's memory guard tripped"
         )
-    return values[:batch], values[batch + 1]
+    return values[:batch], values[batch + 1 :]
 
 
 def prefill_chunks(
@@ -294,87 +342,242 @@ def _agree_bytes(stage, local: int) -> list[int]:
     """Every rank's measured bytes, rank-indexed (KiB over the wire: int32)."""
     kib = [0] * stage.size
     kib[stage.rank] = -(-local // 1024)
-    if stage.size > 1:
-        kib = mx.distributed.all_sum(
-            mx.array(kib, dtype=mx.int32), group=stage.group
-        ).tolist()
+    kib = _all_sum(stage.group, mx.array(kib, dtype=mx.int32)).tolist()
     return [value * 1024 for value in kib]
 
 
-def run_batch(
-    stage,
-    guard,
-    rows: list[_Row],
-    prefill_step: int,
-    on_tokens=None,
-    control_fn=None,
-    store: _PrefixStore | None = None,
-    evict: list[int] | None = None,
-    on_stored=None,
-) -> None:
-    """Prefill + decode one batch on this rank.
+def _batch_rope(ropes: list[Any]):
+    """One batch's RoPE table from its rows' own (None = a text row); None if all text.
 
-    ``on_tokens(step, tokens)`` (rank 0) receives each step's sampled tokens;
-    ``control_fn()`` (rank 0) returns 1 to end the batch at the next step.
-    A one-row batch may carry a prefix-cache directive: restore ``reuse_id``
-    and prefill from ``cached``; snapshot ``store_id`` after ``store_at``
-    tokens, then ``on_stored(store_id, bytes_per_rank)`` (rank 0).
-    ``evict`` entries are dropped after the restore copied its entry.
+    A text row carries a zero-length table, so every position it asks for
+    rotates at ``position + 0`` — exactly what ``MRopePositions`` does past a
+    row's prompt.
     """
-    width = max(len(row.ids) for row in rows)
-    padded = [[0] * (width - len(row.ids)) + row.ids for row in rows]
-    tokens = mx.array(padded, dtype=mx.int32)
-    padding = [width - len(row.ids) for row in rows]
-    embeddings, rope = pipe.prepare_multimodal(
-        stage,
-        [row.ids for row in rows],
-        [row.images for row in rows] if stage.is_first else None,
+    if all(rope is None for rope in ropes):
+        return None
+    from ..models.qwen4_exp_vision import MRopePositions
+
+    width = max(rope.table.shape[2] for rope in ropes if rope is not None)
+    tables, lengths, deltas = [], [], []
+    for rope in ropes:
+        if rope is None:
+            tables.append(mx.zeros((3, 1, width), dtype=mx.int64))
+            lengths.append(mx.zeros((1,), dtype=mx.int64))
+            deltas.append(mx.zeros((1,), dtype=mx.int64))
+            continue
+        pad = width - rope.table.shape[2]
+        tables.append(
+            mx.pad(rope.table, [(0, 0), (0, 0), (0, pad)]) if pad else rope.table
+        )
+        lengths.append(rope.lengths)
+        deltas.append(rope.deltas)
+    return MRopePositions(
+        table=mx.concatenate(tables, axis=1),
+        lengths=mx.concatenate(lengths),
+        deltas=mx.concatenate(deltas),
     )
-    head = rows[0]
-    directed = len(rows) == 1 and (head.reuse_id or head.store_id)
-    if directed and (store is None or embeddings is not None or rope is not None):
-        raise RuntimeError(
-            "prefix cache: a directive reached a rank without a store, or a row "
-            "with images (rank 0 never directs either)"
+
+
+@dataclass
+class _Joining:
+    """The one row still prefilling, in its own cache, before it joins the batch."""
+
+    row: _Row
+    cache: list[Any]
+    tokens: mx.array
+    embeddings: Any
+    rope: Any
+    ranges: list[tuple[int, int]]
+
+
+class _Engine:
+    """One rank's rows: the running batch and at most one row still prefilling.
+
+    Every rank holds the same rows in the same order and applies the same
+    plans, so every forward and every collective pairs across ranks; what a
+    plan holds is rank 0's decision alone (``_Scheduler``).
+    """
+
+    def __init__(self, stage, guard, prefill_step: int, store=None, on_stored=None):
+        self.stage = stage
+        self.guard = guard
+        self.prefill_step = prefill_step
+        self.store = store
+        # Rank 0: ``on_stored(row, bytes_per_rank)`` once every rank holds a snapshot.
+        self.on_stored = on_stored
+        self.rows: list[_Row] = []
+        self.cache: list[Any] | None = None
+        self.current: list[int] = []
+        self.ropes: list[Any] = []
+        self.rope = None
+        self.joining: _Joining | None = None
+
+    @property
+    def idle(self) -> bool:
+        return not self.rows and self.joining is None
+
+    @property
+    def last_chunk(self) -> bool:
+        return self.joining is not None and len(self.joining.ranges) == 1
+
+    def apply(self, plan: _Plan) -> None:
+        if plan.abort:
+            self.joining = None
+        if plan.leave:
+            leaving = set(plan.leave)
+            self._regroup([i for i in range(len(self.rows)) if i not in leaving])
+        if plan.joiner is not None:
+            self._start(plan.joiner)
+        if self.store is not None and plan.evict:
+            # After the restore copied its entry: an evicted entry may be the
+            # one this joiner restores from.
+            self.store.drop(plan.evict)
+
+    def _start(self, row: _Row) -> None:
+        if self.joining is not None:
+            raise RuntimeError(
+                "pipeline plan: a second row started prefilling beside the first "
+                "— rank 0 admits one at a time"
+            )
+        embeddings, rope = pipe.prepare_multimodal(
+            self.stage,
+            [row.ids],
+            [row.images] if self.stage.is_first else None,
         )
-    if len(rows) == 1 and head.reuse_id:
-        cache, start = store.take(head.reuse_id), head.cached
-    else:
-        cache, start = stage.make_cache(padding if len(rows) > 1 else None), 0
-    if store is not None and evict:
-        store.drop(evict)
-    split = head.store_at if len(rows) == 1 and head.store_id else 0
-    for offset, stop in prefill_chunks(start, width - 1, prefill_step, split):
-        out = stage.forward(
-            tokens[:, offset:stop],
-            cache,
-            logits=None,
-            embeddings=None if embeddings is None else embeddings[:, offset:stop],
-            rope_positions=rope,
+        directed = row.reuse_id or row.store_id
+        if directed and (
+            self.store is None or embeddings is not None or rope is not None
+        ):
+            raise RuntimeError(
+                "prefix cache: a directive reached a rank without a store, or a row "
+                "with images (rank 0 never directs either)"
+            )
+        if row.reuse_id:
+            cache, start = self.store.take(row.reuse_id), row.cached
+        else:
+            cache, start = self.stage.make_cache(), 0
+        self.joining = _Joining(
+            row=row,
+            cache=cache,
+            tokens=mx.array([row.ids], dtype=mx.int32),
+            embeddings=embeddings,
+            rope=rope,
+            ranges=prefill_chunks(
+                start,
+                len(row.ids),
+                self.prefill_step,
+                row.store_at if row.store_id else 0,
+            ),
         )
-        _step(stage, out, cache, rows, guard, 0, sample=False)
-        if split and stop == split:
-            measured = _agree_bytes(stage, store.put(head.store_id, cache))
-            if on_stored is not None:
-                on_stored(head.store_id, measured)
-    current = tokens[:, -1:]
-    current_embeddings = None if embeddings is None else embeddings[:, -1:]
-    for step in range(max(row.max_tokens for row in rows)):
-        control = control_fn() if (control_fn is not None and stage.is_first) else 0
-        out = stage.forward(
-            current,
-            cache,
+
+    def decode(self, words: list[int] | None) -> tuple[list[int], list[int]]:
+        """One decode step of every running row; its tokens and rank 0's words."""
+        out = self.stage.forward(
+            mx.array(self.current, dtype=mx.int32)[:, None],
+            self.cache,
             logits="last",
-            embeddings=current_embeddings,
-            rope_positions=rope,
+            rope_positions=self.rope,
         )
-        current_embeddings = None
-        sampled, ended = _step(stage, out, cache, rows, guard, control, sample=True)
-        if ended:
-            return
-        if on_tokens is not None:
-            on_tokens(step, sampled)
-        current = mx.array(sampled, dtype=mx.int32)[:, None]
+        sampled, control = _step(
+            self.stage, out, self.cache, self.rows, self.guard, words, sample=True
+        )
+        self.current = sampled
+        return sampled, control
+
+    def prefill(self, words: list[int] | None) -> tuple[int | None, list[int]]:
+        """The joining row's next chunk; its first token when the prompt is done.
+
+        The last chunk ends at the prompt's last token and samples from it; the
+        row then joins the running batch with that token as its next input.
+        """
+        joining = self.joining
+        start, stop = joining.ranges.pop(0)
+        last = not joining.ranges
+        out = self.stage.forward(
+            joining.tokens[:, start:stop],
+            joining.cache,
+            logits="last" if last else None,
+            embeddings=None
+            if joining.embeddings is None
+            else joining.embeddings[:, start:stop],
+            rope_positions=joining.rope,
+        )
+        sampled, control = _step(
+            self.stage,
+            out,
+            joining.cache,
+            [joining.row],
+            self.guard,
+            words,
+            sample=last,
+        )
+        row = joining.row
+        if row.store_id and stop == row.store_at:
+            measured = _agree_bytes(
+                self.stage, self.store.put(row.store_id, joining.cache)
+            )
+            if self.on_stored is not None:
+                self.on_stored(row, measured)
+        if not last:
+            return None, control
+        self._regroup(list(range(len(self.rows))), joining, sampled[0])
+        return sampled[0], control
+
+    def _regroup(
+        self, keep: list[int], joining: _Joining | None = None, first: int = 0
+    ) -> None:
+        """Rebuild the running batch from the kept rows (+ the joined row), layer by layer.
+
+        Each kept row's cache is extracted and the rows are merged again (a lone
+        row keeps its own, unbatched cache).  One layer at a time, evaluated
+        before the next, so the rebuild never holds more than one layer twice.
+        """
+        count = len(self.rows)
+        rebuilt = self.cache if self.cache is not None else list(joining.cache)
+        for index in range(len(rebuilt)):
+            parts: list[Any] = []
+            if self.cache is not None:
+                layer = self.cache[index]
+                if count == 1:
+                    parts = [layer] if keep == [0] else []
+                else:
+                    parts = [layer.extract(row) for row in keep]
+            if joining is not None:
+                parts.append(joining.cache[index])
+            if not parts:
+                merged = None
+            elif len(parts) == 1:
+                merged = parts[0]
+            else:
+                merged = type(parts[0]).merge(parts)
+            if merged is not None:
+                mx.eval(merged.state)
+            rebuilt[index] = merged
+        self.rows = [self.rows[i] for i in keep]
+        self.current = [self.current[i] for i in keep]
+        self.ropes = [self.ropes[i] for i in keep]
+        if joining is not None:
+            self.rows.append(joining.row)
+            self.current.append(first)
+            self.ropes.append(joining.rope)
+            self.joining = None
+        self.cache = rebuilt if self.rows else None
+        self.rope = _batch_rope(self.ropes) if self.rows else None
+
+
+def _warm(engine: _Engine) -> None:
+    """Kernel compilation and first-touch paging, before anything is advertised.
+
+    The same path a request takes — prefill, sample, join, decode, leave —
+    identical on every rank, so no plan is broadcast.
+    """
+    engine.apply(
+        _Plan(joiner=_Row(ids=[0] * 8, max_tokens=2, temperature=0.0, top_p=1.0))
+    )
+    while engine.joining is not None:
+        engine.prefill(None)
+    engine.decode(None)
+    engine.apply(_Plan(leave=[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -509,19 +712,19 @@ class _PrefixIndex:
                 best_id, best = entry_id, length
         return best_id, best
 
-    def acts_on(self, row: _Row) -> bool:
-        return row.images is None and (row.boundary > 0 or self.lookup(row.ids)[1] > 0)
+    def admit(self, row: _Row, lengths: list[int]) -> list[int]:
+        """Set the joining row's directive; return the entries to evict.
 
-    def admit(self, rows: list[_Row], lengths: list[int]) -> list[int]:
-        """Set the directive on a one-row batch; return the entries to evict."""
+        ``lengths`` are the reservations of every row the batch will hold once
+        the row joins, its own included.
+        """
         with self.lock:
             room = [
                 budget - need
                 for budget, need in zip(self.kv.budgets, self.kv.reserve(lengths))
             ]
             new = [0] * len(room)
-            if len(rows) == 1 and rows[0].images is None:
-                row = rows[0]
+            if row.images is None:
                 row.reuse_id, row.cached = self.lookup(row.ids)
                 if row.reuse_id:
                     self.hits += 1
@@ -561,7 +764,7 @@ class _PrefixIndex:
             if any(new) and over(new):
                 # Even an empty cache cannot hold this snapshot beside the batch.
                 self._skip("no_room_beside_the_batch")
-                rows[0].store_id = rows[0].store_at = 0
+                row.store_id = row.store_at = 0
             return evict
 
     def stored(self, entry_id: int, key: tuple[int, ...], measured: list[int]) -> None:
@@ -1211,118 +1414,259 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     return app
 
 
-def _run_jobs(
-    stage,
-    guard,
-    state: _State,
-    batch: list[_Job],
-    prefill_step: int,
-    store: _PrefixStore | None = None,
-    evict: list[int] | None = None,
-) -> None:
-    def on_tokens(step: int, tokens: list[int]) -> None:
-        state.steps += 1
-        for job, token in zip(batch, tokens):
-            if job.finished or job.cancelled:
+class _Scheduler:
+    """Rank 0's decisions: which rows leave, which queued request joins, when its chunks run.
+
+    Admission is by slots and memory alone: the oldest live queued request
+    joins when no other request is prefilling, a row slot is free
+    (``max_batch``) and ``_KvBudget`` fits every row the batch would hold on
+    every rank.  First come, first served: a request that does not fit waits
+    at the head and nothing behind it jumps the line.  The joining prefill's
+    chunks are spaced by ``_PREFILL_SHARE`` of the measured pipeline time.
+    """
+
+    def __init__(self, state: _State, engine: _Engine):
+        self.state = state
+        self.engine = engine
+        self.running: list[_Job] = []
+        self.joining: _Job | None = None
+        # The request the plan being broadcast admits (joining once applied).
+        self.admitted: _Job | None = None
+        self.stopping = False
+        self.fitted: dict[tuple[int, ...], bool] = {}
+        # Seconds of pipeline time the joining prefill may still spend before
+        # the running rows' decode has had its share (both measured here).
+        self.credit = 0.0
+        if state.prefix is not None:
+            engine.on_stored = self._stored
+
+    def _stored(self, row: _Row, measured: list[int]) -> None:
+        self.state.prefix.stored(row.store_id, tuple(row.ids[: row.store_at]), measured)
+
+    def _head(self, block: bool) -> _Job | None:
+        """The oldest live queued request (it stays held until it joins)."""
+        state = self.state
+        while not self.stopping:
+            if state.held is not None:
+                if not state.held.cancelled:
+                    return state.held
+                state.held = None
+            try:
+                job = state.jobs.get() if block else state.jobs.get_nowait()
+            except queue.Empty:
+                return None
+            if job is None:
+                self.stopping = True
+            else:
+                state.held = job
+        return None
+
+    def _fits(self, job: _Job, beside: list[_Job]) -> bool:
+        if len(beside) + 1 > self.state.max_batch:
+            return False
+        kv = self.state.kv
+        if kv is None:
+            return True
+        # Asked before every decode step while a request waits: the same
+        # question until the rows change, and each plan clears the memo.
+        lengths = tuple(_reservation_length(other.row) for other in [*beside, job])
+        if lengths not in self.fitted:
+            self.fitted[lengths] = kv.fits(list(lengths))
+        return self.fitted[lengths]
+
+    def _leaving(self) -> list[int]:
+        return [
+            index
+            for index, job in enumerate(self.running)
+            if job.finished or job.cancelled
+        ]
+
+    def wants_plan(self, joined: bool) -> bool:
+        """Whether the next tick opens with a plan (``joined``: the joiner joins this tick)."""
+        if self.stopping or self.state.shutting_down or self._leaving():
+            return True
+        if self.joining is not None:
+            if self.joining.cancelled:
+                return True
+            if not joined:
+                return False
+        beside = [*self.running, *([self.joining] if self.joining else [])]
+        head = self._head(block=False)
+        return self.stopping or (head is not None and self._fits(head, beside))
+
+    def plan(self, block: bool) -> _Plan | None:
+        """The next tick's plan; None = shut down.  ``block``: the engine is idle."""
+        state = self.state
+        leave = self._leaving()
+        abort = self.joining is not None and self.joining.cancelled
+        survivors = [job for i, job in enumerate(self.running) if i not in leave]
+        joiner, evict = None, []
+        while not (self.stopping or state.shutting_down):
+            if (self.joining is not None and not abort) or len(
+                survivors
+            ) >= state.max_batch:
+                break
+            head = self._head(block=block and not survivors)
+            if head is None:
+                break
+            if self._fits(head, survivors):
+                state.held = None
+                self.admitted = head
+                joiner = head.row
+                if state.prefix is not None:
+                    evict = state.prefix.admit(
+                        head.row,
+                        [_reservation_length(job.row) for job in [*survivors, head]],
+                    )
+                break
+            if not survivors:
+                # Alone it still does not fit: the plan cannot hold it at all
+                # (a lone row at <= context always fits the plan's first slot,
+                # so this names a planner defect rather than waiting forever).
+                state.held = None
+                needed = state.kv.reserve([_reservation_length(head.row)])
+                head.finished = True
+                head.push(
+                    (
+                        "error",
+                        f"the pipeline's KV budget {state.kv.budgets} cannot hold "
+                        f"this request alone ({needed} bytes per rank)",
+                    )
+                )
                 continue
-            job.produced += 1
-            job.push(("token", token))
-            if token in state.eos_ids:
-                job.finished = True
-                job.push(("done", "stop"))
-            elif job.produced >= job.row.max_tokens:
-                job.finished = True
-                job.push(("done", "length"))
+            break
+        if self.stopping or state.shutting_down:
+            return None
+        return _Plan(leave=leave, abort=abort, joiner=joiner, evict=evict)
 
-    def control() -> int:
-        return int(all(job.finished or job.cancelled for job in batch))
+    def applied(self, plan: _Plan) -> None:
+        self.fitted.clear()
+        leaving = set(plan.leave)
+        self.running = [job for i, job in enumerate(self.running) if i not in leaving]
+        if plan.abort:
+            self.joining = None
+        if plan.joiner is not None:
+            self.joining, self.admitted = self.admitted, None
+            self.credit = 0.0
+        self._publish()
 
-    def on_stored(entry_id: int, measured: list[int]) -> None:
-        row = batch[0].row
-        state.prefix.stored(entry_id, tuple(row.ids[: row.store_at]), measured)
-
-    try:
-        run_batch(
-            stage,
-            guard,
-            [job.row for job in batch],
-            prefill_step,
-            on_tokens,
-            control,
-            store=store,
-            evict=evict,
-            on_stored=on_stored if state.prefix is not None else None,
+    def _publish(self) -> None:
+        active = [*self.running, *([self.joining] if self.joining else [])]
+        kv = self.state.kv
+        self.state.reserved = (
+            kv.reserve([_reservation_length(job.row) for job in active])
+            if kv is not None and active
+            else []
         )
-    except pipe.PipelineMemoryStopError as stop:
-        for job in batch:
-            job.push(("error", f"memory guard stopped the pipeline: {stop}"))
-        raise
-    for job in batch:
-        if not job.finished:
+        self.state.active = active
+
+    def _give(self, job: _Job, token: int) -> None:
+        if job.finished or job.cancelled:
+            return
+        job.produced += 1
+        job.push(("token", token))
+        if token in self.state.eos_ids:
+            job.finished = True
+            job.push(("done", "stop"))
+        elif job.produced >= job.row.max_tokens:
             job.finished = True
             job.push(("done", "length"))
 
+    def decode_words(self) -> list[int]:
+        chunk = self.joining is not None and self.credit >= 0
+        # When a chunk follows, its own collective carries the plan word.
+        plan = False if chunk else self.wants_plan(joined=False)
+        return [int(plan), int(chunk)]
 
-def _rank0_loop(
-    stage,
-    guard,
-    state: _State,
-    prefill_step: int,
-    wake: _Wake,
-    store: _PrefixStore | None = None,
-) -> None:
-    group = stage.group
-    prefix = state.prefix
-    while True:
-        if state.held is not None:
-            first, state.held = state.held, None
-        else:
-            first = state.jobs.get()
+    def decoded(self, tokens: list[int], seconds: float) -> None:
+        self.state.steps += 1
+        for job, token in zip(self.running, tokens):
+            self._give(job, token)
+        if self.joining is not None:
+            self.credit += seconds * _PREFILL_SHARE / (1 - _PREFILL_SHARE)
+
+    def chunk_words(self, last: bool) -> list[int]:
+        return [int(self.wants_plan(joined=last)), 0]
+
+    def chunked(self, first: int | None, seconds: float) -> None:
+        self.credit -= seconds
         if first is None:
-            wake.ring()
-            _broadcast_batch(group, None, state.max_batch)
             return
-        if first.cancelled:
-            continue
-        batch = [first]
-        lengths = [_reservation_length(first.row)]
-        # A request the prefix cache acts on runs alone: a restored prefix
-        # cannot share a left-padded batch.
-        alone = prefix is not None and prefix.acts_on(first.row)
-        while len(batch) < state.max_batch and not alone:
-            try:
-                extra = state.jobs.get_nowait()
-            except queue.Empty:
-                break
-            if extra is None:
-                state.jobs.put(None)
-                break
-            if extra.cancelled:
+        job, self.joining = self.joining, None
+        self.running.append(job)
+        self._give(job, first)
+        self._publish()
+
+    def tell(self, message: str) -> None:
+        """Every request the engine holds or has queued ends with ``message``."""
+        held = [self.state.held] if self.state.held is not None else []
+        for job in [*self.running, *([self.joining] if self.joining else []), *held]:
+            if not job.finished:
+                job.finished = True
+                job.push(("error", message))
+
+
+def _ticks(
+    engine: _Engine,
+    group,
+    max_batch: int,
+    wake: _Wake,
+    scheduler: _Scheduler | None = None,
+) -> None:
+    """The tick loop every rank runs; only rank 0 passes its ``scheduler``.
+
+    Every branch below depends only on what every rank holds (the rows, the
+    joining row, the collectives' words), so the forwards and collectives
+    pair across ranks.
+    """
+    deciding = scheduler is not None
+    pending = True
+    while True:
+        if pending:
+            plan = None
+            if engine.idle:
+                if deciding:
+                    plan = scheduler.plan(block=True)
+                    wake.ring()
+                elif not wake.wait():
+                    return
+            elif deciding:
+                plan = scheduler.plan(block=False)
+            plan = _broadcast_plan(group, plan, max_batch, deciding=deciding)
+            if plan is None:
+                return
+            engine.apply(plan)
+            if deciding:
+                scheduler.applied(plan)
+            pending = engine.idle
+            if pending:
                 continue
-            candidate = [*lengths, _reservation_length(extra.row)]
-            if (state.kv is not None and not state.kv.fits(candidate)) or (
-                prefix is not None and prefix.acts_on(extra.row)
-            ):
-                # First come, first served: the request that does not fit
-                # beside this batch (by KV, or because the prefix cache acts
-                # on it) heads the next one, and nothing behind it jumps the
-                # line.
-                state.held = extra
-                break
-            batch.append(extra)
-            lengths = candidate
-        evict = (
-            prefix.admit([job.row for job in batch], lengths)
-            if prefix is not None
-            else []
-        )
-        state.active = batch
-        state.reserved = state.kv.reserve(lengths) if state.kv is not None else []
-        wake.ring()
-        _broadcast_batch(group, [job.row for job in batch], state.max_batch, evict)
-        _run_jobs(stage, guard, state, batch, prefill_step, store, evict)
-        state.active = []
-        state.reserved = []
+        chunk = engine.joining is not None
+        if engine.rows:
+            words = scheduler.decode_words() if deciding else None
+            began = time.perf_counter()
+            tokens, words = engine.decode(words)
+            if deciding:
+                scheduler.decoded(tokens, time.perf_counter() - began)
+            pending, chunk = bool(words[0]), chunk and bool(words[1])
+        if chunk:
+            words = scheduler.chunk_words(engine.last_chunk) if deciding else None
+            began = time.perf_counter()
+            first, words = engine.prefill(words)
+            if deciding:
+                scheduler.chunked(first, time.perf_counter() - began)
+            pending = bool(words[0])
+        pending = pending or engine.idle
+
+
+def _rank0_loop(state: _State, engine: _Engine, group, wake: _Wake) -> None:
+    scheduler = _Scheduler(state, engine)
+    try:
+        _ticks(engine, group, state.max_batch, wake, scheduler)
+    except pipe.PipelineMemoryStopError as stop:
+        scheduler.tell(f"memory guard stopped the pipeline: {stop}")
+        raise
+    scheduler.tell("the pipeline engine is shutting down")
 
 
 def _rank0_host() -> str:
@@ -1384,24 +1728,6 @@ class _Wake:
         return self.link.recv(1) == b"\x01"
 
 
-def _worker_loop(
-    stage,
-    guard,
-    max_batch: int,
-    prefill_step: int,
-    wake: _Wake,
-    store: _PrefixStore | None = None,
-) -> None:
-    while True:
-        if not wake.wait():
-            return
-        batch = _broadcast_batch(stage.group, None, max_batch)
-        if batch is None:
-            return
-        rows, evict = batch
-        run_batch(stage, guard, rows, prefill_step, store=store, evict=evict)
-
-
 def serve(options, emit=None) -> int:
     """Run one rank of the server (``mlx.distributed.init`` already reachable)."""
     emit = emit or (
@@ -1427,13 +1753,12 @@ def serve(options, emit=None) -> int:
         log=lambda line: print(line, flush=True),
     )
     emit("RANK_CAPS", {**stage.limits, "planned": plan.stages[stage.rank].total_bytes})
-    # Kernel compilation and first-touch paging happen here, before anything
-    # is advertised: a readiness probe that succeeds means a request can run.
-    warm = [_Row(ids=[0] * 8, max_tokens=2, temperature=0.0, top_p=1.0)]
-    run_batch(stage, guard, warm, prefill_step)
+    store = None if options.no_prefix_cache else _PrefixStore()
+    engine = _Engine(stage, guard, prefill_step, store)
+    # A readiness probe that succeeds means a request can run.
+    _warm(engine)
     wake = _Wake(group)
     context = options.context or plan.context
-    store = None if options.no_prefix_cache else _PrefixStore()
     if not stage.is_first:
         emit(
             "READY",
@@ -1443,7 +1768,7 @@ def serve(options, emit=None) -> int:
                 "layers": [stage.start, stage.end],
             },
         )
-        _worker_loop(stage, guard, options.max_batch, prefill_step, wake, store)
+        _ticks(engine, group, options.max_batch, wake)
         return 0
 
     from mlx_lm.utils import load_tokenizer
@@ -1508,7 +1833,7 @@ def serve(options, emit=None) -> int:
         },
     )
     try:
-        _rank0_loop(stage, guard, state, prefill_step, wake, store)
+        _rank0_loop(state, engine, group, wake)
     finally:
         server.should_exit = True
     return 0

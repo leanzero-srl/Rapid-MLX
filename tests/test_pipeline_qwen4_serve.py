@@ -233,8 +233,8 @@ def test_queued_requests_are_batched_and_a_disconnect_cancels(server):
     ]
     for thread in pair:
         thread.start()
-    while server.get("/v1/status")["num_waiting"] < 2:
-        time.sleep(0.05)
+    # Q-134: "a" joins the running batch at once (a slot is free); "b" waits
+    # for the next free slot instead of for the whole batch to end.
     for thread in [long_request, *pair]:
         thread.join()
     steps = server.get("/goose/progress")["steps"] - before
@@ -261,6 +261,34 @@ def test_queued_requests_are_batched_and_a_disconnect_cancels(server):
     answer = json.load(server.post(_chat("w8", max_tokens=4)))
     assert answer["usage"]["completion_tokens"] >= 1
     assert server.get("/goose/progress")["steps"] - start < 400
+
+
+def test_a_request_joins_a_running_generation_on_both_ranks(server):
+    """Q-134 across two ranks: a short request is answered while a long one decodes.
+
+    Before Q-134 a batch formed only when the previous one ended, so the
+    short request waited for every token of the long one.
+    """
+    finished: dict[str, float] = {}
+    results: dict[str, dict] = {}
+
+    def run(key: str, body: dict) -> None:
+        results[key] = json.load(server.post(body))
+        finished[key] = time.monotonic()
+
+    long_request = threading.Thread(
+        target=run, args=("long", _chat("w3", max_tokens=160))
+    )
+    long_request.start()
+    while server.get("/v1/status")["num_running"] == 0:
+        time.sleep(0.02)
+    started = server.get("/goose/progress")["steps"]
+    run("short", _chat("w40 w41 w42", max_tokens=4))
+    during = server.get("/goose/progress")["steps"] - started
+    long_request.join()
+    assert results["short"]["usage"]["completion_tokens"] >= 1
+    assert finished["short"] < finished["long"]
+    assert during < results["long"]["usage"]["completion_tokens"]
 
 
 def test_image_parts_are_refused_by_name(server):
@@ -408,21 +436,21 @@ def test_prefix_index_restores_only_an_exact_prefix_that_leaves_a_token_to_feed(
 
     index = _PrefixIndex(_FakeKv([1000, 1000]))
     cold = _row(list(range(20)), boundary=12)
-    assert index.admit([cold], [24]) == []
+    assert index.admit(cold, [24]) == []
     assert (cold.reuse_id, cold.cached, cold.store_at) == (0, 0, 12)
     _store(index, cold)
 
     warm = _row([*range(12), 99, 98, 97], boundary=13)
-    index.admit([warm], [19])
+    index.admit(warm, [19])
     assert (warm.reuse_id, warm.cached) == (cold.store_id, 12)
     assert warm.store_at == 13  # the longer boundary is a new entry
 
     other = _row([7, *range(1, 20)], boundary=12)
-    index.admit([other], [24])
+    index.admit(other, [24])
     assert (other.reuse_id, other.cached) == (0, 0)  # the first token differs
 
     exact = _row(list(range(12)))
-    index.admit([exact], [16])
+    index.admit(exact, [16])
     # The prompt IS the entry: nothing would be left to feed, so no restore.
     assert exact.cached == 0
     assert index.status()["hits"] == 1
@@ -433,21 +461,22 @@ def test_prefix_index_yields_its_bytes_to_the_batch_oldest_first_hits_refresh():
 
     index = _PrefixIndex(_FakeKv([200, 200]))
     first = _row([1] * 30, boundary=20)
-    index.admit([first], [30])
+    index.admit(first, [30])
     _store(index, first)  # held [20, 40]
     second = _row([2] * 30, boundary=20)
-    index.admit([second], [30])
+    index.admit(second, [30])
     _store(index, second)  # held [40, 80]
 
     hit = _row([1] * 25)
-    assert index.admit([hit], [25]) == []
+    assert index.admit(hit, [25]) == []
     assert hit.reuse_id == first.store_id  # `first` is now the most recent
 
-    # A batch reserving 150 leaves room 50 on each rank; rank 1 holds 80, so
-    # the least recently used entry (`second`) goes, and only it.
-    batch = [_row([3] * 10), _row([4] * 10)]
-    assert index.admit(batch, [75, 75]) == [second.store_id]
-    assert all(row.store_id == 0 and row.reuse_id == 0 for row in batch)
+    # A row joining one running row reserves 150 between them, leaving room 50
+    # on each rank; rank 1 holds 80, so the least recently used entry
+    # (`second`) goes, and only it.
+    joiner = _row([3] * 10)
+    assert index.admit(joiner, [75, 75]) == [second.store_id]
+    assert joiner.store_id == 0 and joiner.reuse_id == 0
     assert index.status()["bytes"] == [20, 40]
     assert index.status()["evicted"] == 1
 
@@ -457,7 +486,7 @@ def test_prefix_index_never_snapshots_what_cannot_fit_beside_the_batch():
 
     index = _PrefixIndex(_FakeKv([100, 100]))
     big = _row([5] * 60, boundary=40)  # rank 1 would need 80 beside the batch's 60
-    assert index.admit([big], [60]) == []
+    assert index.admit(big, [60]) == []
     assert (big.store_id, big.store_at) == (0, 0)
     assert index.status()["skipped"] == {"no_room_beside_the_batch": 1}
 
