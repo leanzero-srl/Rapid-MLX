@@ -149,9 +149,9 @@ def test_a_stream_of_short_requests_cannot_starve_a_long_prefill(stage, group):
 
     ahead = firsts.names.index("long")
     assert len(offered) < offer_bound, "the long prompt waited out the whole stream"
-    # Protected once the tokens prefilled for others reach its own tokens left
-    # (<= 162 - 16 after its first chunk): at most that many 12-token requests
-    # go ahead of it, and every later one waits.
+    # A 12-token request goes ahead only while it takes at most half the
+    # long prompt's slack (162 less what went ahead): at most 12 of them,
+    # and every later one waits.
     assert 1 <= ahead <= -(-(len(LONGER) - PREFILL_STEP) // len(SHORT))
     assert len(offered) > ahead
     assert long_job.tokens() == _solo(stage, LONGER, 2)
@@ -210,21 +210,24 @@ def test_the_26c_arrival_pattern_prefills_the_canary_between_two_chunks():
     assert plan.joiner is others[0].row
 
 
-def test_a_protected_prefill_is_not_jumped():
-    """Aging: once a row has waited its own prefill, a later short request waits for it."""
+def test_a_prefill_whose_slack_is_spent_is_not_jumped():
+    """A later request goes ahead only while it fits in the earlier one's slack."""
     state = serve._State(served="t", context=100_000, max_batch=4)
     scheduler = serve._Scheduler(state, serve._Engine(None, None, 100))
     long_job = _job([1] * 1_000, 4)
     state.jobs.put(long_job)
     _apply(scheduler, scheduler.plan(block=True))
     _chunk(scheduler)  # 900 left
-    long_job.waited = 899
+    assert (
+        long_job.waited == 0 and long_job.prefill == 1_000
+    )  # its own chunk is no wait
+    long_job.waited = 980
     state.jobs.put(_job([2] * 10, 4))
-    assert scheduler.wants_plan(chunk=False)  # not yet protected: 899 < 900
-    long_job.waited = 900
+    assert scheduler.wants_plan(chunk=False)  # 10 is half of 1,000 - 980
+    long_job.waited = 981
     assert not scheduler.wants_plan(chunk=False)
     assert scheduler.plan(block=False).joiner is None
-    # A protected queued request goes before a shorter later one.
+    # A queued request whose slack is spent goes before a shorter later one.
     waiting = _job([3] * 500, 4)
     later = _job([4] * 20, 4)
     scheduler2 = serve._Scheduler(
@@ -235,8 +238,268 @@ def test_a_protected_prefill_is_not_jumped():
         scheduler2.state.jobs.put(job)
     scheduler2._collect(block=False)
     assert scheduler2._head() is later
-    waiting.waited = 500
+    waiting.waited = 461  # 20 is more than half of 500 - 461
     assert scheduler2._head() is waiting
+
+
+def test_only_later_arrivals_age_a_request():
+    """An earlier arrival's chunk is the order a request had anyway; a later one's is a jump."""
+    state = serve._State(served="t", context=100_000, max_batch=4)
+    scheduler = serve._Scheduler(state, serve._Engine(None, None, 100))
+    first, second, third = _job([1] * 300, 4), _job([2] * 400, 4), _job([3] * 50, 4)
+    for job in (first, second):
+        state.jobs.put(job)
+    _apply(scheduler, scheduler.plan(block=True))
+    assert scheduler.prefilling == [first]
+    _chunk(scheduler)
+    assert second.waited == 0  # first arrived before it
+    state.jobs.put(third)
+    _apply(scheduler, scheduler.plan(block=False))
+    assert scheduler.prefilling == [first, third]
+    assert _chunk(scheduler) == 5  # third's one chunk: it joined
+    assert (first.waited, second.waited, third.waited) == (50, 50, 0)
+
+
+class _Drive:
+    """Rank 0's tick loop over the scheduler alone, the engine's rows faked and
+    time taken from the rates goose's load runs measured on the Flash split.
+
+    It mirrors ``_ticks``: a plan when the previous collective announced one,
+    a decode step while rows run, the target's chunk when the prefill share
+    allows.  Requests arrive at their times (seen by the next collective's
+    words, as on the live loop) and a finished load worker sends its next
+    prompt at once, as goose's load.py does.
+    """
+
+    PREFILL_STEP = 2048
+    PREFILL_TOKENS_PER_S = 333.0  # 26d: 39k-token prompts' first tokens 117.55 s apart
+    DECODE_S = 0.123  # 26d: a load row's 37 tokens took 4.55 s after its first
+    EOS = 2
+
+    def __init__(self, context=131_072, max_batch=2):
+        self.state = serve._State(served="flash", context=context, max_batch=max_batch)
+        self.state.kv = _FakeKv(context)
+        self.state.eos_ids = frozenset({self.EOS})
+        self.engine = serve._Engine(None, None, self.PREFILL_STEP)
+        self.scheduler = serve._Scheduler(self.state, self.engine)
+        self.now = 0.0
+        self.chunk_ran = (-1.0, -1.0)
+        self.chunks = 0
+        self.prefilled = 0
+        self.arrivals: list = []
+        self.log: list[dict] = []
+        self.outputs: dict[int, int] = {}
+
+    def at(self, when: float, name: str, prompt: int, output: int, then=None):
+        """``name`` arrives at ``when``: ``prompt`` tokens, ``output`` generated
+        (an EOS ends it; ``output`` 1 = max_tokens 1, the canary), ``then``
+        (``[(prompt, output), ...]``) its worker's next prompts."""
+        self.arrivals.append((when, len(self.arrivals), name, prompt, output, then))
+
+    def _arrive(self) -> None:
+        self.arrivals.sort(key=lambda a: a[:2])
+        while self.arrivals and self.arrivals[0][0] <= self.now:
+            when, _, name, prompt, output, then = self.arrivals.pop(0)
+            # Queued while the last chunk ran: that chunk is part of its wait.
+            during = self.chunk_ran[0] <= when < self.chunk_ran[1]
+            context = self.state.context
+            max_tokens = 1 if output == 1 else context - prompt - 1
+            job = _Collected(serve._Row([1] * prompt, max_tokens, 0.0, 1.0), None, None)
+            record = {
+                "name": name,
+                "prompt": prompt,
+                "arrived": when,
+                "chunks_at": self.chunks - during,
+                "prefilled_at": self.prefilled,
+                "first": None,
+                "done": None,
+            }
+            self.log.append(record)
+            self.outputs[id(job)] = output
+
+            def push(item, record=record, then=then, name=name):
+                if item[0] == "token" and record["first"] is None:
+                    record["first"] = self.now
+                    record["chunk_steps"] = self.chunks - record["chunks_at"]
+                    record["tokens_before"] = self.prefilled - record["prefilled_at"]
+                if item[0] == "done":
+                    record["done"] = self.now
+                    if then:
+                        (prompt, output), *rest = then
+                        self.at(self.now, name, prompt, output, rest)
+
+            job.push = push
+            self.state.jobs.put(job)
+
+    def _idle(self) -> bool:
+        return not self.scheduler.running and not self.engine.prefilling
+
+    def run(self, until) -> None:
+        scheduler, engine = self.scheduler, self.engine
+        pending = True
+        while not until(self):
+            self._arrive()
+            if pending:
+                if (
+                    self._idle()
+                    and not self.state.jobs.qsize()
+                    and not self.state.waiting
+                ):
+                    assert self.arrivals, "nothing left to arrive and nothing running"
+                    self.now = min(a[0] for a in self.arrivals)
+                    continue
+                _apply(scheduler, scheduler.plan(block=False))
+                pending = self._idle()
+                if pending:
+                    continue
+            chunk = bool(engine.prefilling)
+            if scheduler.running:
+                words = scheduler.decode_words()
+                self.now += self.DECODE_S
+                tokens = [
+                    self.EOS if job.produced + 1 >= self.outputs[id(job)] else 1
+                    for job in scheduler.running
+                ]
+                scheduler.decoded(tokens, self.DECODE_S)
+                pending, chunk = bool(words[0]), chunk and bool(words[1])
+            if chunk:
+                words = scheduler.chunk_words()
+                start, stop = engine.prefilling[engine.target].ranges[0]
+                seconds = (stop - start) / self.PREFILL_TOKENS_PER_S
+                self.chunk_ran = (self.now, self.now + seconds)
+                self.now += seconds
+                self.chunks += 1
+                self.prefilled += stop - start
+                _chunk(scheduler, seconds)
+                pending = bool(words[0])
+            pending = pending or self._idle()
+
+    def first(self, name: str, nth: int = 0) -> dict | None:
+        rows = [r for r in self.log if r["name"] == name]
+        return rows[nth] if nth < len(rows) else None
+
+    def answered(self, name: str, nth: int = 0) -> bool:
+        row = self.first(name, nth)
+        return row is not None and row["first"] is not None
+
+
+def test_the_26d_steady_load_admits_every_canary_between_two_chunks():
+    """LOAD-2026-09-26d replayed: three load workers x ~39k-token prompts and a
+    1-token canary at +0 / +63.3 / +124.8 / +538.2 s.
+
+    Live on fork 419306f70 the canaries' first tokens came after 3.32 / 1.48 /
+    353.41 / 297.16 s: once the workers' second prompts queued, every long
+    request had 'waited' through the earlier long prefills it was behind
+    anyway, was protected before it started, and nothing could jump it —
+    /v1/status during canary 3 read prefill 20,224/39,016, waiting [27,
+    39,259, 38,849] beside a free slot.  Counting only jumpers' tokens, each
+    canary is seen at the next chunk boundary and prefilled in one chunk.
+    """
+    drive = _Drive()
+    # Prompt sizes: 26c's three (the same load.py prompts), then the three
+    # /v1/status read during canary 3; outputs from 26d's requests.csv.
+    workers = {
+        "w1": [(39_263, 37), (39_016, 37), (39_263, 44)],
+        "w2": [(38_880, 37), (39_259, 52), (38_880, 44)],
+        "w0": [(39_015, 39), (38_849, 31), (39_015, 44)],
+    }
+    for name, prompts in workers.items():
+        (prompt, output), *rest = prompts
+        drive.at(0.0, name, prompt, output, rest)
+    for index, when in enumerate((0.0, 63.3, 124.8, 538.2)):
+        drive.at(when, f"canary{index + 1}", 27, 1)
+
+    drive.run(
+        until=lambda d: (
+            all(d.answered(f"canary{i}") for i in (1, 2, 3, 4))
+            and all(d.answered(name, 1) for name in workers)
+        )
+    )
+
+    canaries = [drive.first(f"canary{i}") for i in (1, 2, 3, 4)]
+    waits = [round(c["first"] - c["arrived"], 1) for c in canaries]
+    steps = [c["chunk_steps"] for c in canaries]
+    # A canary queued mid-chunk waits out that chunk, is seen by the next
+    # chunk's words, and prefills in one chunk of its own: at most three
+    # chunk-steps, <= ~18.5 s at the measured ~6.2 s per 2,048-token chunk.
+    # This replay: 0.1 / 10.7 / 4.2 / 11.3 s (1 / 3 / 1 / 3 steps).  On
+    # 419306f70 the same replay gives canaries 3 and 4 236.9 / 311.3 s (40 /
+    # 52 steps); live they took 353.41 / 297.16 s.
+    assert all(step <= 3 for step in steps), (steps, waits)
+    chunk_s = drive.PREFILL_STEP / drive.PREFILL_TOKENS_PER_S
+    assert all(wait <= 3 * chunk_s for wait in waits), waits
+    # The long prompts still flow: every worker's first two prompts answered
+    # (the run stops there), in first-come order — each barely shorter than
+    # another, so none takes half an earlier one's slack.
+    longs = sorted(
+        (r["first"], r["arrived"])
+        for r in drive.log
+        if not r["name"].startswith("canary") and r["first"]
+    )
+    assert len(longs) == 6
+    assert [arrived for _, arrived in longs] == sorted(arrived for _, arrived in longs)
+
+
+def _endless_stream(drive: _Drive, long_prompt: int, short_prompt: int) -> dict:
+    """The long prompt at 0, then a short one every quarter chunk — far more
+    than are served — until the long prompt's first token."""
+    drive.at(0.0, "long", long_prompt, 2)
+    chunk_s = drive.PREFILL_STEP / drive.PREFILL_TOKENS_PER_S
+    for index in range(4 * long_prompt // short_prompt):
+        drive.at(0.5 + index * chunk_s / 4, f"short{index}", short_prompt, 1)
+    drive.run(until=lambda d: d.answered("long"))
+    return drive.first("long")
+
+
+def test_an_endless_stream_of_short_requests_stretches_a_long_prefill_at_most_twofold(
+    monkeypatch,
+):
+    """Short requests arriving faster than they are served: the long prompt's
+    first token still comes within twice its solo prefill (in prefill tokens,
+    what a compute-bound prefill's time is), after the stream took all the
+    slack it may."""
+    long_prompt, short_prompt = 39_016, 1_024
+    drive = _Drive(max_batch=8)
+    long_row = _endless_stream(drive, long_prompt, short_prompt)
+    answered = [r for r in drive.log if r["name"] != "long" and r["first"] is not None]
+    assert long_row["tokens_before"] == long_prompt + len(answered) * short_prompt
+    assert long_row["tokens_before"] <= 2 * long_prompt
+    # The stream jumped it until the slack left was under twice a short one ...
+    assert long_prompt - len(answered) * short_prompt < 2 * short_prompt
+    # ... and the shorts still queued then waited for it.
+    assert any(r["first"] is None for r in drive.log if r["name"] != "long")
+
+    # Negative control: with no slack bound the same stream holds the long
+    # prompt until the harness stops offering (every short goes first).
+    monkeypatch.setattr(
+        serve._Scheduler, "_slack", staticmethod(lambda *_, **__: 1 << 60)
+    )
+    control = _endless_stream(_Drive(max_batch=8), long_prompt, short_prompt)
+    assert control["tokens_before"] > 2 * long_prompt
+
+
+def test_a_long_prompt_jumps_an_earlier_one_only_with_half_its_slack():
+    """A later long prompt one percent shorter keeps first-come order (it
+    would spend the earlier one's whole slack and hold every canary behind
+    it); one under half the earlier one's prefill goes first; both leave
+    the earlier one within twice its own prefill after the running row."""
+    for later_prompt, later_first in ((38_849, False), (12_000, True)):
+        drive = _Drive(max_batch=2)
+        drive.at(0.0, "running", 30_000, 2)
+        drive.at(1.0, "earlier", 39_259, 2)
+        drive.at(2.0, "later", later_prompt, 2)
+        drive.at(3.0, "canary", 27, 1)
+        drive.run(until=lambda d: d.answered("earlier") and d.answered("later"))
+
+        earlier, later, canary = (
+            drive.first(n) for n in ("earlier", "later", "canary")
+        )
+        assert (later["first"] < earlier["first"]) is later_first, later_prompt
+        assert canary["chunk_steps"] <= 3
+        # From the earlier one's arrival: the running prompt's rest (earlier
+        # arrivals are no jump), then jumpers, then its own prefill.
+        running_rest = 30_000 - drive.PREFILL_STEP
+        assert earlier["tokens_before"] <= running_rest + 2 * 39_259
 
 
 def test_a_worker_rank_replays_interleaved_prefills_and_an_abort(

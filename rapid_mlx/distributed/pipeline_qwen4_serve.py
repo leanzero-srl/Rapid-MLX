@@ -51,20 +51,27 @@ with the fewest prompt tokens left (ties: the earlier admitted), a rule
 over state every rank holds identically (the rows the plans admitted, the
 ranges their chunks have consumed), so no extra word crosses the ranks.
 Rank 0 alone decides admission: of the queued requests it picks the one
-first in ``_Scheduler._order`` and admits it only when it would be that
+first in ``_Scheduler._head`` and admits it only when it would be that
 rule's pick — fewer tokens left than every prefilling row — so a short
 request (goose's title, fact checker, compaction) is prefilled between two
 chunks of a long one and joins the running batch the moment its last chunk
-samples.  Aging, in prefill tokens (the pipeline's own prefill rate
-cancels, so no clock): a request is PROTECTED once the tokens prefilled for
-others while it waited reach the tokens it still has to prefill — its own
-expected prefill time; a protected request goes before every later arrival
-and, while one is prefilling, nothing new is admitted ahead of it, so no
-stream of short requests stretches a long one past about twice its own
-prefill.  Before Q-145 one request prefilled at a time, first come first
-served: on the Flash split three ~39k-token prompts and a 13-token canary
-arriving together got their first tokens at 115 / 232 / 347 s, the canary
-last.
+samples.  The starvation bound, in prefill tokens (the pipeline's own
+prefill rate cancels, so no clock), limits the delay JUMPERS cause: a
+request's ``waited`` counts only the tokens of LATER arrivals prefilled
+ahead of it.  Its SLACK is its own prefill less that count and less what
+the later rows already admitted will still prefill ahead of it, and a
+later arrival may go ahead of it only by taking at most half the slack it
+finds.  So no stream of later requests stretches a request past twice its
+own prefill, a long prompt barely shorter than an earlier one keeps
+first-come order instead of spending that one's whole slack, and a short
+request is held back only when an earlier one's slack is down to twice
+its size.  The queueing a request would have had first come first
+served never ages it — counting that too (fork 419306f70) protected every
+long request before it started under goose Q-145 26d's steady load, and
+canaries 3 and 4 waited 353 s and 297 s behind FIFO prefills.  Before
+Q-145 one request prefilled at a time, first come first served: on the
+Flash split three ~39k-token prompts and a 13-token canary arriving
+together got their first tokens at 115 / 232 / 347 s, the canary last.
 
 Prefix cache (Q-75): every rank snapshots ITS OWN layers' caches at a stable
 prompt boundary and restores them for a later prompt that starts with the same
@@ -918,9 +925,12 @@ class _Job:
     produced: int = 0
     # Rank 0's arrival order (set when the scheduler takes the job off the queue).
     seq: int = 0
-    # Prompt tokens prefilled for OTHER requests since this one arrived: its
-    # wait in the pipeline's own prefill time (``_Scheduler._protected``).
+    # Prompt tokens of LATER arrivals prefilled ahead of this one: the delay
+    # the shortest-first order cost it, in the pipeline's own prefill time
+    # (``_Scheduler._slack``).  Never the tokens of earlier arrivals.
     waited: int = 0
+    # Prompt tokens it had to prefill when admitted (after its prefix restore).
+    prefill: int = 0
 
     def push(self, item) -> None:
         self.loop.call_soon_threadsafe(self.events.put_nowait, item)
@@ -1792,14 +1802,15 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
 class _Scheduler:
     """Rank 0's decisions: which rows leave, which queued request is admitted, when chunks run.
 
-    Admission is by slots and memory, in ``_order`` (Q-145): the queued
+    Admission is by slots and memory, in ``_head``'s order (Q-145): the queued
     request first in that order is admitted when a row slot is free (running
     and prefilling rows share ``max_batch``), ``_KvBudget`` fits every row the
     batch would hold on every rank, and — while other rows are prefilling —
-    no prefilling row is protected and the request has fewer prompt tokens
-    left than every one of them, so it is exactly the row ``_shortest`` runs
-    next on every rank.  A request that cannot be admitted waits at the head
-    of the order and nothing behind it jumps it.  Chunks are spaced by
+    the request has fewer prompt tokens left than every one of them, so it
+    is exactly the row ``_shortest`` runs next on every rank.  The order
+    only lets a request go ahead of an earlier one while it takes at most
+    half that one's ``_slack``.  A request that cannot be admitted waits at
+    the head of the order and nothing behind it jumps it.  Chunks are spaced by
     ``_PREFILL_SHARE`` of the measured pipeline time.
     """
 
@@ -1864,20 +1875,59 @@ class _Scheduler:
         return memo[1]
 
     @staticmethod
-    def _protected(job: _Job, left: int) -> bool:
-        """Waited, in prefill spent on others, as long as its own prefill will take."""
-        return job.waited >= left
+    def _slack(
+        job: _Job, left: int, prefilling: list[tuple[_Job, int]], queued: bool
+    ) -> int:
+        """Prompt tokens later arrivals may still prefill ahead of ``job``.
 
-    def _order(self, job: _Job) -> tuple[int, int, int]:
-        """Protected requests first, oldest first; then the fewest tokens left."""
-        left = self._queued_left(job)
-        if self._protected(job, left):
-            return (0, job.seq, 0)
-        return (1, left, job.seq)
+        Its own prefill (``left`` while it is queued; while it prefills, what
+        it had to prefill when admitted), less what later arrivals already
+        prefilled ahead of it (``waited``) and what the ones already admitted
+        will still prefill ahead of it: every one of them while ``job`` is
+        queued, the ones with fewer tokens left than its ``left`` while it
+        is prefilling itself.  Spent in full, the jumpers doubled its prefill.
+        """
+        ahead = sum(
+            other_left
+            for other, other_left in prefilling
+            if other.seq > job.seq and (queued or other_left < left)
+        )
+        own = left if queued else job.prefill
+        return own - job.waited - ahead
 
-    def _head(self) -> _Job | None:
+    def _head(self, prefilling: list[tuple[_Job, int]] | None = None) -> _Job | None:
+        """The queued request admitted next: fewest tokens left, then the oldest.
+
+        A request goes ahead of an earlier arrival (queued, or prefilling in
+        ``prefilling`` as (job, tokens left)) only when it takes at most HALF
+        of that one's ``_slack``: a jump never leaves less slack than it took,
+        so the next short request still finds room — a later long prompt one
+        percent shorter never spends a long one's whole slack and blocks
+        every canary behind it (goose Q-145, the 26d replay) — and a stream
+        of jumpers stops before the slack runs out, so none stretches a
+        request past twice its own prefill.  The oldest queued request is
+        never held by a queued one, so while nothing prefills a head exists.
+        """
         waiting = [job for job in self.state.waiting if not job.cancelled]
-        return min(waiting, key=self._order) if waiting else None
+        if not waiting:
+            return None
+        if prefilling is None:
+            prefilling = self._prefilling_lefts()
+        lefts = {job.id: self._queued_left(job) for job in waiting}
+        earlier = [
+            (job, self._slack(job, lefts[job.id], prefilling, queued=True))
+            for job in waiting
+        ] + [
+            (job, self._slack(job, left, prefilling, queued=False))
+            for job, left in prefilling
+        ]
+        for job in sorted(waiting, key=lambda job: (lefts[job.id], job.seq)):
+            left = lefts[job.id]
+            if all(
+                2 * left <= slack for other, slack in earlier if other.seq < job.seq
+            ):
+                return job
+        return None
 
     def _take(self, job: _Job) -> None:
         self.state.waiting = [other for other in self.state.waiting if other is not job]
@@ -1900,16 +1950,15 @@ class _Scheduler:
         self, running: list[_Job], prefilling: list[tuple[_Job, int]]
     ) -> _Job | None:
         """The head, if it is admitted beside ``running`` and ``prefilling`` (job, tokens left)."""
-        head = self._head()
+        head = self._head(prefilling)
         if head is None or not self._fits(
             head, [*running, *(job for job, _ in prefilling)]
         ):
             return None
-        if prefilling:
-            if any(self._protected(job, left) for job, left in prefilling):
-                return None
-            if self._queued_left(head) >= min(left for _, left in prefilling):
-                return None
+        if prefilling and self._queued_left(head) >= min(
+            left for _, left in prefilling
+        ):
+            return None
         return head
 
     def _prefilling_lefts(self) -> list[tuple[_Job, int]]:
@@ -1978,7 +2027,7 @@ class _Scheduler:
                         ],
                     )
                 break
-            head = self._head()
+            head = self._head(prefilling)
             if head is None or survivors or prefilling:
                 break
             # Alone it still does not fit: the plan cannot hold it at all
@@ -2015,6 +2064,9 @@ class _Scheduler:
         if plan.joiner is not None:
             if not self.prefilling:
                 self.credit = 0.0
+            # The engine applied the plan first: its last prefilling row is
+            # the joiner, its ranges whole (after the prefix restore).
+            self.admitted.prefill = self.engine.prefilling[-1].left
             self.prefilling.append(self.admitted)
             self.admitted = None
         self._publish()
@@ -2063,8 +2115,13 @@ class _Scheduler:
         """Prefilling row ``index`` ran a chunk of ``tokens`` tokens (``first``: it joined)."""
         self.credit -= seconds
         job = self.prefilling[index]
+        # A JUMP: a later arrival's tokens went ahead of every earlier request
+        # still waiting for its own.  An earlier arrival's chunk is the order
+        # a later request would have had anyway, so it ages nothing (goose
+        # Q-145 26d: counting it too made every long request protected before
+        # it started, and the canaries queued FIFO again).
         for other in [*self.state.waiting, *self.prefilling]:
-            if other is not job:
+            if other.seq < job.seq:
                 other.waited += tokens
         if first is None:
             return
