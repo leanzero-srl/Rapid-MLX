@@ -199,7 +199,54 @@ class _FakeKv:
         return all(n <= b for n, b in zip(self.reserve(lengths), self.budgets))
 
 
-def test_the_1439_queue_admits_the_first_long_prompt_beside_the_running_row():
+def _start_fake(engine: serve._Engine, row: serve._Row) -> None:
+    """What ``_Engine._start`` leaves behind, without a stage: the scheduler reads the ranges only."""
+    engine.prefilling.append(
+        serve._Joining(
+            row,
+            None,
+            None,
+            None,
+            None,
+            serve.prefill_chunks(
+                row.cached,
+                len(row.ids),
+                engine.prefill_step,
+                row.store_at if row.store_id else 0,
+            ),
+        )
+    )
+
+
+def _apply(scheduler: serve._Scheduler, plan: serve._Plan) -> None:
+    """``_ticks``' plan step on rank 0, the engine's rows faked (no forwards)."""
+    engine = scheduler.engine
+    if plan.abort:
+        engine.prefilling = [
+            joining
+            for index, joining in enumerate(engine.prefilling)
+            if index not in plan.abort
+        ]
+    if plan.joiner is not None:
+        _start_fake(engine, plan.joiner)
+    scheduler.applied(plan)
+
+
+def _chunk(scheduler: serve._Scheduler, seconds: float = 0.0) -> int | None:
+    """``_ticks``' chunk step on rank 0: the target's next chunk; its first token if it joined."""
+    engine = scheduler.engine
+    target = engine.target
+    joining = engine.prefilling[target]
+    start, stop = joining.ranges.pop(0)
+    first = None
+    if not joining.ranges:
+        engine.prefilling = [row for row in engine.prefilling if row is not joining]
+        first = 5
+    scheduler.chunked(target, stop - start, first, seconds)
+    return first
+
+
+def test_the_1439_queue_admits_the_canary_first_beside_the_running_row():
     """The 14:39 status walked through the scheduler (no engine work)."""
     context = 131_072
     state = serve._State(served="flash", context=context, max_batch=2)
@@ -215,30 +262,34 @@ def test_the_1439_queue_admits_the_first_long_prompt_beside_the_running_row():
     canary = default_request(69)
     for job in [*waiting, canary]:
         state.jobs.put(job)
-    scheduler = serve._Scheduler(state, serve._Engine(None, None, PREFILL_STEP))
+    scheduler = serve._Scheduler(state, serve._Engine(None, None, 2048))
     scheduler.running = [running]
     scheduler._publish()
     assert state.reserved == [3_732_993_040, 4_860_343_296]  # "kv_reserved" at 14:39
 
     # A slot is free and two full-context reservations fit: the next decode
-    # step's collective announces a plan, and the plan admits the oldest.
-    assert scheduler.wants_plan(joined=False)
+    # step's collective announces a plan, and the plan admits the request
+    # with the fewest prompt tokens left — the canary (Q-145), not the oldest.
+    assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
-    assert plan.joiner is waiting[0].row and plan.leave == []
-    scheduler.applied(plan)
+    assert plan.joiner is canary.row and plan.leave == []
+    _apply(scheduler, plan)
     assert state.reserved == _FakeKv.budgets
 
-    # While it prefills, nothing else is admitted; once it joins both slots
-    # are held, so the rest wait first come, first served — the canary too.
-    assert not scheduler.wants_plan(joined=False)
-    assert not scheduler.wants_plan(joined=True)
-    scheduler.chunked(first=5, seconds=0.0)
-    assert scheduler.running == [running, waiting[0]]
+    # Both slots are held (the running row and the prefilling canary), so
+    # nothing else is admitted; the canary's one chunk samples its first
+    # token and it joins the running batch at once.
+    assert not scheduler.wants_plan(chunk=False)
+    assert not scheduler.wants_plan(chunk=True)
+    assert _chunk(scheduler) == 5
+    assert scheduler.running == [running, canary]
+    assert canary.produced == 1
     running.finished = True
-    assert scheduler.wants_plan(joined=False)
+    assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
-    assert plan.leave == [0] and plan.joiner is waiting[1].row
-    assert state.held is None and state.jobs.qsize() == 2
+    # The long three are ordered by prompt tokens left: 39,132 first.
+    assert plan.leave == [0] and plan.joiner is waiting[2].row
+    assert state.waiting == [waiting[0], waiting[1]] and state.jobs.qsize() == 0
 
 
 def test_a_request_that_does_not_fit_waits_at_the_head_until_a_row_leaves():
@@ -250,30 +301,32 @@ def test_a_request_that_does_not_fit_waits_at_the_head_until_a_row_leaves():
     state.jobs.put(short)
     scheduler = serve._Scheduler(state, serve._Engine(None, None, PREFILL_STEP))
     scheduler.running = list(running)
-    assert not scheduler.wants_plan(joined=False)
-    assert state.held is short  # held at the head, never dropped
+    assert not scheduler.wants_plan(chunk=False)
+    assert state.waiting == [short]  # held at the head, never dropped
     running[1].cancelled = True
-    assert scheduler.wants_plan(joined=False)
+    assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
     assert plan.leave == [1] and plan.joiner is short.row
 
 
 def test_the_prefill_share_spaces_chunks_by_measured_time():
-    scheduler = serve._Scheduler(_state(), serve._Engine(None, None, PREFILL_STEP))
+    scheduler = serve._Scheduler(_state(), serve._Engine(None, None, 2))
     scheduler.running = [_job(SHORT, 99)]
-    scheduler.joining = _job(LONG, 9)
+    prefilling = _job(LONG, 9)
+    scheduler.prefilling = [prefilling]
+    _start_fake(scheduler.engine, prefilling.row)
     scheduler.credit = 0.0
     # The first chunk runs at once: a short request is answered after one step.
     assert scheduler.decode_words() == [0, 1]
     scheduler.decoded([1], seconds=0.25)
-    scheduler.chunked(None, seconds=1.0)  # a chunk took four decode steps
+    _chunk(scheduler, seconds=1.0)  # a chunk took four decode steps
     runs = []
     for _ in range(8):
         words = scheduler.decode_words()
         runs.append(words[1])
         scheduler.decoded([1], seconds=0.25)
         if words[1]:
-            scheduler.chunked(None, seconds=1.0)
+            _chunk(scheduler, seconds=1.0)
     # Equal shares: a 1 s chunk runs with every four 0.25 s decode steps
     # (credit -0.75 -> -0.5 -> -0.25 -> 0.0, then the chunk rides the step).
     assert runs == [0, 0, 0, 1, 0, 0, 0, 1]
