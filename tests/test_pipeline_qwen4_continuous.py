@@ -287,9 +287,10 @@ def test_the_1439_queue_admits_the_canary_first_beside_the_running_row():
     running.finished = True
     assert scheduler.wants_plan(chunk=False)
     plan = scheduler.plan(block=False)
-    # The long three are ordered by prompt tokens left: 39,132 first.
-    assert plan.leave == [0] and plan.joiner is waiting[2].row
-    assert state.waiting == [waiting[0], waiting[1]] and state.jobs.qsize() == 0
+    # The long three keep first-come order: 39,132 would take more than half
+    # the oldest one's slack (39,194 less the canary's 69).
+    assert plan.leave == [0] and plan.joiner is waiting[0].row
+    assert state.waiting == [waiting[1], waiting[2]] and state.jobs.qsize() == 0
 
 
 def test_a_request_that_does_not_fit_waits_at_the_head_until_a_row_leaves():
