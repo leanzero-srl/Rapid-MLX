@@ -8754,6 +8754,11 @@ class Scheduler:
         if "host" not in done and prompt_batch is not None:
             if len(getattr(prompt_batch, "uids", ()) or ()) == 1:
                 single = demote_single_row(prompt_batch.prompt_cache)
+                logger.info(
+                    "[dbg-demote] host types=%s -> %s",
+                    sorted({type(c).__name__ for c in prompt_batch.prompt_cache}),
+                    None if single is None else sorted({type(c).__name__ for c in single}),
+                )
                 if single is not None:
                     prompt_batch.prompt_cache = single
                 done.add("host")
@@ -8765,6 +8770,11 @@ class Scheduler:
             and getattr(bg, "_mtp_vendored_admission_owner", None) is None
         ):
             single = demote_single_row(generation.prompt_cache)
+            logger.info(
+                "[dbg-demote] guest types=%s -> %s",
+                sorted({type(c).__name__ for c in generation.prompt_cache}),
+                None if single is None else sorted({type(c).__name__ for c in single}),
+            )
             if single is not None:
                 generation.prompt_cache = single
             done.add("guest")
