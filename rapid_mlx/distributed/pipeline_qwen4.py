@@ -683,24 +683,38 @@ def wire_bytes_per_token(args: TextModelArgs, act: int, ranks: int) -> dict[str,
 # ---------------------------------------------------------------------------
 
 
-def apply_memory_guardrails(node: NodeMemory, planned_bytes: int) -> dict[str, int]:
+def apply_memory_guardrails(
+    node: NodeMemory, planned_bytes: int, attention_scores_bytes: int = 0
+) -> dict[str, int]:
     """Bound MLX on this rank at this GPU's own working-set ceiling.
 
     ``set_memory_limit`` is a guideline in MLX 0.32 (the allocator waits and
     reclaims cache first), so the hard stop is :class:`MemoryGuard`; the wired
     limit is Metal's recommended working set — never more — which is what
     prevents the exo-style wired-memory panic.
+
+    The buffer cache holds what the measured budget leaves beside the plan:
+    ``budget − planned − attention_scores_bytes``, where the last term is the
+    prefill's dense attention scores this planner's workspace model leaves out
+    and the requester charged beside it (goose: ``PipelineAttention::scores_bytes``
+    at ``--prefill-step``; 0 when the requester charged none).  Freed buffers
+    stay resident until the cache limit, so a limit of the GPU ceiling less the
+    plan let the cache grow past the budget: goose Q-127, rank 0 of the Flash
+    split, cache 0 → 49.5 GB beside ~60 GB active against a 81.4 GB budget, the
+    kernel at WARN and one request refused.
     """
     budget = node.budget_bytes
-    if planned_bytes > budget:
+    charged = planned_bytes + attention_scores_bytes
+    if charged > budget:
         raise PipelineDoesNotFitError(
-            f"this rank plans {_gib(planned_bytes)} against a budget of "
+            f"this rank plans {_gib(planned_bytes)} + attention scores "
+            f"{_gib(attention_scores_bytes)} against a budget of "
             f"{_gib(budget)} = min(available {_gib(node.available_bytes)} − RAM × "
             f"{AVAILABLE_MARGIN_RATIO:.2f}, GPU ceiling {_gib(node.ceiling_bytes)})"
         )
     memory_limit = node.ceiling_bytes
     wired_limit = node.ceiling_bytes
-    cache_limit = max(0, memory_limit - planned_bytes)
+    cache_limit = budget - charged
     mx.set_memory_limit(memory_limit)
     mx.set_wired_limit(wired_limit)
     mx.set_cache_limit(cache_limit)
@@ -709,6 +723,7 @@ def apply_memory_guardrails(node: NodeMemory, planned_bytes: int) -> dict[str, i
         "wired_limit": wired_limit,
         "cache_limit": cache_limit,
         "budget": budget,
+        "attention_scores": attention_scores_bytes,
     }
 
 
@@ -1199,6 +1214,7 @@ def load_stage(
     starts: list[int] | None = None,
     layer_limit: int | None = None,
     vision: bool = True,
+    attention_scores_bytes: int = 0,
     log=print,
 ) -> tuple[PipelineStage, PipelinePlan, MemoryGuard]:
     from mlx_lm.utils import load_model
@@ -1232,7 +1248,9 @@ def load_stage(
         log(format_plan(plan))
     require_fit(plan)
     stage_plan = plan.stages[rank]
-    limits = apply_memory_guardrails(node, stage_plan.total_bytes)
+    limits = apply_memory_guardrails(
+        node, stage_plan.total_bytes, attention_scores_bytes
+    )
     log(f"[pipeline] rank {rank} guardrails " + json.dumps(limits))
 
     _register_vendored_archs()

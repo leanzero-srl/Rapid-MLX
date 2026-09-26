@@ -385,12 +385,47 @@ def test_guardrails_sit_at_this_gpus_ceiling(monkeypatch):
     ceiling = 83_494_174_720
     node = pipe.NodeMemory(total, total // 2, 50, 1, ceiling)
     limits = pipe.apply_memory_guardrails(node, 10 * 2**30)
+    budget = total // 2 - int(total * pipe.AVAILABLE_MARGIN_RATIO)
     assert calls["memory"] == ceiling
     assert calls["wired"] == ceiling
-    assert calls["cache"] == ceiling - 10 * 2**30
-    assert limits["budget"] == total // 2 - int(total * pipe.AVAILABLE_MARGIN_RATIO)
+    assert calls["cache"] == budget - 10 * 2**30
+    assert limits["budget"] == budget
     with pytest.raises(pipe.PipelineDoesNotFitError, match="GPU ceiling"):
         pipe.apply_memory_guardrails(node, total)
+
+
+def test_the_buffer_cache_holds_the_budget_less_the_plan_and_its_scores(monkeypatch):
+    """goose Q-127 (2026-09-26): rank 0 of the Flash split on the 128 GB MacBook.
+
+    Its own log: guardrails {"memory_limit": 115448725504, "cache_limit":
+    50613078792, "budget": 81404943664}, planned 64835646712 — the cache limit
+    was the GPU ceiling less the plan, and the cache grew 0 → 49.5 GB beside
+    ~60 GB active (active + cache ~110 GB against the 81.4 GB budget) until the
+    kernel reported WARN.  goose charged the rank's prefill attention scores
+    at its 256-token chunk beside the plan: 2 slots × 24 heads × 2 B × 256 ×
+    262,144 = 6,442,450,944 B.
+    """
+    calls = {}
+    monkeypatch.setattr(mx, "set_memory_limit", lambda v: calls.setdefault("memory", v))
+    monkeypatch.setattr(mx, "set_wired_limit", lambda v: calls.setdefault("wired", v))
+    monkeypatch.setattr(mx, "set_cache_limit", lambda v: calls.setdefault("cache", v))
+    total = 128 * 2**30
+    ceiling = 115_448_725_504
+    budget = 81_404_943_664
+    available = budget + int(total * pipe.AVAILABLE_MARGIN_RATIO)
+    node = pipe.NodeMemory(total, available, 60, 1, ceiling)
+    assert node.budget_bytes == budget
+    planned = 64_835_646_712
+    scores = 2 * 24 * 2 * 256 * 262_144
+    limits = pipe.apply_memory_guardrails(node, planned, scores)
+    assert calls["cache"] == limits["cache_limit"] == 10_126_846_008
+    assert limits["attention_scores"] == scores
+    assert planned + scores + limits["cache_limit"] == budget
+    assert ceiling - planned == 50_613_078_792
+    # The plan alone (no scores charged) leaves the cache the rest of the budget.
+    assert pipe.apply_memory_guardrails(node, planned)["cache_limit"] == 16_569_296_952
+    with pytest.raises(pipe.PipelineDoesNotFitError, match="attention scores"):
+        pipe.apply_memory_guardrails(node, planned, budget - planned + 1)
 
 
 def test_the_budget_is_the_gpu_ceiling_or_available_less_the_margin():
