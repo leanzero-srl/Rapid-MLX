@@ -1380,6 +1380,7 @@ def serve(options, emit=None) -> int:
         prefill_step=prefill_step,
         starts=pipe._parse_starts(options.split),
         vision=not options.no_vision,
+        attention_scores_bytes=options.attention_scores_bytes,
         log=lambda line: print(line, flush=True),
     )
     emit("RANK_CAPS", {**stage.limits, "planned": plan.stages[stage.rank].total_bytes})
@@ -1487,6 +1488,14 @@ def add_arguments(parser) -> None:
         help="most rows one batch may carry; the KV budget decides how many do",
     )
     parser.add_argument("--prefill-step", type=int)
+    parser.add_argument(
+        "--attention-scores-bytes",
+        type=int,
+        default=0,
+        help="this rank's prefill attention scores at --prefill-step that the "
+        "planner's workspace model leaves out, as the requester charged them; "
+        "the MLX buffer cache holds the budget less the plan less these",
+    )
     parser.add_argument(
         "--split", help="pinned starts for ranks 1..N-1 (the preflighted plan)"
     )
