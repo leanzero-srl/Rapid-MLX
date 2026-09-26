@@ -10050,6 +10050,11 @@ class Scheduler:
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
                     self._apply_prefill_guest()
+                    _guest_step = (
+                        (self._prefill_guest_rid, time.perf_counter())
+                        if self._prefill_guest_rid is not None
+                        else None
+                    )
                     if self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
                         if st is None:
@@ -10082,6 +10087,22 @@ class Scheduler:
                             st[0], st[1] = [], []
                     else:
                         raw_next = self.batch_generator.next()
+                    if _guest_step is not None:
+                        logger.info(
+                            "[prefill_guest] step guest=%s chunk=%s cbs=%s owner=%s "
+                            "next=%.3fs",
+                            _guest_step[0][:12],
+                            getattr(self.batch_generator, "prefill_step_size", None),
+                            getattr(
+                                self.batch_generator, "completion_batch_size", None
+                            ),
+                            getattr(
+                                self.batch_generator,
+                                "_mtp_vendored_admission_owner",
+                                None,
+                            ),
+                            time.perf_counter() - _guest_step[1],
+                        )
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires
                     # off the live chain DEPTH (steps since the last barrier),
