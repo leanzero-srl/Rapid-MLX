@@ -3699,6 +3699,19 @@ class StreamingPostProcessor:
             return [StreamEvent(type="content", content=content)]
         return []
 
+    def refused_tool_calls(self) -> list[dict[str, str]]:
+        """Calls the tool parser refused for an undeclared name (goose Q-133).
+
+        Their text went out as content; this is how a caller learns the
+        content was a tool call, not an answer. Read after ``finalize``.
+        Only ``tool_accumulated_text`` is scanned — the content the tool
+        parser saw — never reasoning, where a scratch call is not a call.
+        """
+        scan = getattr(self.tool_parser, "refused_tool_calls", None)
+        if not callable(scan) or not self.tool_accumulated_text:
+            return []
+        return scan(self.tool_accumulated_text, request=self.request)
+
     def finalize(self) -> list[StreamEvent]:
         """Finalize stream — flush remaining tool calls, emit corrections.
 
