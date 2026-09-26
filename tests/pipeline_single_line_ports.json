@@ -1,0 +1,81 @@
+{
+  "_what": "Every single-engine commit (tags v*-lz.*) this pipeline line does not contain by ancestry, reviewed: ported (the pipeline commits that carry it), equivalent (the pipeline already did it its own way) or n/a (the code path does not exist in the pipeline server). tests/test_pipeline_single_line_ports_audit.py fails on any commit missing here. goose Q-144: this line branched at v0.14.3-lz.2 and silently missed lz.6 until Q-143.",
+  "upstream_base": "v0.14.3",
+  "reviewed_through": "v0.14.3-lz.9",
+  "commits": {
+    "999d43ea656bd2f2dfd7834bf4e3dca7e2ad5a14": {
+      "tag": "v0.14.3-lz.3",
+      "fixes": "quantized live KV (--kv-cache-dtype int8|int4) on GatedDeltaNet hybrids",
+      "status": "n/a",
+      "reason": "scheduler.py / quantized_batch_cache.py admission and cache construction of the single engine; the pipeline server has no --kv-cache-dtype, builds its caches with stage.make_cache() and plans unquantized KV, and goose passes it no KV flag (launch.rs pipeline argv)"
+    },
+    "ce15b39ff86987ca70913c200d49804545f68d3e": {
+      "tag": "v0.14.3-lz.4",
+      "fixes": "a logprobs request on an MTP engine aborted the process (lazy logprob rows evaluated off the step thread)",
+      "status": "n/a",
+      "reason": "the pipeline has no MTP path and returns no logprobs; the only values leaving its step thread are Python ints from the step's collective (_step: payload.tolist())"
+    },
+    "d1b58f6edd97ccbac084ef9f7f2bcbe204e24cbe": {
+      "tag": "v0.14.3-lz.5",
+      "fixes": "an unset max_tokens was filled with the serve default 32768 (goose Q-69)",
+      "status": "equivalent",
+      "pipeline": ["5675768ea4e5c8816fc9233295b78f59d81cf9eb"],
+      "reason": "the pipeline chat handler never had a default: max_tokens = min(requested, budget) if requested else budget, budget = the planned context less the counted prompt"
+    },
+    "8a15af57591611b6f6a592605d9aba097dfa4878": {
+      "tag": "v0.14.3-lz.6",
+      "fixes": "the transient tail may end the last tool message (goose Q-94)",
+      "status": "ported",
+      "pipeline": [
+        "43d248c47eba11f405789aaa9263480ad946d042",
+        "09f645526621f3b1aca5f09c431e31f490d82d24"
+      ],
+      "reason": "goose Q-143: cherry-picked, and /v1/models declares rapid_mlx_transient_tail_on_tool"
+    },
+    "c4f11b7a62fc8d9df673bf41e5b4533e954f27be": {
+      "tag": "v0.14.3-lz.7",
+      "fixes": "the XML tool-call skeleton guard (goose Q-85)",
+      "status": "ported",
+      "pipeline": [
+        "1d1e5b5b1e0da69b964aa98f837712345448c47a",
+        "32a865ed88abdd0c82d47c119ce2a64acc94eeec"
+      ],
+      "reason": "goose Q-144: cherry-picked; the last rank (the one that samples) runs it on rows whose plan says tools"
+    },
+    "d159b1141807f8f68c184d8065488ff5e553eca0": {
+      "tag": "v0.14.3-lz.7",
+      "fixes": "the XML close guard starts at the close marker itself (goose Q-85)",
+      "status": "ported",
+      "pipeline": ["b564a527371188bf115b3c9f3ffac2adb4ea29d1"],
+      "reason": "goose Q-144: cherry-picked"
+    },
+    "da83e3c208df0188a379c84b64079181e1acb195": {
+      "tag": "v0.14.3-lz.7",
+      "fixes": "the XML close guard arms through mlx-lm's TokenizerWrapper (goose Q-85)",
+      "status": "ported",
+      "pipeline": ["5db4853298fb97afa54f82f0e0c415d9710fd6e6"],
+      "reason": "goose Q-144: cherry-picked; the pipeline's last rank loads its tokenizer with mlx_lm.utils.load_tokenizer, i.e. that wrapper"
+    },
+    "eb9ed506d329a8f73a7e3d1fe0079983ab78219c": {
+      "tag": "v0.14.3-lz.7",
+      "fixes": "the XML close guard holds the function close too, and never forces a call (goose Q-85)",
+      "status": "ported",
+      "pipeline": ["c090b56e8a549adcfe105ddc076a1cf310ef2bf5"],
+      "reason": "goose Q-144: cherry-picked"
+    },
+    "5fc8b99317a38b5e694d88c275f90ccbb0585fe1": {
+      "tag": "v0.14.3-lz.8",
+      "fixes": "a prefix-cache entry owns exactly the bytes it is charged for (goose Q-110)",
+      "status": "ported",
+      "pipeline": ["32a865ed88abdd0c82d47c119ce2a64acc94eeec"],
+      "reason": "goose Q-144: adapted, not cherry-picked — the single engine's memory_cache/hybrid_state_checkpoints are not on the pipeline path; the pipeline's own _PrefixStore.put held the QSA index cache's raw-ring view (1.346x charged at 512-token chunks, CPU) and now owns its arrays (1.025x)"
+    },
+    "5a5a76598339dec1c215228be05dd86313cab94f": {
+      "tag": "v0.14.3-lz.9",
+      "fixes": "serve answers to every name of its model — --served-model-alias (goose Q-131)",
+      "status": "equivalent",
+      "pipeline": ["a863c60c5db1ae69b6fee22311e205d940daf6b9"],
+      "reason": "the pipeline server's own --served-model-alias landed the same day for the same finding"
+    }
+  }
+}
