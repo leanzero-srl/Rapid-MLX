@@ -58,7 +58,16 @@ budget — at every admission it is trimmed to that budget minus the batch's
 own reservation, the new snapshot pre-charged — so it never holds memory the
 plan did not.  The cache acts on a request while it prefills in its own
 cache, before it joins the batch, so a restored prefix never shares a
-padded prefill.
+padded prefill.  A snapshot owns exactly the bytes it is charged for
+(``_own_bytes``, the single engine's lz.8 / goose Q-110): a stored view would
+keep its whole source buffer alive beside the budget.
+
+Tool calls (the single engine's lz.7, goose Q-85): the last rank — the one
+that samples — holds a tool request's decode to the XML tool-call skeleton
+(``xml_tool_close_guard``) at the positions where the template admits no free
+text, so ``</parameter>`` residue never becomes an argument's payload.  The
+plan carries whether a row declared tools; the guard reads the row's prompt and
+the tokens every rank learns from the step's collective.
 """
 
 from __future__ import annotations
@@ -135,6 +144,14 @@ class _Row:
     # Rank 0 only: the stable-prefix boundary the HTTP side computed (0 = the
     # request asks the cache for nothing: images, or no boundary).
     boundary: int = 0
+    # Identical on every rank (the plan carries it): the request declared
+    # tools, so the rank that samples holds its decode to the XML tool-call
+    # skeleton (``xml_tool_close_guard``, the single engine's lz.7, goose Q-85).
+    tools: bool = False
+    # The sampling rank only: that guard and the token history it reads
+    # (the prompt, then every sampled token).
+    close_guard: Any = None
+    history: Any = None
 
 
 @dataclass
@@ -161,7 +178,16 @@ def _all_sum(group, value: mx.array) -> mx.array:
 # The plan header after [cmd, abort, one leave flag per slot]: the joiner's
 # fields (length 0 = no joiner), then the eviction count.
 _PLAN_TAIL = len(
-    ("length", "max_tokens", "reuse_id", "cached", "store_id", "store_at", "evictions")
+    (
+        "length",
+        "max_tokens",
+        "reuse_id",
+        "cached",
+        "store_id",
+        "store_at",
+        "tools",
+        "evictions",
+    )
 )
 
 
@@ -185,15 +211,16 @@ def _broadcast_plan(
                 header[2 + index] = 1
             row = plan.joiner
             if row is not None:
-                header[tail : tail + 6] = [
+                header[tail : tail + 7] = [
                     len(row.ids),
                     row.max_tokens,
                     row.reuse_id,
                     row.cached,
                     row.store_id,
                     row.store_at,
+                    int(row.tools),
                 ]
-            header[tail + 6] = len(plan.evict)
+            header[tail + 7] = len(plan.evict)
     header = _all_sum(group, mx.array(header, dtype=mx.int32)).tolist()
     if header[0] == _CMD_SHUTDOWN:
         return None
@@ -222,7 +249,8 @@ def _broadcast_plan(
             joiner.reuse_id, joiner.cached, joiner.store_id, joiner.store_at = header[
                 tail + 2 : tail + 6
             ]
-    evictions = header[tail + 6]
+            joiner.tools = bool(header[tail + 6])
+    evictions = header[tail + 7]
     evict = []
     if evictions:
         dropped = list(plan.evict) if deciding else [0] * evictions
@@ -241,6 +269,8 @@ def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
     picked = []
     for index, row in enumerate(rows):
         line = logits[index : index + 1].astype(mx.float32)
+        if row.close_guard is not None:
+            line = row.close_guard(row.history, line)
         if row.temperature <= 0:
             picked.append(mx.argmax(line, axis=-1))
         else:
@@ -248,6 +278,12 @@ def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
             sampler = make_sampler(temp=row.temperature, top_p=row.top_p)
             picked.append(sampler(logprobs))
     return mx.concatenate(picked).astype(mx.int32)
+
+
+def _extend_history(row: _Row, token: int) -> None:
+    """A guarded row's history gains the token every rank just learned."""
+    if row.close_guard is not None:
+        row.history = mx.concatenate([row.history, mx.array([token], dtype=mx.int32)])
 
 
 def _step(
@@ -314,6 +350,55 @@ def _held_bytes(value, seen: set[int] | None = None) -> int:
     return 0
 
 
+def _own_bytes(value, owned: dict[int, Any] | None = None, arrays=None):
+    """``value`` with every MLX array it holds replaced, in place, by one that
+    owns exactly its bytes — evaluated now, so the buffers it viewed are free.
+
+    The single engine's lz.8 (goose Q-110) on this store's own layers: an
+    array that is a VIEW keeps its whole source buffer alive while
+    ``_held_bytes`` (shape x dtype) charges the view.  Measured here, CPU,
+    the tiny qwen4_exp, 512-token prefill chunks: a full-attention layer's
+    ``QSAIndexCache`` raw ring (``raw_keys[:, a:b, :]``) freed 458,752 bytes
+    against 66,048 charged, so an entry held 1.35x what the plan budgeted.
+    The walk is ``_held_bytes``'s own, so what is owned is what is charged;
+    an array reached twice is copied once.
+    """
+    top = owned is None
+    # id -> (the original, what replaces it); the original is kept so its id
+    # cannot be reused by a copy made later in the same walk.
+    owned = {} if owned is None else owned
+    arrays = [] if arrays is None else arrays
+    if id(value) in owned:
+        return owned[id(value)][1]
+    if isinstance(value, mx.array):
+        result = mx.contiguous(value)
+        arrays.append(result)
+        owned[id(value)] = (value, result)
+    else:
+        owned[id(value)] = (value, value)
+        if isinstance(value, list):
+            value[:] = [_own_bytes(item, owned, arrays) for item in value]
+            result = value
+        elif isinstance(value, tuple):
+            items = [_own_bytes(item, owned, arrays) for item in value]
+            result = type(value)(*items) if hasattr(value, "_fields") else tuple(items)
+            owned[id(value)] = (value, result)
+        elif isinstance(value, dict):
+            for key in list(value):
+                value[key] = _own_bytes(value[key], owned, arrays)
+            result = value
+        elif hasattr(value, "__dict__"):
+            fields = vars(value)
+            for key in list(fields):
+                fields[key] = _own_bytes(fields[key], owned, arrays)
+            result = value
+        else:
+            result = value
+    if top and arrays:
+        mx.eval(arrays)
+    return result
+
+
 class _PrefixStore:
     """One rank's prefix snapshots, by the id rank 0 assigned.  Decides nothing."""
 
@@ -332,7 +417,7 @@ class _PrefixStore:
         return copy.deepcopy(self.entries[entry_id])
 
     def put(self, entry_id: int, cache: list[Any]) -> int:
-        self.entries[entry_id] = copy.deepcopy(cache)
+        self.entries[entry_id] = _own_bytes(copy.deepcopy(cache))
         return _held_bytes(self.entries[entry_id])
 
     def drop(self, entry_ids: list[int]) -> None:
@@ -400,13 +485,24 @@ class _Engine:
     plan holds is rank 0's decision alone (``_Scheduler``).
     """
 
-    def __init__(self, stage, guard, prefill_step: int, store=None, on_stored=None):
+    def __init__(
+        self,
+        stage,
+        guard,
+        prefill_step: int,
+        store=None,
+        on_stored=None,
+        close_guard=None,
+    ):
         self.stage = stage
         self.guard = guard
         self.prefill_step = prefill_step
         self.store = store
         # Rank 0: ``on_stored(row, bytes_per_rank)`` once every rank holds a snapshot.
         self.on_stored = on_stored
+        # The sampling rank: the XML skeleton rules (``XmlCloseGuardSpec``) a
+        # tool row decodes under; None elsewhere or for another wire.
+        self.close_guard = close_guard
         self.rows: list[_Row] = []
         self.cache: list[Any] | None = None
         self.current: list[int] = []
@@ -458,6 +554,13 @@ class _Engine:
             cache, start = self.store.take(row.reuse_id), row.cached
         else:
             cache, start = self.stage.make_cache(), 0
+        if self.close_guard is not None and row.tools:
+            from ..xml_tool_close_guard import XmlToolCloseGuard
+
+            row.close_guard = XmlToolCloseGuard(self.close_guard)
+            # The whole prompt: whether a call or a <think> is open is read
+            # from the last opener, which may be in the generation prompt.
+            row.history = mx.array(row.ids, dtype=mx.int32)
         self.joining = _Joining(
             row=row,
             cache=cache,
@@ -484,6 +587,8 @@ class _Engine:
             self.stage, out, self.cache, self.rows, self.guard, words, sample=True
         )
         self.current = sampled
+        for row, token in zip(self.rows, sampled):
+            _extend_history(row, token)
         return sampled, control
 
     def prefill(self, words: list[int] | None) -> tuple[int | None, list[int]]:
@@ -522,6 +627,7 @@ class _Engine:
                 self.on_stored(row, measured)
         if not last:
             return None, control
+        _extend_history(row, sampled[0])
         self._regroup(list(range(len(self.rows))), joining, sampled[0])
         return sampled[0], control
 
@@ -1185,7 +1291,15 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         stops = [stops] if isinstance(stops, str) else list(stops)
         loop = asyncio.get_running_loop()
         job = _Job(
-            _Row(ids, max_tokens, temperature, top_p, images, boundary=boundary),
+            _Row(
+                ids,
+                max_tokens,
+                temperature,
+                top_p,
+                images,
+                boundary=boundary,
+                tools=bool(tools),
+            ),
             loop,
             asyncio.Queue(),
         )
@@ -1739,6 +1853,39 @@ class _Wake:
         return self.link.recv(1) == b"\x01"
 
 
+def _xml_close_guard_spec(model_dir: Path, rank: int, log):
+    """The sampling rank's XML tool-call skeleton rules, or None — said either way.
+
+    The single engine's lz.7 (goose Q-85), derived from this checkpoint's own
+    tokenizer and template exactly as ``Scheduler._xml_tool_close_guard`` does,
+    with the same opt-out variable.  Only the last rank samples, so only it
+    loads the tokenizer for this.
+    """
+    from ..xml_tool_close_guard import OPT_OUT_ENV, xml_close_guard_spec
+
+    opt_out = os.environ.get(OPT_OUT_ENV, "").strip().lower()
+    if opt_out in ("0", "off", "false", "no"):
+        log(
+            f"[pipeline] rank {rank}: xml tool-call skeleton guard disabled by "
+            f"{OPT_OUT_ENV}={opt_out}"
+        )
+        return None
+    from mlx_lm.utils import load_tokenizer
+
+    tokenizer = load_tokenizer(model_dir)
+    spec = xml_close_guard_spec(tokenizer, tokenizer.eos_token_ids)
+    log(
+        f"[pipeline] rank {rank}: xml tool-call skeleton guard "
+        + (
+            f"armed ({len(spec.rules)} rules)"
+            if spec is not None
+            else "not armed: this checkpoint's wire is not the parameterised XML "
+            "tool call (or its markers are not single tokens)"
+        )
+    )
+    return spec
+
+
 def serve(options, emit=None) -> int:
     """Run one rank of the server (``mlx.distributed.init`` already reachable)."""
     emit = emit or (
@@ -1765,7 +1912,14 @@ def serve(options, emit=None) -> int:
     )
     emit("RANK_CAPS", {**stage.limits, "planned": plan.stages[stage.rank].total_bytes})
     store = None if options.no_prefix_cache else _PrefixStore()
-    engine = _Engine(stage, guard, prefill_step, store)
+    close_guard = (
+        _xml_close_guard_spec(
+            model_dir, stage.rank, lambda line: print(line, flush=True)
+        )
+        if stage.is_last
+        else None
+    )
+    engine = _Engine(stage, guard, prefill_step, store, close_guard=close_guard)
     # A readiness probe that succeeds means a request can run.
     _warm(engine)
     wake = _Wake(group)
