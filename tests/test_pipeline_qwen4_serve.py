@@ -156,7 +156,14 @@ def server(checkpoint):
 
 
 def _chat(text: str, **extra) -> dict:
-    return {"model": SERVED, "messages": [{"role": "user", "content": text}], **extra}
+    # Greedy, named: these tests compare answers token for token, and a request
+    # that names no temperature samples the checkpoint's own (goose Q-159).
+    return {
+        "model": SERVED,
+        "messages": [{"role": "user", "content": text}],
+        "temperature": 0,
+        **extra,
+    }
 
 
 def test_models_lists_only_the_served_id_with_its_parsers(server):

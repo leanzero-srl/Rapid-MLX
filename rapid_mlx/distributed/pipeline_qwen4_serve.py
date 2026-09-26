@@ -86,6 +86,16 @@ padded prefill.  A snapshot owns exactly the bytes it is charged for
 (``_own_bytes``, the single engine's lz.8 / goose Q-110): a stored view would
 keep its whole source buffer alive beside the budget.
 
+Sampling (goose Q-159): a request's own temperature / top_p / top_k / min_p
+win; a field it leaves out (or sends null) takes the single engine's chain —
+``--default-*`` (the operator's per-model profile), then the checkpoint's
+``generation_config.json``, then the engine fallback (``_SamplingDefaults``).
+The plan carries all four to the sampling rank.  Before Q-159 a request with no
+temperature decoded greedy.  A missing or unreadable ``generation_config.json``
+is named on /v1/status (``sampling_defaults.generation_config_error``) and in
+the log (``GENERATION_CONFIG_UNREAD``); penalties in force are reported
+``applied: false`` — the pipeline's sampler keeps no per-row token history.
+
 Tool calls (the single engine's lz.7, goose Q-85): the last rank — the one
 that samples — holds a tool request's decode to the XML tool-call skeleton
 (``xml_tool_close_guard``) at the positions where the template admits no free
@@ -145,6 +155,142 @@ _THINK_MARKERS = ("enable_thinking", "<think>", "</think>")
 
 
 # ---------------------------------------------------------------------------
+# sampling defaults (goose Q-159)
+# ---------------------------------------------------------------------------
+
+# The sampling fields the single engine resolves through its chain
+# (service/helpers.py ``_resolve_*``), in utils/generation_config.py's order.
+_SAMPLING_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+)
+# What the sampling rank applies (``_sample``).  The penalties need a per-row
+# token history the pipeline's sampler does not keep: one in force is reported
+# ``applied: false`` on /v1/status, never dropped unsaid.
+_APPLIED_KEYS = frozenset(("temperature", "top_p", "top_k", "min_p"))
+
+
+@dataclass
+class _SamplingDefaults:
+    """What a request that names no sampling field samples with — the single
+    engine's chain below the request (service/helpers.py ``_cascade``): the
+    operator's ``--default-*`` flags (goose's per-model profile), then the
+    checkpoint's ``generation_config.json`` (filtered by the single engine's own
+    ``load_generation_config_sampling``), then the engine fallback
+    (``_FALLBACK_TEMPERATURE`` / ``_FALLBACK_TOP_P``; the rest stay off).  The
+    alias catalog's layer never applies here: ``resolve_profile`` matches alias
+    names and HF ids, and the split serves a local checkpoint directory.
+
+    Before goose Q-159 the server read ``body.get("temperature") or 0.0``: every
+    request goose sent (it names no sampling field) decoded GREEDY, where the
+    single engine sampled the checkpoint's own temperature 1.0 / top_k 20 /
+    top_p 0.95 — Qwen's card warns greedy decoding repeats endlessly.  The
+    single engine skips a missing or unreadable ``generation_config.json``
+    silently; here ``error`` names it on /v1/status and in the rank's log.
+    """
+
+    profile: dict = field(default_factory=dict)
+    generation_config: dict = field(default_factory=dict)
+    path: str | None = None
+    error: str | None = "no checkpoint directory was read for generation_config.json"
+    # Sampling keys the file carries that the single engine's filter drops.
+    ignored: list = field(default_factory=list)
+
+    @classmethod
+    def load(cls, model_dir: Path, profile: dict) -> _SamplingDefaults:
+        from ..utils.generation_config import load_generation_config_sampling
+
+        path = Path(model_dir).expanduser() / "generation_config.json"
+        profile = {k: v for k, v in profile.items() if v is not None}
+        try:
+            raw = json.loads(path.read_text())
+        except FileNotFoundError:
+            return cls(profile, {}, str(path), f"{path} is absent", [])
+        except (OSError, ValueError) as exc:
+            return cls(profile, {}, str(path), f"{path} is unreadable: {exc}", [])
+        if not isinstance(raw, dict):
+            return cls(profile, {}, str(path), f"{path} holds no JSON object", [])
+        values = load_generation_config_sampling(str(path.parent))
+        ignored = [
+            f"{key}={raw[key]!r}"
+            for key in _SAMPLING_KEYS
+            if key in raw and key not in values
+        ]
+        return cls(profile, values, str(path), None, ignored)
+
+    @staticmethod
+    def profile_of(options) -> dict:
+        return {key: getattr(options, f"default_{key}", None) for key in _SAMPLING_KEYS}
+
+    def report(self) -> dict[str, Any]:
+        from ..service.helpers import _FALLBACK_TEMPERATURE, _FALLBACK_TOP_P
+
+        return {
+            "profile": dict(self.profile),
+            "generation_config": dict(self.generation_config),
+            "generation_config_path": self.path,
+            "generation_config_error": self.error,
+            "generation_config_ignored": list(self.ignored),
+            "engine_fallback": {
+                "temperature": _FALLBACK_TEMPERATURE,
+                "top_p": _FALLBACK_TOP_P,
+            },
+            "unapplied": sorted(
+                key
+                for key in {*self.profile, *self.generation_config}
+                if key not in _APPLIED_KEYS
+            ),
+        }
+
+    def resolve(self, body: dict) -> dict[str, dict[str, Any]]:
+        """Every sampling field this request runs with and the layer it came
+        from (``request`` / ``profile`` / ``generation_config`` /
+        ``engine_fallback`` / ``unset``).  A request's null is no value, as on
+        the single engine (its pydantic field is None either way).  A value of
+        the wrong type is a ValueError naming the field."""
+        from ..service.helpers import _FALLBACK_TEMPERATURE, _FALLBACK_TOP_P
+
+        fallback = {"temperature": _FALLBACK_TEMPERATURE, "top_p": _FALLBACK_TOP_P}
+        resolved = {}
+        for key in _SAMPLING_KEYS:
+            if body.get(key) is not None:
+                value, source = body[key], "request"
+            elif key in self.profile:
+                value, source = self.profile[key], "profile"
+            elif key in self.generation_config:
+                value, source = self.generation_config[key], "generation_config"
+            elif key in fallback:
+                value, source = fallback[key], "engine_fallback"
+            else:
+                value, source = None, "unset"
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError(
+                        f"{key} must be a finite number, not {value!r} ({source})"
+                    )
+                if key == "top_k":
+                    if value != int(value):
+                        raise ValueError(f"top_k must be a whole number, not {value}")
+                    value = int(value)
+                else:
+                    value = float(value)
+            entry = {"value": value, "from": source}
+            if key not in _APPLIED_KEYS and value is not None:
+                entry["applied"] = False
+            resolved[key] = entry
+        return resolved
+
+
+# ---------------------------------------------------------------------------
 # rank-shared batch execution
 # ---------------------------------------------------------------------------
 
@@ -173,6 +319,13 @@ class _Row:
     # tools, so the rank that samples holds its decode to the XML tool-call
     # skeleton (``xml_tool_close_guard``, the single engine's lz.7, goose Q-85).
     tools: bool = False
+    # Identical on every rank (the plan carries them with temperature and
+    # top_p): mlx-lm's own off values (0 = no top-k, 0.0 = no min-p).
+    top_k: int = 0
+    min_p: float = 0.0
+    # Rank 0 only: every sampling field and the layer it came from
+    # (``_SamplingDefaults.resolve``), for /v1/status.
+    sampling: Any = field(default=None, compare=False, repr=False)
     # The sampling rank only: that guard and the token history it reads
     # (the prompt, then every sampled token).
     close_guard: Any = field(default=None, compare=False, repr=False)
@@ -261,7 +414,14 @@ def _broadcast_plan(
     if length:
         ids = plan.joiner.ids if deciding else [0] * length
         floats = (
-            [plan.joiner.temperature, plan.joiner.top_p] if deciding else [0.0, 0.0]
+            [
+                plan.joiner.temperature,
+                plan.joiner.top_p,
+                plan.joiner.top_k,
+                plan.joiner.min_p,
+            ]
+            if deciding
+            else [0.0] * 4
         )
         ids = _all_sum(group, mx.array(ids, dtype=mx.int32)).tolist()
         floats = _all_sum(group, mx.array(floats, dtype=mx.float32)).tolist()
@@ -273,6 +433,8 @@ def _broadcast_plan(
                 max_tokens=header[tail + 1],
                 temperature=floats[0],
                 top_p=floats[1],
+                top_k=int(round(floats[2])),
+                min_p=floats[3],
             )
             joiner.reuse_id, joiner.cached, joiner.store_id, joiner.store_at = header[
                 tail + 2 : tail + 6
@@ -303,7 +465,9 @@ def _sample(logits: mx.array, rows: list[_Row]) -> mx.array:
             picked.append(mx.argmax(line, axis=-1))
         else:
             logprobs = line - mx.logsumexp(line, axis=-1, keepdims=True)
-            sampler = make_sampler(temp=row.temperature, top_p=row.top_p)
+            sampler = make_sampler(
+                temp=row.temperature, top_p=row.top_p, top_k=row.top_k, min_p=row.min_p
+            )
             picked.append(sampler(logprobs))
     return mx.concatenate(picked).astype(mx.int32)
 
@@ -1001,6 +1165,8 @@ class _State:
     admission_reason: str | None = None
     shutting_down: bool = False
     eos_ids: frozenset = frozenset()
+    # Rank 0's sampling layers under each request's own fields (goose Q-159).
+    sampling: _SamplingDefaults = field(default_factory=_SamplingDefaults)
 
 
 def _template_parsers(tokenizer) -> tuple[str | None, str | None]:
@@ -1256,6 +1422,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             "prefix_cache": state.prefix.status()
             if state.prefix is not None
             else {"enabled": False, "reason": "--no-prefix-cache"},
+            "sampling_defaults": state.sampling.report(),
             "status": "ok",
         }
 
@@ -1313,6 +1480,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             pictures = [_load_image(source) for source in image_sources]
         except Exception as refusal:  # noqa: BLE001 - every cause is the client's input
             return error(400, str(refusal), "invalid_request_error")
+        try:
+            sampling = state.sampling.resolve(body)
+        except ValueError as refusal:
+            return error(400, str(refusal), "invalid_request_error")
         kwargs = dict(body.get("chat_template_kwargs") or {})
         enable_thinking = kwargs.pop("enable_thinking", body.get("enable_thinking"))
         prompt = apply_chat_template(
@@ -1362,8 +1533,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 "context_length_exceeded",
             )
         max_tokens = min(int(requested), budget) if requested else budget
-        temperature = float(body.get("temperature") or 0.0)
-        top_p = float(body.get("top_p") or 1.0)
+        values = {key: entry["value"] for key, entry in sampling.items()}
         stops = body.get("stop") or []
         stops = [stops] if isinstance(stops, str) else list(stops)
         loop = asyncio.get_running_loop()
@@ -1371,11 +1541,14 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             _Row(
                 ids,
                 max_tokens,
-                temperature,
-                top_p,
+                values["temperature"],
+                values["top_p"],
                 images,
                 boundary=boundary,
                 tools=bool(tools),
+                top_k=values["top_k"] or 0,
+                min_p=values["min_p"] or 0.0,
+                sampling=sampling,
             ),
             loop,
             asyncio.Queue(),
@@ -2124,6 +2297,13 @@ def serve(options, emit=None) -> int:
     from mlx_lm.utils import load_tokenizer
 
     tokenizer = load_tokenizer(model_dir)
+    sampling = _SamplingDefaults.load(model_dir, _SamplingDefaults.profile_of(options))
+    emit("SAMPLING_DEFAULTS", sampling.report())
+    if sampling.error is not None:
+        emit(
+            "GENERATION_CONFIG_UNREAD",
+            {"error": sampling.error, "in_force": sampling.report()["engine_fallback"]},
+        )
     kv = _KvBudget(plan, prefill_step)
     state = _State(
         served=options.served_model_name,
@@ -2133,6 +2313,7 @@ def serve(options, emit=None) -> int:
         kv=kv,
         prefix=None if store is None else _PrefixIndex(kv),
         eos_ids=frozenset(tokenizer.eos_token_ids),
+        sampling=sampling,
     )
 
     import uvicorn
@@ -2233,6 +2414,14 @@ def add_arguments(parser) -> None:
         action="store_true",
         help="keep no prefix cache: every request prefills its whole prompt",
     )
+    for key in _SAMPLING_KEYS:
+        parser.add_argument(
+            f"--default-{key.replace('_', '-')}",
+            type=int if key == "top_k" else float,
+            default=None,
+            help=f"{key} for a request that sets none, above the checkpoint's "
+            "generation_config.json (the single engine's flag of the same name)",
+        )
     parser.add_argument(
         "--no-vision",
         action="store_true",
