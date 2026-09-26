@@ -611,13 +611,14 @@ class SchedulerConfig:
 
     # LeanZero Q-103 (fair interleave). A scheduler step that carries prompt
     # work BESIDE other work (a decoding row, a second prompt row, a request
-    # queued for admission) is sized so its wall time stays near this
-    # multiple of the step's own measured overhead (the decode forward, the
-    # prompt forward's fixed cost, the scheduler) instead of a fixed token
-    # count per row: the prompt keeps (ratio - 1) / ratio of every shared
-    # step, and a short request waits a few such steps instead of every long
-    # prompt's whole chunk. A lone prefill keeps ``prefill_step_size``. ``0``
-    # disables the bound. Appended for positional callers.
+    # queued for admission) never prompts more tokens across its rows than one
+    # lone chunk (the attention transient; always on), and lasts this multiple
+    # of its own measured overhead (the decode forward, cache merges, the
+    # prompt forward's fixed cost): the prompt keeps (ratio - 1) / ratio of
+    # every shared step and a short request waits a few such steps instead of
+    # every long prompt's whole chunk. A lone prefill keeps
+    # ``prefill_step_size``. ``0`` turns the time bound off. Appended for
+    # positional callers.
     fair_prefill_step_ratio: float = 16.0
 
     # LeanZero Q-103. The ordinary (non-continuous) vendored MTP verifier is
@@ -3926,7 +3927,6 @@ class Scheduler:
     _fair_forward_s: float | None = None
     _fair_forward_error: str | None = None
     _fair_seconds_per_token: float | None = None
-    _fair_step_overhead_s: float | None = None
     _fair_step_shared = False
     _fair_chunk_size: int | None = None
     _fair_contended_steps = 0
@@ -6285,13 +6285,13 @@ class Scheduler:
         return rows, rows > 0 and (decoding > 0 or rows > 1)
 
     def _measure_forward_seconds(self) -> None:
-        """Measure one warm one-token forward: the least a step can cost.
+        """Measure one warm one-token forward: a forward's fixed cost.
 
-        Taken once, on the step thread, the first time a step is shared. It
-        seeds the shared-step overhead before one has been measured and floors
-        it after (a step pays at least one forward's fixed cost). A failure is
-        kept and reported (``fair_prefill.forward_error``); the bound then
-        stays off rather than guessing a cost.
+        Taken once, on the step thread, at the first prompt step. Prompt time
+        per token is read net of it (see ``_record_fair_prefill_step``), and
+        it is part of every shared step's overhead. A failure is kept and
+        reported (``fair_prefill.forward_error``); the time bound then stays
+        off rather than guessing a cost.
         """
         if self._fair_forward_s is not None or self._fair_forward_error is not None:
             return
@@ -6311,43 +6311,65 @@ class Scheduler:
             self._fair_forward_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
                 "[fair_prefill] forward measurement failed (%s); shared steps "
-                "keep the configured chunk",
+                "keep only the memory bound",
                 self._fair_forward_error,
             )
 
+    def _fair_outside(self) -> deque:
+        """Recent shared steps' seconds outside the prompt call (per instance)."""
+        samples = self.__dict__.get("_fair_outside_prompt_s")
+        if samples is None:
+            # A window, not a bound: the last few joins and leaves.
+            samples = self._fair_outside_prompt_s = deque(maxlen=8)
+        return samples
+
+    def _fair_step_overhead(self) -> float | None:
+        """A shared step's cost that is not its prompt tokens.
+
+        The median of recent shared steps' time outside mlx-lm's prompt call
+        (the decode forward, cache merges when a row joins or leaves, the
+        scheduler) plus the prompt forward's own fixed cost. The median, so a
+        join's one-off cache merge does not size the steps after it.
+        """
+        samples = sorted(self._fair_outside())
+        if self._fair_forward_s is None or not samples:
+            return None
+        return samples[len(samples) // 2] + self._fair_forward_s
+
     def _apply_fair_prefill_size(self) -> int | None:
-        """Bound a SHARED step's prompt chunk as a ratio of its overhead (Q-103).
+        """Bound a SHARED step's prompt chunk (Q-103).
 
         mlx-lm prompts one chunk per row per ``next()``, padded to the longest
         row, and a decoding row or a newly admitted short request waits for the
-        whole step. A shared step's wall time is its overhead (the decode
-        forward, the prompt forward's fixed cost, the scheduler) plus its
-        prompt tokens at the lone-prefill cost per token. The per-row chunk is
-        chosen so the step lasts ``fair_prefill_step_ratio`` times that
-        measured overhead: the prompt keeps ``(ratio - 1) / ratio`` of every
-        shared step, whatever the overhead is, and nothing waits longer than
-        the ratio says. Only ever lowers the size
-        ``_apply_adaptive_prefill_size`` just set.
+        whole step. Two bounds, the tighter wins, and neither ever raises the
+        size ``_apply_adaptive_prefill_size`` just set:
+
+        * memory: the rows together never prompt more tokens than one lone
+          chunk -- a 4-row step of 2048 each is 4x the attention transient a
+          lone prefill has, and it ran the Studio's GPU out of memory;
+        * time: the step lasts ``fair_prefill_step_ratio`` times its measured
+          overhead, so the prompt keeps ``(ratio - 1) / ratio`` of it and a
+          short request waits a few such steps. ``0`` turns this one off; the
+          memory bound always holds.
         """
         self._fair_chunk_size = None
         self._fair_step_shared = False
         ratio = float(getattr(self.config, "fair_prefill_step_ratio", 0) or 0)
         bg = getattr(self, "batch_generator", None)
-        if ratio <= 1 or bg is None:
+        if bg is None:
             return None
         rows, shared = self._fair_prefill_rows()
         if not shared:
             return None
         self._fair_step_shared = True
         self._fair_contended_steps += 1
-        self._measure_forward_seconds()
-        per_token = self._fair_seconds_per_token
-        if self._fair_forward_s is None or per_token is None:
-            return None
-        overhead = max(self._fair_forward_s, self._fair_step_overhead_s or 0.0)
         current = max(1, int(getattr(bg, "prefill_step_size", 1)))
-        chunk = int((ratio - 1) * overhead / (per_token * rows))
-        chunk = max(1, min(current, chunk))
+        chunk = max(1, current // rows)
+        overhead = self._fair_step_overhead()
+        per_token = self._fair_seconds_per_token
+        if ratio > 1 and overhead is not None and per_token:
+            chunk = min(chunk, int((ratio - 1) * overhead / (per_token * rows)))
+        chunk = max(1, chunk)
         if chunk < current:
             bg.prefill_step_size = chunk
             prompt_batch = getattr(bg, "_prompt_batch", None)
@@ -6358,37 +6380,47 @@ class Scheduler:
         return chunk
 
     def _record_fair_prefill_step(
-        self, wall_s: float, tokens_before: int | None, chunk: int
+        self,
+        wall_s: float,
+        tokens_before: int | None,
+        prompt_s_before: float | None,
+        chunk: int,
     ) -> None:
-        """Measure the two costs a shared step is sized from.
+        """Read the two costs a shared step is sized from, off mlx-lm's counters.
 
-        Only unpadded steps count (every prompted row consumed ``chunk``
-        tokens), so tokens are exactly the prompt work done. A LONE step gives
-        the prompt cost per token; a SHARED step gives its overhead, the wall
-        time left once its tokens are paid at that cost, floored at the
-        one-token forward so a stale per-token cost can never talk the
-        overhead -- and with it the chunk -- down toward nothing.
+        mlx-lm times its prompt call (``_prompt_time_counter``) and counts its
+        prompted tokens. An unpadded step (every row consumed ``chunk``) gives
+        the cost per prompt token: prompt time net of one forward's fixed
+        cost, over its tokens -- net, or a small chunk would read as dear
+        tokens and shrink the next chunk again. A shared step gives the time
+        spent outside the prompt call.
         """
         bg = getattr(self, "batch_generator", None)
-        after = getattr(bg, "_prompt_tokens_counter", None)
-        if tokens_before is None or not isinstance(after, int) or wall_s <= 0:
+        tokens_after = getattr(bg, "_prompt_tokens_counter", None)
+        prompt_s_after = getattr(bg, "_prompt_time_counter", None)
+        if (
+            tokens_before is None
+            or prompt_s_before is None
+            or not isinstance(tokens_after, int)
+            or not isinstance(prompt_s_after, (int, float))
+        ):
             return
-        tokens = after - tokens_before
+        tokens = tokens_after - tokens_before
+        prompt_s = prompt_s_after - prompt_s_before
+        if tokens <= 0 or prompt_s <= 0:
+            return
+        self._measure_forward_seconds()
+        if self._fair_step_shared:
+            self._fair_outside().append(max(0.0, wall_s - prompt_s))
         try:
             rows = len(getattr(bg, "_prompt_batch", None) or ())
         except TypeError:
             return
-        if tokens <= 0 or not rows or not chunk or tokens != rows * chunk:
+        if self._fair_forward_s is None or tokens != rows * chunk:
             return
-        if not self._fair_step_shared:
-            if rows == 1:
-                self._fair_seconds_per_token = wall_s / tokens
-            return
-        if self._fair_seconds_per_token is not None:
-            self._fair_step_overhead_s = max(
-                self._fair_forward_s or 0.0,
-                wall_s - self._fair_seconds_per_token * tokens,
-            )
+        net = prompt_s - self._fair_forward_s
+        if net > 0:
+            self._fair_seconds_per_token = net / tokens
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
@@ -10151,6 +10183,9 @@ class Scheduler:
                     _fair_tokens_before = getattr(
                         self.batch_generator, "_prompt_tokens_counter", None
                     )
+                    _fair_prompt_s_before = getattr(
+                        self.batch_generator, "_prompt_time_counter", None
+                    )
                     _fair_started = time.perf_counter()
                     if self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
@@ -10187,6 +10222,7 @@ class Scheduler:
                     self._record_fair_prefill_step(
                         time.perf_counter() - _fair_started,
                         _fair_tokens_before,
+                        _fair_prompt_s_before,
                         _fair_chunk,
                     )
                     # Bound functional recurrent-state graphs without forcing
@@ -10874,7 +10910,7 @@ class Scheduler:
                 "forward_s": getattr(self, "_fair_forward_s", None),
                 "forward_error": getattr(self, "_fair_forward_error", None),
                 "seconds_per_token": getattr(self, "_fair_seconds_per_token", None),
-                "step_overhead_s": getattr(self, "_fair_step_overhead_s", None),
+                "step_overhead_s": self._fair_step_overhead(),
                 "chunk_size": getattr(self, "_fair_chunk_size", None),
                 "shared_steps": getattr(self, "_fair_contended_steps", 0),
                 "bounded_steps": getattr(self, "_fair_bounded_steps", 0),
