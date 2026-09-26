@@ -237,140 +237,116 @@ def _fair_scheduler(*, prompt_rows, decoding=0, queued=0, chunk=2048, ratio=16.0
         _generation_batch=_Rows(decoding),
         _unprocessed_sequences=deque(object() for _ in range(queued)),
         _prompt_tokens_counter=0,
+        _prompt_time_counter=0.0,
     )
     return scheduler
 
 
-def test_a_lone_prefill_keeps_the_configured_chunk():
-    scheduler = _fair_scheduler(prompt_rows=1)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.004
+def _measured(scheduler, *, forward=0.1, per_token=0.004, outside=(0.2,)):
+    scheduler._fair_forward_s = forward
+    scheduler._fair_seconds_per_token = per_token
+    scheduler._fair_outside().extend(outside)
+    return scheduler
 
+
+def test_a_lone_prefill_keeps_the_configured_chunk():
+    scheduler = _measured(_fair_scheduler(prompt_rows=1))
     assert scheduler._apply_fair_prefill_size() is None
     assert scheduler.batch_generator.prefill_step_size == 2048
-    assert scheduler.model.calls == 0
+
+
+def test_shared_rows_never_prompt_more_than_one_lone_chunk():
+    # Nothing measured yet: the memory bound alone.
+    scheduler = _fair_scheduler(prompt_rows=4)
+    assert scheduler._apply_fair_prefill_size() == 512
+    bg = scheduler.batch_generator
+    assert bg.prefill_step_size == 512
+    assert bg._prompt_batch.prefill_step_size == 512
+
+
+def test_the_memory_bound_holds_with_the_time_bound_off():
+    scheduler = _measured(_fair_scheduler(prompt_rows=3, ratio=0))
+    assert scheduler._apply_fair_prefill_size() == 682
 
 
 def test_a_shared_step_is_ratio_times_its_overhead():
-    scheduler = _fair_scheduler(prompt_rows=3)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.004
-
-    # No shared step measured yet: the overhead is the one-token forward.
-    # (16 - 1) x 0.1 s of prompt at 0.004 s/token over 3 rows -> 125 per row.
-    assert scheduler._apply_fair_prefill_size() == 125
-    bg = scheduler.batch_generator
-    assert bg.prefill_step_size == 125
-    assert bg._prompt_batch.prefill_step_size == 125
+    scheduler = _measured(_fair_scheduler(prompt_rows=3))
+    # Overhead 0.2 s outside the prompt + 0.1 s forward = 0.3 s; (16 - 1) x 0.3 s
+    # of prompt at 0.004 s/token over 3 rows -> 375 per row.
+    assert scheduler._apply_fair_prefill_size() == 375
     assert scheduler._fair_bounded_steps == 1
 
-    # A measured 0.4 s overhead buys proportionally more prompt per step.
-    scheduler._fair_step_overhead_s = 0.4
-    bg.prefill_step_size = 2048
-    assert scheduler._apply_fair_prefill_size() == 500
 
-
-def test_the_overhead_never_counts_below_one_forward():
-    scheduler = _fair_scheduler(prompt_rows=3)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.004
-    scheduler._fair_step_overhead_s = 0.01
-    assert scheduler._apply_fair_prefill_size() == 125
+def test_one_cache_merge_spike_does_not_size_the_steps_after_it():
+    scheduler = _measured(_fair_scheduler(prompt_rows=3), outside=(0.2, 0.2, 5.0))
+    assert scheduler._apply_fair_prefill_size() == 375
 
 
 def test_a_decoding_row_or_a_queued_arrival_makes_a_step_shared():
-    decoding = _fair_scheduler(prompt_rows=1, decoding=1)
-    queued = _fair_scheduler(prompt_rows=1, queued=1)
-    for scheduler in (decoding, queued):
-        scheduler._fair_forward_s = 0.1
-        scheduler._fair_seconds_per_token = 0.004
-    assert decoding._apply_fair_prefill_size() == 375
-    assert queued._apply_fair_prefill_size() == 187
+    decoding = _measured(_fair_scheduler(prompt_rows=1, decoding=1))
+    queued = _measured(_fair_scheduler(prompt_rows=1, queued=1))
+    assert decoding._apply_fair_prefill_size() == 1125
+    assert queued._apply_fair_prefill_size() == 562
 
 
 def test_the_bound_only_ever_lowers_the_memory_guarded_chunk():
-    scheduler = _fair_scheduler(prompt_rows=1, decoding=1, chunk=256)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.004
+    scheduler = _measured(_fair_scheduler(prompt_rows=1, decoding=1, chunk=256))
     assert scheduler._apply_fair_prefill_size() == 256
     assert scheduler.batch_generator.prefill_step_size == 256
     assert scheduler._fair_bounded_steps == 0
 
 
-def test_the_forward_is_measured_once_on_the_first_shared_step():
-    scheduler = _fair_scheduler(prompt_rows=2)
-    scheduler._apply_fair_prefill_size()
+def _step(scheduler, *, tokens, prompt_s, wall_s, chunk):
+    bg = scheduler.batch_generator
+    before = (bg._prompt_tokens_counter, bg._prompt_time_counter)
+    bg._prompt_tokens_counter += tokens
+    bg._prompt_time_counter += prompt_s
+    scheduler._record_fair_prefill_step(wall_s, before[0], before[1], chunk)
+
+
+def test_the_forward_is_measured_once_at_the_first_prompt_step():
+    scheduler = _fair_scheduler(prompt_rows=1)
+    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
     assert scheduler._fair_forward_s is not None
     calls = scheduler.model.calls
-    scheduler._apply_fair_prefill_size()
+    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
     assert scheduler.model.calls == calls
 
 
-def test_an_unmeasurable_forward_is_reported_and_leaves_the_chunk_alone():
+def test_an_unmeasurable_forward_is_reported_and_keeps_the_memory_bound():
     scheduler = _fair_scheduler(prompt_rows=2)
     scheduler.model = _Model(fail=True)
-    scheduler._fair_seconds_per_token = 0.004
-
-    assert scheduler._apply_fair_prefill_size() is None
+    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
     assert scheduler._fair_forward_error == "RuntimeError: no metal here"
-    assert scheduler.batch_generator.prefill_step_size == 2048
+    assert scheduler._fair_seconds_per_token is None
+    assert scheduler._apply_fair_prefill_size() == 1024
 
 
-def test_no_token_cost_yet_leaves_the_chunk_alone():
-    scheduler = _fair_scheduler(prompt_rows=2)
+def test_cost_per_token_is_prompt_time_net_of_one_forward():
+    scheduler = _fair_scheduler(prompt_rows=1)
     scheduler._fair_forward_s = 0.1
-    assert scheduler._apply_fair_prefill_size() is None
-    assert scheduler.batch_generator.prefill_step_size == 2048
+    _step(scheduler, tokens=2048, prompt_s=6.244, wall_s=6.3, chunk=2048)
+    assert scheduler._fair_seconds_per_token == pytest.approx(0.003)
+    assert list(scheduler._fair_outside()) == []
 
 
-def test_ratio_zero_disables_the_bound():
-    scheduler = _fair_scheduler(prompt_rows=3, ratio=0)
+def test_a_shared_step_records_its_time_outside_the_prompt_call():
+    scheduler = _fair_scheduler(prompt_rows=2, chunk=100)
     scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.004
-    assert scheduler._apply_fair_prefill_size() is None
-    assert scheduler.batch_generator.prefill_step_size == 2048
+    scheduler._fair_step_shared = True
+    _step(scheduler, tokens=200, prompt_s=0.7, wall_s=1.0, chunk=100)
+    assert list(scheduler._fair_outside()) == [pytest.approx(0.3)]
+    assert scheduler._fair_seconds_per_token == pytest.approx(0.003)
 
 
-def test_a_lone_full_step_measures_the_cost_per_prompt_token():
-    scheduler = _fair_scheduler(prompt_rows=1, chunk=2048)
-    scheduler.batch_generator._prompt_tokens_counter = 2048
-    scheduler._record_fair_prefill_step(10.24, 0, 2048)
-    assert scheduler._fair_seconds_per_token == pytest.approx(0.005)
-    assert scheduler._fair_step_overhead_s is None
-
-
-def test_a_shared_full_step_measures_its_overhead():
+def test_padded_and_prompt_free_steps_leave_the_token_cost_alone():
     scheduler = _fair_scheduler(prompt_rows=2, chunk=100)
     scheduler._fair_forward_s = 0.1
     scheduler._fair_seconds_per_token = 0.005
-    scheduler._fair_step_shared = True
-    bg = scheduler.batch_generator
-
-    bg._prompt_tokens_counter = 200
-    scheduler._record_fair_prefill_step(1.3, 0, 100)
-    assert scheduler._fair_step_overhead_s == pytest.approx(0.3)
-    # A shared step never re-measures the per-token cost.
-    assert scheduler._fair_seconds_per_token == pytest.approx(0.005)
-
-    # A per-token cost that overstates this step floors at one forward.
-    bg._prompt_tokens_counter = 400
-    scheduler._record_fair_prefill_step(0.9, 200, 100)
-    assert scheduler._fair_step_overhead_s == pytest.approx(0.1)
-
-
-def test_padded_and_prompt_free_steps_measure_nothing():
-    scheduler = _fair_scheduler(prompt_rows=2, chunk=100)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.005
-    scheduler._fair_step_shared = True
-    bg = scheduler.batch_generator
-
     # A remainder row was padded to the chunk.
-    bg._prompt_tokens_counter = 150
-    scheduler._record_fair_prefill_step(9.0, 0, 100)
+    _step(scheduler, tokens=150, prompt_s=9.0, wall_s=9.1, chunk=100)
     # A decode-only step prompted nothing.
-    scheduler._record_fair_prefill_step(0.1, 150, 100)
-    assert scheduler._fair_step_overhead_s is None
+    _step(scheduler, tokens=0, prompt_s=0.0, wall_s=0.1, chunk=100)
     assert scheduler._fair_seconds_per_token == pytest.approx(0.005)
 
 
