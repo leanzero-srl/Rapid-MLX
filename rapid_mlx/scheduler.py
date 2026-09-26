@@ -609,7 +609,20 @@ class SchedulerConfig:
     # stays exactly on the cold image path. Appended for positional callers.
     mllm_media_prefix_cache: str = "auto"
 
+    # LeanZero Q-103. The ordinary (non-continuous) vendored MTP verifier
+    # admits one running request, so a 1-token request queued behind a long
+    # prompt waited for that prompt's whole prefill and decode (146-162 s on
+    # the Studio under 3 x 17k prompts). With this on, ONE short request (its
+    # prefill fits one ``prefill_step_size`` chunk) may enter BETWEEN the
+    # prefill chunks of the one running long prompt: the long prompt pauses at
+    # a chunk boundary, the guest prefills and decodes alone (batch-1 MTP as
+    # before), and the long prompt resumes. Decode is never batched and two
+    # long prefills never run together. Appended for positional callers.
+    mtp_prefill_guests: bool = True
+
     def __post_init__(self) -> None:
+        if not isinstance(self.mtp_prefill_guests, bool):
+            raise ValueError("mtp_prefill_guests must be a boolean")
         if self.mllm_singleton_fastpath not in ("auto", "off"):
             raise ValueError(
                 "mllm_singleton_fastpath must be 'auto' or 'off', "
@@ -3853,6 +3866,11 @@ class Scheduler:
     # on its first decode step — the #1834 step-zero barrier generalized to
     # every activation, not just construction (codex #1895 r2+r3).
     _recurrent_prev_running = 0
+    # Q-103 prefill guest (see ``_prefill_guest_index``). Class-level so
+    # ``__new__``-built stubs step cleanly.
+    _prefill_guest_rid: str | None = None
+    _prefill_guest_paused_host = False
+    _prefill_guests_admitted = 0
 
     def __init__(
         self,
@@ -8609,6 +8627,110 @@ class Scheduler:
             return 1
         return self.config.max_num_seqs
 
+    @staticmethod
+    def _prefill_token_count(request: Request) -> int:
+        """Prompt tokens ``request`` still has to prefill (after any cache hit)."""
+        remaining = getattr(request, "remaining_tokens", None)
+        if remaining is not None:
+            return max(1, len(remaining))
+        return len(getattr(request, "prompt_token_ids", None) or ())
+
+    def _prefill_rows(self) -> tuple[Any, list[Any], list[Any], Any]:
+        bg = self.batch_generator
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        uids = list(getattr(prompt_batch, "uids", None) or ())
+        processing = list(getattr(bg, "_currently_processing", None) or ())
+        return bg, uids, processing, prompt_batch
+
+    def _prefill_remaining(self, uid: Any) -> tuple[int, int] | None:
+        """(tokens left to prefill, tokens left in the current segment) for a
+        uid still in prefill, or None once it decodes or is unknown."""
+        bg, uids, processing, _ = self._prefill_rows()
+        if bg is None or uid is None:
+            return None
+        if uid in (getattr(getattr(bg, "_generation_batch", None), "uids", None) or ()):
+            return None
+        if uid in uids:
+            index = uids.index(uid)
+            if index >= len(processing):
+                return None
+            segments, processed, total = processing[index]
+            first = len(segments[0]) if segments else 0
+            return int(total) - int(processed), first
+        for sequence in getattr(bg, "_unprocessed_sequences", None) or ():
+            if sequence[0] == uid:
+                segments = sequence[1]
+                return sum(len(seg) for seg in segments), len(segments[0])
+        return None
+
+    def _prefill_guest_index(self) -> int | None:
+        """The waiting request to let in beside a prefilling long prompt, if any.
+
+        Only under the ordinary batch-1 MTP verifier (``mtp_prefill_guests``),
+        only while its one running request is still in PREFILL (it has not
+        taken the verifier: no admission owner) with more of it left than the
+        guest will make it process, and one guest at a time. A guest is the
+        first waiting request whose own prefill fits one ``prefill_step_size``
+        chunk. While it runs, ``_apply_prefill_guest`` sizes the shared steps
+        to the guest's prompt and holds the long prompt at its chunk boundary
+        while the guest decodes, so the host cannot finish its prefill beside
+        the guest and decode is never batched.
+        """
+        if not getattr(self.config, "mtp_prefill_guests", False):
+            return None
+        if getattr(self.config, "spec_decode", "none") != "mtp":
+            return None
+        if getattr(self.config, "mtp_continuous_batching", False):
+            return None
+        if getattr(self, "spec_decode_runtime_method", None) != "mtp":
+            return None
+        if len(self.running) != 1 or self._prefill_guest_rid is not None:
+            return None
+        bg = getattr(self, "batch_generator", None)
+        if bg is None or getattr(bg, "_mtp_vendored_admission_owner", None) is not None:
+            return None
+        host = next(iter(self.running.values()))
+        host_left = self._prefill_remaining(getattr(host, "batch_uid", None))
+        if host_left is None:
+            return None
+        chunk = max(1, int(getattr(self.config, "prefill_step_size", 2048)))
+        for index, request in enumerate(self.waiting):
+            tokens = self._prefill_token_count(request)
+            # The host advances at most the guest's prompt plus one token
+            # while the guest is in prefill; it must still be prefilling after.
+            if tokens <= chunk and tokens + 2 < host_left[0]:
+                return index
+        return None
+
+    def _apply_prefill_guest(self) -> None:
+        """Keep a guest's steps short and the host paused while it decodes."""
+        rid = self._prefill_guest_rid
+        bg = getattr(self, "batch_generator", None)
+        if rid is None or bg is None:
+            return
+        guest = self.running.get(rid)
+        if guest is None:
+            self._prefill_guest_rid = None
+            if self._prefill_guest_paused_host:
+                self._prefill_guest_paused_host = False
+                if getattr(bg, "_mtp_vendored_admission_owner", None) is None:
+                    bg.completion_batch_size = int(self.config.completion_batch_size)
+            return
+        left = self._prefill_remaining(getattr(guest, "batch_uid", None))
+        if left is None:
+            # The guest decodes. Under MTP it holds the singleton lock, which
+            # already stops mlx-lm from prompting the host; on plain decode
+            # (sampling MTP cannot serve) take the same boundary explicitly.
+            if getattr(bg, "_mtp_vendored_admission_owner", None) is None:
+                bg.completion_batch_size = 1
+                self._prefill_guest_paused_host = True
+            return
+        chunk = max(1, min(int(getattr(bg, "prefill_step_size", 1)), left[1]))
+        bg.prefill_step_size = chunk
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if prompt_batch is not None:
+            prompt_batch.prefill_step_size = chunk
+
     def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
@@ -8627,8 +8749,18 @@ class Scheduler:
             == "shortest_validated_tail"
             and getattr(self, "_shortest_tail_runtime_supported", None) is not False
         )
-        while self.waiting and len(self.running) < self._max_running_sequences():
-            if shortest_tail:
+        while self.waiting:
+            guest_index = None
+            if len(self.running) >= self._max_running_sequences():
+                guest_index = None if shortest_tail else self._prefill_guest_index()
+                if guest_index is None:
+                    break
+            requeue_at = guest_index or 0
+            if guest_index is not None:
+                request = self.waiting[guest_index]
+                del self.waiting[guest_index]
+                selection_forced = False
+            elif shortest_tail:
                 if self._shortest_tail_admission_capacity() <= 0:
                     break
                 selection = self._select_waiting_request()
@@ -8647,13 +8779,13 @@ class Scheduler:
             # once the running batch completes.
             if not self._ensure_batch_generator(request.sampling_params):
                 if not shortest_tail:
-                    self.waiting.appendleft(request)
+                    self.waiting.insert(requeue_at, request)
                 break
 
             if self.batch_generator is None:
                 # Put back and try again later
                 if not shortest_tail:
-                    self.waiting.appendleft(request)
+                    self.waiting.insert(requeue_at, request)
                 break
 
             # Determine tokens to process and cache to use
@@ -8965,6 +9097,9 @@ class Scheduler:
                 if shortest_tail:
                     self._admission_prefill_uids.add(uid)
                 request.batch_uid = uid
+                if guest_index is not None:
+                    self._prefill_guest_rid = request.request_id
+                    self._prefill_guests_admitted += 1
                 request.status = RequestStatus.RUNNING
                 request._prefill_started_at = time.time()
                 # #558 PR-3 / #558 budget: record this request's FULL processor
@@ -9914,6 +10049,7 @@ class Scheduler:
                     # Tighten that chunk before dispatch when a long cold or
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
+                    self._apply_prefill_guest()
                     if self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
                         if st is None:
@@ -10626,6 +10762,11 @@ class Scheduler:
             "adaptive_prefill_reduced_chunks": getattr(
                 self, "_adaptive_prefill_reduced_chunks", 0
             ),
+            "prefill_guests": {
+                "enabled": bool(getattr(self.config, "mtp_prefill_guests", False)),
+                "admitted": self._prefill_guests_admitted,
+                "current": self._prefill_guest_rid,
+            },
         }
         # R15-P1 (task #296): disk-backed KV checkpoint counters.
         # Folded straight from the module-level ``disk_kv_checkpoint``
