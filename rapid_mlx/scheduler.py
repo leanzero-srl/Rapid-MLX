@@ -3870,6 +3870,7 @@ class Scheduler:
     # ``__new__``-built stubs step cleanly.
     _prefill_guest_rid: str | None = None
     _prefill_guest_paused_host = False
+    _prefill_guest_demoted: frozenset = frozenset()
     _prefill_guests_admitted = 0
 
     def __init__(
@@ -8716,20 +8717,58 @@ class Scheduler:
                 if getattr(bg, "_mtp_vendored_admission_owner", None) is None:
                     bg.completion_batch_size = int(self.config.completion_batch_size)
             return
-        left = self._prefill_remaining(getattr(guest, "batch_uid", None))
+        guest_uid = getattr(guest, "batch_uid", None)
+        left = self._prefill_remaining(guest_uid)
+        prompt_batch = getattr(bg, "_prompt_batch", None)
         if left is None:
             # The guest decodes. Under MTP it holds the singleton lock, which
             # already stops mlx-lm from prompting the host; on plain decode
             # (sampling MTP cannot serve) take the same boundary explicitly.
+            # Its last step releases the lock INSIDE next(), and mlx-lm then
+            # prompts the host with whatever chunk is set: keep it at one
+            # token so the guest's answer is not held behind a full chunk.
             if getattr(bg, "_mtp_vendored_admission_owner", None) is None:
                 bg.completion_batch_size = 1
                 self._prefill_guest_paused_host = True
+            self._set_prefill_chunk(bg, 1)
+            self._demote_guest_rows(bg, guest_uid)
             return
-        chunk = max(1, min(int(getattr(bg, "prefill_step_size", 1)), left[1]))
+        self._set_prefill_chunk(bg, left[1])
+
+    @staticmethod
+    def _set_prefill_chunk(bg: Any, tokens: int) -> None:
+        chunk = max(1, min(int(getattr(bg, "prefill_step_size", 1)), int(tokens)))
         bg.prefill_step_size = chunk
         prompt_batch = getattr(bg, "_prompt_batch", None)
         if prompt_batch is not None:
             prompt_batch.prefill_step_size = chunk
+
+    def _demote_guest_rows(self, bg: Any, guest_uid: Any) -> None:
+        """Once the guest has left the prompt batch, give the host's prompt
+        cache and -- before MTP binds to it -- the guest's lone generation
+        cache back their singleton form (``demote_single_row``)."""
+        from .singleton_cache_fastpath import demote_single_row
+
+        done = set(self._prefill_guest_demoted)
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if "host" not in done and prompt_batch is not None:
+            if len(getattr(prompt_batch, "uids", ()) or ()) == 1:
+                single = demote_single_row(prompt_batch.prompt_cache)
+                if single is not None:
+                    prompt_batch.prompt_cache = single
+                done.add("host")
+        generation = getattr(bg, "_generation_batch", None)
+        if (
+            "guest" not in done
+            and generation is not None
+            and list(getattr(generation, "uids", ()) or ()) == [guest_uid]
+            and getattr(bg, "_mtp_vendored_admission_owner", None) is None
+        ):
+            single = demote_single_row(generation.prompt_cache)
+            if single is not None:
+                generation.prompt_cache = single
+            done.add("guest")
+        self._prefill_guest_demoted = frozenset(done)
 
     def _schedule_waiting(self) -> list[Request]:
         """
@@ -9099,6 +9138,7 @@ class Scheduler:
                 request.batch_uid = uid
                 if guest_index is not None:
                     self._prefill_guest_rid = request.request_id
+                    self._prefill_guest_demoted = frozenset()
                     self._prefill_guests_admitted += 1
                 request.status = RequestStatus.RUNNING
                 request._prefill_started_at = time.time()

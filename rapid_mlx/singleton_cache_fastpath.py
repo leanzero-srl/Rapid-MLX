@@ -290,6 +290,49 @@ def _bind_singleton_surface(cache_obj: Any) -> None:
             setattr(cache_obj, name, types.MethodType(fn, cache_obj))
 
 
+def demote_single_row(cache: list[Any]) -> list[Any] | None:
+    """Return a one-row batched cache to the singleton form, or None.
+
+    A second row joining promotes every layer to its batched form, and
+    nothing demotes it when the batch shrinks back to one row: the rest of
+    that request then decodes on the batched representation. Q-103 measured
+    what that costs a request that hosted a short guest request between its
+    prefill chunks (Studio, Qwen3.8-27B Q8, MTP): its 33-token decode took
+    2.3 s against 1.0 s for the same request that never hosted one.
+
+    Only ``BatchKVCache`` layers are demoted (``extract(0)``: the row, its
+    left padding dropped, copied and evaluated); native-surface layers
+    (hybrid ``ArraysCache``) already hold B=1 state and keep their objects,
+    with an all-zero left padding cleared. Any other batched type -- rotating,
+    quantized -- keeps the whole list batched (None): a mixed list would
+    fail the singleton contract.
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    demoted: list[Any] = []
+    arrays: list[Any] = []
+    for layer in cache:
+        if type(layer) is BatchKVCache:
+            if int(layer.keys.shape[0]) != 1:
+                return None
+            single = layer.extract(0)
+            _bind_singleton_surface(single)
+            arrays.extend([single.keys, single.values])
+            demoted.append(single)
+        elif _is_singleton_passthrough_layer(layer):
+            demoted.append(layer)
+        else:
+            return None
+    for layer in demoted:
+        padding = getattr(layer, "left_padding", None)
+        if padding is not None and not isinstance(layer, KVCache):
+            if int(mx.max(padding).item()) == 0:
+                layer.left_padding = None
+    if arrays:
+        mx.eval(arrays)
+    return demoted
+
+
 _install_lock = threading.Lock()
 
 

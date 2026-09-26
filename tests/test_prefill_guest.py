@@ -34,7 +34,7 @@ def _scheduler(*, host_left=10_000, host_where="prompt", owner=None, **config):
     scheduler.spec_decode_runtime_method = "mtp"
     host = _req("host", 17_000, uid=0)
     scheduler.running = {"host": host}
-    prompt = SimpleNamespace(uids=[], prefill_step_size=2048)
+    prompt = SimpleNamespace(uids=[], prefill_step_size=2048, prompt_cache=[])
     processing, unprocessed, generating = [], deque(), []
     if host_where == "prompt":
         prompt.uids = [0]
@@ -49,7 +49,7 @@ def _scheduler(*, host_left=10_000, host_where="prompt", owner=None, **config):
         _prompt_batch=prompt,
         _currently_processing=processing,
         _unprocessed_sequences=unprocessed,
-        _generation_batch=SimpleNamespace(uids=generating),
+        _generation_batch=SimpleNamespace(uids=generating, prompt_cache=[]),
         _mtp_vendored_admission_owner=owner,
     )
     scheduler.waiting = deque()
@@ -130,6 +130,9 @@ def test_a_guest_on_plain_decode_holds_the_host_at_its_chunk_boundary():
     bg = _with_guest(scheduler, "decode")
     scheduler._apply_prefill_guest()
     assert bg.completion_batch_size == 1
+    # The step that ends the guest re-opens mlx-lm's prompt call inside
+    # next(): the host gets one token, not a full chunk.
+    assert bg.prefill_step_size == 1
 
     del scheduler.running["canary"]
     scheduler._apply_prefill_guest()
@@ -147,3 +150,39 @@ def test_a_guest_under_mtp_leaves_the_verifier_lock_alone():
     del scheduler.running["canary"]
     scheduler._apply_prefill_guest()
     assert bg.completion_batch_size == 1  # released by the verifier, not here
+
+
+def test_a_one_row_batched_cache_goes_back_to_its_singleton_form():
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+
+    from rapid_mlx.singleton_cache_fastpath import demote_single_row
+
+    kv = BatchKVCache([0, 5])
+    keys = mx.random.normal((2, 4, 12, 8))
+    kv.update_and_fetch(keys, keys)
+    kv.filter([0])
+    rec = ArraysCache(2)
+    rec.cache = [mx.zeros((1, 3, 8)), mx.zeros((1, 2, 4, 4))]
+    rec.left_padding = mx.array([0])
+
+    single = demote_single_row([kv, rec])
+
+    assert type(single[0]) is KVCache
+    assert single[0].offset == 12
+    assert mx.array_equal(single[0].keys, keys[0:1]).item()
+    assert hasattr(single[0], "filter") and hasattr(single[0], "extract")
+    assert single[1] is rec and rec.left_padding is None
+
+
+def test_a_two_row_or_unknown_batched_cache_stays_batched():
+    import mlx.core as mx
+    from mlx_lm.models.cache import BatchKVCache
+
+    from rapid_mlx.singleton_cache_fastpath import demote_single_row
+
+    kv = BatchKVCache([0, 0])
+    keys = mx.random.normal((2, 4, 3, 8))
+    kv.update_and_fetch(keys, keys)
+    assert demote_single_row([kv]) is None
+    assert demote_single_row([object()]) is None
