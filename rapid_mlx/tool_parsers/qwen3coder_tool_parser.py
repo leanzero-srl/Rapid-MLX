@@ -685,6 +685,46 @@ class Qwen3CoderToolParser(ToolParser):
             return names.intersection({selected})
         return names
 
+    def refused_tool_calls(
+        self, model_output: str, request: dict[str, Any] | None = None
+    ) -> list[dict[str, str]]:
+        """The framed calls ``extract_tool_calls`` refuses for their name alone.
+
+        An undeclared name is never executable, so the call reaches the wire
+        as content (the gate above and in the streaming path). Content alone
+        is indistinguishable from an answer: a client shows the XML as the
+        model's reply and ends the turn (goose Q-133 — Flash on the pipeline
+        split called ``bash`` where the request declared ``shell``). This
+        names each refused call so the server can say so beside the content.
+
+        The candidates are exactly the ones ``extract_tool_calls`` would
+        weigh — canonically wrapped or carrying a parameter, and parseable —
+        so bare prose that merely mentions ``<function=x>`` is not reported.
+        A request that declares no tools, or sets ``tool_choice: none``,
+        refused nothing: it asked for no calls.
+        """
+        if self.tool_call_prefix not in model_output:
+            return []
+        if not isinstance(request, dict) or request.get("tool_choice") == "none":
+            return []
+        if not request.get("tools"):
+            return []
+        declared = self._declared_tool_names(request)
+        selected = self._named_tool_choice(request)
+        refused: list[dict[str, str]] = []
+        for fc_str, _, _, is_wrapped in self._function_call_candidates(model_output):
+            candidate_name = fc_str.split(">", 1)[0]
+            if (
+                not is_wrapped
+                and self.parameter_prefix not in fc_str
+                and candidate_name != selected
+            ):
+                continue
+            tc = self._parse_xml_function_call(fc_str, request.get("tools"))
+            if tc and tc.get("name") not in declared:
+                refused.append({"name": tc["name"]})
+        return refused
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:

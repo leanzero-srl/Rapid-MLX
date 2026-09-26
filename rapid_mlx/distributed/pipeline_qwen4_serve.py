@@ -691,6 +691,26 @@ def _load_image(source: Any):
         return image.convert("RGB")
 
 
+def _refusal_fields(processor, served: str) -> dict[str, Any]:
+    """The finishing choice's ``refused_tool_calls``, when the parser refused any.
+
+    goose Q-133: Flash called ``bash`` on the split while the request declared
+    ``shell``; the parser refuses an undeclared name (never executable), so the
+    call went out as content and goose showed the XML as the finished reply.
+    The refusal stands — this only says it happened: each refused call's name
+    rides the final choice (streamed and not), and the server log names it.
+    """
+    refused = processor.refused_tool_calls()
+    if not refused:
+        return {}
+    print(
+        "PIPELINE_TOOL_CALL_REFUSED "
+        + json.dumps({"model": served, "refused_tool_calls": refused}),
+        flush=True,
+    )
+    return {"refused_tool_calls": refused}
+
+
 def _merge_tool_call_deltas(deltas: list[dict]) -> list[dict]:
     """Fold the postprocessor's streaming tool-call deltas into whole calls."""
     merged: dict[int, dict] = {}
@@ -1078,14 +1098,19 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         if body.get("stream"):
 
             async def sse():
-                def chunk(delta, finish=None, usage=None):
+                def chunk(delta, finish=None, usage=None, refusal=None):
                     payload = {
                         "id": f"chatcmpl-{job.id}",
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": state.served,
                         "choices": [
-                            {"index": 0, "delta": delta, "finish_reason": finish}
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish,
+                                **(refusal or {}),
+                            }
                         ],
                     }
                     if usage is not None:
@@ -1117,7 +1142,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     "total_tokens": len(ids) + completion,
                     "prompt_tokens_details": {"cached_tokens": job.row.cached},
                 }
-                yield chunk({}, finish, usage)
+                yield chunk(
+                    {}, finish, usage, _refusal_fields(processor, state.served)
+                )
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
@@ -1156,7 +1183,14 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             "object": "chat.completion",
             "created": created,
             "model": state.served,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish,
+                    **_refusal_fields(processor, state.served),
+                }
+            ],
             "usage": {
                 "prompt_tokens": len(ids),
                 "completion_tokens": completion,
