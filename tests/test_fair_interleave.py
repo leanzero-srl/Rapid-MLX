@@ -212,145 +212,96 @@ def test_without_yield_the_batch_one_contract_is_unchanged(fake_mtp):
 # --- the shared-step bound --------------------------------------------------
 
 
-class _Model:
-    def __init__(self, fail=False):
-        self.fail = fail
-        self.calls = 0
-
-    def __call__(self, x):
-        self.calls += 1
-        if self.fail:
-            raise RuntimeError("no metal here")
-        return x
-
-
-def _fair_scheduler(*, prompt_rows, decoding=0, queued=0, chunk=2048, ratio=16.0):
+def _fair_scheduler(*, prompt_rows, decoding=0, queued=0, chunk=2048):
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.config = SchedulerConfig(
-        prefill_step_size=2048, fair_prefill_step_ratio=ratio
-    )
-    scheduler.model = _Model()
+    scheduler.config = SchedulerConfig(prefill_step_size=2048)
     scheduler.batch_generator = SimpleNamespace(
         prefill_step_size=chunk,
         prefill_batch_size=8,
         _prompt_batch=_Rows(prompt_rows, chunk),
         _generation_batch=_Rows(decoding),
         _unprocessed_sequences=deque(object() for _ in range(queued)),
-        _prompt_tokens_counter=0,
-        _prompt_time_counter=0.0,
     )
     return scheduler
 
 
-def _measured(scheduler, *, forward=0.1, per_token=0.004, outside=(0.2,)):
-    scheduler._fair_forward_s = forward
-    scheduler._fair_seconds_per_token = per_token
-    scheduler._fair_outside().extend(outside)
-    return scheduler
-
-
 def test_a_lone_prefill_keeps_the_configured_chunk():
-    scheduler = _measured(_fair_scheduler(prompt_rows=1))
+    scheduler = _fair_scheduler(prompt_rows=1)
     assert scheduler._apply_fair_prefill_size() is None
     assert scheduler.batch_generator.prefill_step_size == 2048
 
 
-def test_shared_rows_never_prompt_more_than_one_lone_chunk():
-    # Nothing measured yet: the memory bound alone.
+def test_a_decode_only_step_is_left_alone():
+    scheduler = _fair_scheduler(prompt_rows=0, decoding=3)
+    assert scheduler._apply_fair_prefill_size() is None
+
+
+def test_shared_rows_split_one_lone_chunk():
     scheduler = _fair_scheduler(prompt_rows=4)
     assert scheduler._apply_fair_prefill_size() == 512
     bg = scheduler.batch_generator
     assert bg.prefill_step_size == 512
     assert bg._prompt_batch.prefill_step_size == 512
-
-
-def test_the_memory_bound_holds_with_the_time_bound_off():
-    scheduler = _measured(_fair_scheduler(prompt_rows=3, ratio=0))
-    assert scheduler._apply_fair_prefill_size() == 682
-
-
-def test_a_shared_step_is_ratio_times_its_overhead():
-    scheduler = _measured(_fair_scheduler(prompt_rows=3))
-    # Overhead 0.2 s outside the prompt + 0.1 s forward = 0.3 s; (16 - 1) x 0.3 s
-    # of prompt at 0.004 s/token over 3 rows -> 375 per row.
-    assert scheduler._apply_fair_prefill_size() == 375
     assert scheduler._fair_bounded_steps == 1
 
 
-def test_one_cache_merge_spike_does_not_size_the_steps_after_it():
-    scheduler = _measured(_fair_scheduler(prompt_rows=3), outside=(0.2, 0.2, 5.0))
-    assert scheduler._apply_fair_prefill_size() == 375
+def test_a_decoding_row_or_a_queued_arrival_takes_a_share():
+    assert _fair_scheduler(prompt_rows=1, decoding=1)._apply_fair_prefill_size() == 1024
+    assert _fair_scheduler(prompt_rows=1, queued=2)._apply_fair_prefill_size() == 682
 
 
-def test_a_decoding_row_or_a_queued_arrival_makes_a_step_shared():
-    decoding = _measured(_fair_scheduler(prompt_rows=1, decoding=1))
-    queued = _measured(_fair_scheduler(prompt_rows=1, queued=1))
-    assert decoding._apply_fair_prefill_size() == 1125
-    assert queued._apply_fair_prefill_size() == 562
+def test_the_split_starts_from_the_memory_guarded_chunk():
+    scheduler = _fair_scheduler(prompt_rows=2, chunk=256)
+    assert scheduler._apply_fair_prefill_size() == 128
 
 
-def test_the_bound_only_ever_lowers_the_memory_guarded_chunk():
-    scheduler = _measured(_fair_scheduler(prompt_rows=1, decoding=1, chunk=256))
-    assert scheduler._apply_fair_prefill_size() == 256
-    assert scheduler.batch_generator.prefill_step_size == 256
-    assert scheduler._fair_bounded_steps == 0
+# --- admission beside a long prefill ----------------------------------------
 
 
-def _step(scheduler, *, tokens, prompt_s, wall_s, chunk):
-    bg = scheduler.batch_generator
-    before = (bg._prompt_tokens_counter, bg._prompt_time_counter)
-    bg._prompt_tokens_counter += tokens
-    bg._prompt_time_counter += prompt_s
-    scheduler._record_fair_prefill_step(wall_s, before[0], before[1], chunk)
+def _req(name, tokens):
+    return SimpleNamespace(
+        name=name, remaining_tokens=list(range(tokens)), prompt_token_ids=[]
+    )
 
 
-def test_the_forward_is_measured_once_at_the_first_prompt_step():
-    scheduler = _fair_scheduler(prompt_rows=1)
-    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
-    assert scheduler._fair_forward_s is not None
-    calls = scheduler.model.calls
-    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
-    assert scheduler.model.calls == calls
+def _admission(waiting, running, *, open_=True):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SchedulerConfig(prefill_step_size=2048)
+    scheduler.waiting = deque(waiting)
+    scheduler.running = {r.name: r for r in running}
+    scheduler._mtp_admission_open = lambda: open_
+    return scheduler
 
 
-def test_an_unmeasurable_forward_is_reported_and_keeps_the_memory_bound():
-    scheduler = _fair_scheduler(prompt_rows=2)
-    scheduler.model = _Model(fail=True)
-    _step(scheduler, tokens=2048, prompt_s=6.2, wall_s=6.3, chunk=2048)
-    assert scheduler._fair_forward_error == "RuntimeError: no metal here"
-    assert scheduler._fair_seconds_per_token is None
-    assert scheduler._apply_fair_prefill_size() == 1024
+def test_with_no_long_prefill_running_admission_is_fcfs():
+    scheduler = _admission([_req("long", 17_000), _req("short", 28)], [])
+    assert scheduler._pop_waiting_for_admission().name == "long"
 
 
-def test_cost_per_token_is_prompt_time_net_of_one_forward():
-    scheduler = _fair_scheduler(prompt_rows=1)
-    scheduler._fair_forward_s = 0.1
-    _step(scheduler, tokens=2048, prompt_s=6.244, wall_s=6.3, chunk=2048)
-    assert scheduler._fair_seconds_per_token == pytest.approx(0.003)
-    assert list(scheduler._fair_outside()) == []
+def test_a_short_request_is_admitted_beside_a_long_prefill():
+    scheduler = _admission(
+        [_req("long-b", 17_000), _req("canary", 28), _req("helper", 2048)],
+        [_req("long-a", 17_000)],
+    )
+    assert scheduler._pop_waiting_for_admission().name == "canary"
+    assert scheduler._pop_waiting_for_admission().name == "helper"
+    assert scheduler._fair_short_admissions == 2
+    # Long prefills still run one at a time.
+    assert scheduler._pop_waiting_for_admission() is None
+    assert [r.name for r in scheduler.waiting] == ["long-b"]
 
 
-def test_a_shared_step_records_its_time_outside_the_prompt_call():
-    scheduler = _fair_scheduler(prompt_rows=2, chunk=100)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_step_shared = True
-    _step(scheduler, tokens=200, prompt_s=0.7, wall_s=1.0, chunk=100)
-    assert list(scheduler._fair_outside()) == [pytest.approx(0.3)]
-    assert scheduler._fair_seconds_per_token == pytest.approx(0.003)
+def test_a_cached_prefix_counts_only_the_tail_to_prefill():
+    tail = _req("warm", 30)
+    tail.prompt_token_ids = list(range(17_000))
+    scheduler = _admission([tail], [_req("long-a", 17_000)])
+    assert scheduler._pop_waiting_for_admission().name == "warm"
 
 
-def test_padded_and_prompt_free_steps_leave_the_token_cost_alone():
-    scheduler = _fair_scheduler(prompt_rows=2, chunk=100)
-    scheduler._fair_forward_s = 0.1
-    scheduler._fair_seconds_per_token = 0.005
-    # A remainder row was padded to the chunk.
-    _step(scheduler, tokens=150, prompt_s=9.0, wall_s=9.1, chunk=100)
-    # A decode-only step prompted nothing.
-    _step(scheduler, tokens=0, prompt_s=0.0, wall_s=0.1, chunk=100)
-    assert scheduler._fair_seconds_per_token == pytest.approx(0.005)
-
-
-@pytest.mark.parametrize("ratio", [-1, 0.5, 1, float("nan"), float("inf"), True])
-def test_the_ratio_is_zero_or_a_finite_number_above_one(ratio):
-    with pytest.raises(ValueError, match="fair_prefill_step_ratio"):
-        SchedulerConfig(fair_prefill_step_ratio=ratio)
+def test_without_the_mtp_yield_admission_is_plain_fcfs():
+    scheduler = _admission(
+        [_req("long-b", 17_000), _req("canary", 28)],
+        [_req("long-a", 17_000)],
+        open_=False,
+    )
+    assert scheduler._pop_waiting_for_admission().name == "long-b"

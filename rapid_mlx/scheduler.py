@@ -609,37 +609,18 @@ class SchedulerConfig:
     # stays exactly on the cold image path. Appended for positional callers.
     mllm_media_prefix_cache: str = "auto"
 
-    # LeanZero Q-103 (fair interleave). A scheduler step that carries prompt
-    # work BESIDE other work (a decoding row, a second prompt row, a request
-    # queued for admission) never prompts more tokens across its rows than one
-    # lone chunk (the attention transient; always on), and lasts this multiple
-    # of its own measured overhead (the decode forward, cache merges, the
-    # prompt forward's fixed cost): the prompt keeps (ratio - 1) / ratio of
-    # every shared step and a short request waits a few such steps instead of
-    # every long prompt's whole chunk. A lone prefill keeps
-    # ``prefill_step_size``. ``0`` turns the time bound off. Appended for
-    # positional callers.
-    fair_prefill_step_ratio: float = 16.0
-
     # LeanZero Q-103. The ordinary (non-continuous) vendored MTP verifier is
     # batch-1, and admission used to hold every other request in the queue
     # for the whole life of the one running request -- prefill included -- so
     # a 1-token request waited behind every long prompt ahead of it. With
-    # this on, admission stays open until a LONE request primes MTP; a
-    # request whose first decode step meets other work runs plain batched
-    # decode for its whole life (never a mid-stream MTP handoff). Appended
-    # for positional callers.
+    # this on, admission stays open until a LONE request primes MTP, for
+    # requests whose prefill fits one lone chunk beside a running long
+    # prefill (long prefills still run one at a time); a request whose first
+    # decode step meets other work runs plain batched decode for its whole
+    # life (never a mid-stream MTP handoff). Appended for positional callers.
     mtp_yield_to_contention: bool = True
 
     def __post_init__(self) -> None:
-        if isinstance(self.fair_prefill_step_ratio, bool) or not (
-            isinstance(self.fair_prefill_step_ratio, (int, float))
-            and math.isfinite(self.fair_prefill_step_ratio)
-            and (self.fair_prefill_step_ratio == 0 or self.fair_prefill_step_ratio > 1)
-        ):
-            raise ValueError(
-                "fair_prefill_step_ratio must be 0 (off) or a finite number > 1"
-            )
         if not isinstance(self.mtp_yield_to_contention, bool):
             raise ValueError("mtp_yield_to_contention must be a boolean")
         if self.mllm_singleton_fastpath not in ("auto", "off"):
@@ -3922,15 +3903,11 @@ class Scheduler:
     # on its first decode step — the #1834 step-zero barrier generalized to
     # every activation, not just construction (codex #1895 r2+r3).
     _recurrent_prev_running = 0
-    # Q-103 fair interleave: measured, never assumed (see
-    # ``_apply_fair_prefill_size``). Class-level so ``__new__`` stubs step.
-    _fair_forward_s: float | None = None
-    _fair_forward_error: str | None = None
-    _fair_seconds_per_token: float | None = None
-    _fair_step_shared = False
+    # Q-103 fair interleave counters (class-level so ``__new__`` stubs step).
     _fair_chunk_size: int | None = None
     _fair_contended_steps = 0
     _fair_bounded_steps = 0
+    _fair_short_admissions = 0
 
     def __init__(
         self,
@@ -6263,113 +6240,43 @@ class Scheduler:
             self._last_adaptive_prefill_size = selected
         return selected
 
-    def _fair_prefill_rows(self) -> tuple[int, bool]:
-        """Rows the next ``next()`` will prompt, and whether they share it.
-
-        A lone prefill (one prompt row, nothing decoding) keeps the configured
-        chunk: nothing waits on it. Anything beside it -- a decoding row, a
-        second prompt row, a sequence queued for the prompt batch -- waits one
-        whole step for every chunk, so that step is the one to bound.
-        """
+    def _fair_prefill_rows(self) -> tuple[int, int]:
+        """Rows the next ``next()`` will prompt, and rows it will decode."""
         bg = getattr(self, "batch_generator", None)
         if bg is None:
-            return 0, False
+            return 0, 0
         try:
             prompt_rows = len(getattr(bg, "_prompt_batch", None) or ())
             decoding = len(getattr(bg, "_generation_batch", None) or ())
             queued = len(getattr(bg, "_unprocessed_sequences", None) or ())
         except TypeError:
-            return 0, False
+            return 0, 0
         slots = max(0, int(getattr(bg, "prefill_batch_size", 1)) - prompt_rows)
-        rows = prompt_rows + min(queued, slots)
-        return rows, rows > 0 and (decoding > 0 or rows > 1)
-
-    def _measure_forward_seconds(self) -> None:
-        """Measure one warm one-token forward: a forward's fixed cost.
-
-        Taken once, on the step thread, at the first prompt step. Prompt time
-        per token is read net of it (see ``_record_fair_prefill_step``), and
-        it is part of every shared step's overhead. A failure is kept and
-        reported (``fair_prefill.forward_error``); the time bound then stays
-        off rather than guessing a cost.
-        """
-        if self._fair_forward_s is not None or self._fair_forward_error is not None:
-            return
-        try:
-            probe = mx.array([[0]])
-            mx.eval(self.model(probe))
-            samples = []
-            for _ in range(3):
-                started = time.perf_counter()
-                mx.eval(self.model(probe))
-                samples.append(time.perf_counter() - started)
-            # The fastest sample: anything slower is another process on the
-            # GPU or the scheduler, not the cost of a forward.
-            self._fair_forward_s = min(samples)
-            logger.info("[fair_prefill] one-token forward %.4fs", self._fair_forward_s)
-        except Exception as exc:  # noqa: BLE001 - reported, never guessed
-            self._fair_forward_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "[fair_prefill] forward measurement failed (%s); shared steps "
-                "keep only the memory bound",
-                self._fair_forward_error,
-            )
-
-    def _fair_outside(self) -> deque:
-        """Recent shared steps' seconds outside the prompt call (per instance)."""
-        samples = self.__dict__.get("_fair_outside_prompt_s")
-        if samples is None:
-            # A window, not a bound: the last few joins and leaves.
-            samples = self._fair_outside_prompt_s = deque(maxlen=8)
-        return samples
-
-    def _fair_step_overhead(self) -> float | None:
-        """A shared step's cost that is not its prompt tokens.
-
-        The median of recent shared steps' time outside mlx-lm's prompt call
-        (the decode forward, cache merges when a row joins or leaves, the
-        scheduler) plus the prompt forward's own fixed cost. The median, so a
-        join's one-off cache merge does not size the steps after it.
-        """
-        samples = sorted(self._fair_outside())
-        if self._fair_forward_s is None or not samples:
-            return None
-        return samples[len(samples) // 2] + self._fair_forward_s
+        return prompt_rows + min(queued, slots), decoding
 
     def _apply_fair_prefill_size(self) -> int | None:
-        """Bound a SHARED step's prompt chunk (Q-103).
+        """A SHARED step does no more work than one lone chunk (Q-103).
 
         mlx-lm prompts one chunk per row per ``next()``, padded to the longest
-        row, and a decoding row or a newly admitted short request waits for the
-        whole step. Two bounds, the tighter wins, and neither ever raises the
-        size ``_apply_adaptive_prefill_size`` just set:
-
-        * memory: the rows together never prompt more tokens than one lone
-          chunk -- a 4-row step of 2048 each is 4x the attention transient a
-          lone prefill has, and it ran the Studio's GPU out of memory;
-        * time: the step lasts ``fair_prefill_step_ratio`` times its measured
-          overhead, so the prompt keeps ``(ratio - 1) / ratio`` of it and a
-          short request waits a few such steps. ``0`` turns this one off; the
-          memory bound always holds.
+        row, and every other row waits for the whole step. A step with prompt
+        work beside other rows (a second prompt row, a queued arrival, a
+        decoding row) splits the lone chunk evenly across all of them: the
+        attention transient stays what one lone prefill has -- four 17k
+        prompts at 2048 each ran the Studio's GPU out of memory -- and a short
+        request or a decoding row waits one lone step's time or less per step.
+        Only ever lowers the size ``_apply_adaptive_prefill_size`` just set;
+        a lone prefill keeps it.
         """
         self._fair_chunk_size = None
-        self._fair_step_shared = False
-        ratio = float(getattr(self.config, "fair_prefill_step_ratio", 0) or 0)
         bg = getattr(self, "batch_generator", None)
         if bg is None:
             return None
-        rows, shared = self._fair_prefill_rows()
-        if not shared:
+        rows, decoding = self._fair_prefill_rows()
+        if rows == 0 or rows + decoding < 2:
             return None
-        self._fair_step_shared = True
         self._fair_contended_steps += 1
         current = max(1, int(getattr(bg, "prefill_step_size", 1)))
-        chunk = max(1, current // rows)
-        overhead = self._fair_step_overhead()
-        per_token = self._fair_seconds_per_token
-        if ratio > 1 and overhead is not None and per_token:
-            chunk = min(chunk, int((ratio - 1) * overhead / (per_token * rows)))
-        chunk = max(1, chunk)
+        chunk = max(1, current // (rows + decoding))
         if chunk < current:
             bg.prefill_step_size = chunk
             prompt_batch = getattr(bg, "_prompt_batch", None)
@@ -6379,48 +6286,42 @@ class Scheduler:
         self._fair_chunk_size = chunk
         return chunk
 
-    def _record_fair_prefill_step(
-        self,
-        wall_s: float,
-        tokens_before: int | None,
-        prompt_s_before: float | None,
-        chunk: int,
-    ) -> None:
-        """Read the two costs a shared step is sized from, off mlx-lm's counters.
+    @staticmethod
+    def _prefill_token_count(request: Request) -> int:
+        remaining = getattr(request, "remaining_tokens", None)
+        if remaining is not None:
+            return len(remaining)
+        return len(getattr(request, "prompt_token_ids", None) or ())
 
-        mlx-lm times its prompt call (``_prompt_time_counter``) and counts its
-        prompted tokens. An unpadded step (every row consumed ``chunk``) gives
-        the cost per prompt token: prompt time net of one forward's fixed
-        cost, over its tokens -- net, or a small chunk would read as dear
-        tokens and shrink the next chunk again. A shared step gives the time
-        spent outside the prompt call.
+    def _is_long_prefill(self, request: Request) -> bool:
+        """More prompt to prefill than one lone chunk takes."""
+        return self._prefill_token_count(request) > max(
+            1, int(getattr(self.config, "prefill_step_size", 2048))
+        )
+
+    def _pop_waiting_for_admission(self) -> Request | None:
+        """The next request to admit: FCFS, except beside a long prefill.
+
+        While the MTP verifier yields (``_mtp_admission_open``), a request
+        whose prefill fits in one lone chunk is admitted beside a running long
+        prefill; long prefills still run one at a time, in arrival order, as
+        they did when admission was batch-1. Measured on the Studio: four
+        concurrent 17k prompts exhausted Metal memory twice (lz/fair-prefill
+        6963009bd and 28ae5c583), in a padded prompt step and then in a decode
+        step with all four contexts resident.
         """
-        bg = getattr(self, "batch_generator", None)
-        tokens_after = getattr(bg, "_prompt_tokens_counter", None)
-        prompt_s_after = getattr(bg, "_prompt_time_counter", None)
-        if (
-            tokens_before is None
-            or prompt_s_before is None
-            or not isinstance(tokens_after, int)
-            or not isinstance(prompt_s_after, (int, float))
+        if not self.waiting:
+            return None
+        if not self._mtp_admission_open() or not any(
+            self._is_long_prefill(running) for running in self.running.values()
         ):
-            return
-        tokens = tokens_after - tokens_before
-        prompt_s = prompt_s_after - prompt_s_before
-        if tokens <= 0 or prompt_s <= 0:
-            return
-        self._measure_forward_seconds()
-        if self._fair_step_shared:
-            self._fair_outside().append(max(0.0, wall_s - prompt_s))
-        try:
-            rows = len(getattr(bg, "_prompt_batch", None) or ())
-        except TypeError:
-            return
-        if self._fair_forward_s is None or tokens != rows * chunk:
-            return
-        net = prompt_s - self._fair_forward_s
-        if net > 0:
-            self._fair_seconds_per_token = net / tokens
+            return self.waiting.popleft()
+        for index, request in enumerate(self.waiting):
+            if not self._is_long_prefill(request):
+                del self.waiting[index]
+                self._fair_short_admissions += 1
+                return request
+        return None
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
@@ -8898,7 +8799,9 @@ class Scheduler:
                     break
                 request, selection_forced = selection
             else:
-                request = self.waiting.popleft()
+                request = self._pop_waiting_for_admission()
+                if request is None:
+                    break
                 selection_forced = False
 
             # Ensure we have a batch generator. The False return means
@@ -10177,16 +10080,6 @@ class Scheduler:
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
                     self._apply_fair_prefill_size()
-                    _fair_chunk = int(
-                        getattr(self.batch_generator, "prefill_step_size", 0)
-                    )
-                    _fair_tokens_before = getattr(
-                        self.batch_generator, "_prompt_tokens_counter", None
-                    )
-                    _fair_prompt_s_before = getattr(
-                        self.batch_generator, "_prompt_time_counter", None
-                    )
-                    _fair_started = time.perf_counter()
                     if self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
                         if st is None:
@@ -10219,12 +10112,6 @@ class Scheduler:
                             st[0], st[1] = [], []
                     else:
                         raw_next = self.batch_generator.next()
-                    self._record_fair_prefill_step(
-                        time.perf_counter() - _fair_started,
-                        _fair_tokens_before,
-                        _fair_prompt_s_before,
-                        _fair_chunk,
-                    )
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires
                     # off the live chain DEPTH (steps since the last barrier),
@@ -10906,14 +10793,10 @@ class Scheduler:
                 self, "_adaptive_prefill_reduced_chunks", 0
             ),
             "fair_prefill": {
-                "step_ratio": getattr(self.config, "fair_prefill_step_ratio", 0),
-                "forward_s": getattr(self, "_fair_forward_s", None),
-                "forward_error": getattr(self, "_fair_forward_error", None),
-                "seconds_per_token": getattr(self, "_fair_seconds_per_token", None),
-                "step_overhead_s": self._fair_step_overhead(),
                 "chunk_size": getattr(self, "_fair_chunk_size", None),
                 "shared_steps": getattr(self, "_fair_contended_steps", 0),
                 "bounded_steps": getattr(self, "_fair_bounded_steps", 0),
+                "short_admissions": getattr(self, "_fair_short_admissions", 0),
             },
         }
         # R15-P1 (task #296): disk-backed KV checkpoint counters.
