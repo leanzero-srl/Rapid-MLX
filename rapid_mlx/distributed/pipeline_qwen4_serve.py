@@ -23,7 +23,7 @@ applies when it launches the single engine.
 
 Scheduling is continuous (Q-134).  Every rank runs the same TICK: one decode
 step for the running rows, then — when rank 0 grants it — one prefill chunk
-of the ONE request that is joining.  A queued request joins the moment a row
+of ONE prefilling request (the one with the fewest prompt tokens left, Q-145).  A queued request joins the moment a row
 slot is free (``--max-batch``) and its KV fits every rank's planned budget
 beside the running rows (``_KvBudget``: rows x the longest reservation); it
 prefills in its own cache, ``--prefill-step`` tokens a chunk (the chunk
@@ -41,6 +41,30 @@ so a steady decode pays no extra collective.  Before Q-134 a batch formed
 only when the previous one ended and a request the prefix cache acted on
 ran alone: one long generation froze every other request (a 69-token
 canary waited 308 s beside a free slot and half an unreserved KV budget).
+
+Prefill order is shortest-remaining-prefill-first at chunk granularity
+(Q-145).  Prefill is compute-bound, so the chunks still run one at a time;
+what changed is WHICH request's chunk runs.  Several requests may be
+prefilling at once, each in its own cache and each holding a row slot and
+its KV reservation; every rank runs the next chunk of the prefilling row
+with the fewest prompt tokens left (ties: the earlier admitted), a rule
+over state every rank holds identically (the rows the plans admitted, the
+ranges their chunks have consumed), so no extra word crosses the ranks.
+Rank 0 alone decides admission: of the queued requests it picks the one
+first in ``_Scheduler._order`` and admits it only when it would be that
+rule's pick — fewer tokens left than every prefilling row — so a short
+request (goose's title, fact checker, compaction) is prefilled between two
+chunks of a long one and joins the running batch the moment its last chunk
+samples.  Aging, in prefill tokens (the pipeline's own prefill rate
+cancels, so no clock): a request is PROTECTED once the tokens prefilled for
+others while it waited reach the tokens it still has to prefill — its own
+expected prefill time; a protected request goes before every later arrival
+and, while one is prefilling, nothing new is admitted ahead of it, so no
+stream of short requests stretches a long one past about twice its own
+prefill.  Before Q-145 one request prefilled at a time, first come first
+served: on the Flash split three ~39k-token prompts and a 13-token canary
+arriving together got their first tokens at 115 / 232 / 347 s, the canary
+last.
 
 Prefix cache (Q-75): every rank snapshots ITS OWN layers' caches at a stable
 prompt boundary and restores them for a later prompt that starts with the same
@@ -88,7 +112,8 @@ from . import pipeline_qwen4 as pipe
 _CMD_SHUTDOWN = 1
 _CMD_PLAN = 2
 # Rank 0's words on every step's collective: [a plan opens the next tick,
-# a prefill chunk of the joining row runs after this decode step].
+# a prefill chunk (of the row ``_Engine.target`` names) runs after this
+# decode step].
 _CONTROL_WORDS = 2
 # The running rows' decode and a joining row's prefill split the pipeline's
 # time equally while both have work.  A policy ratio (Q-134): the owner weighs
@@ -143,9 +168,10 @@ class _Plan:
 
     # Running-row indices (batch order) that leave: finished or cancelled.
     leave: list[int] = field(default_factory=list)
-    # The joining row leaves before it joined (its request was cancelled).
-    abort: bool = False
-    # The request that starts prefilling (at most one prefills at a time).
+    # Prefilling-row indices (admission order) that leave before they joined
+    # (their requests were cancelled).
+    abort: list[int] = field(default_factory=list)
+    # The request that starts prefilling (appended to the prefilling rows).
     joiner: _Row | None = None
     # Prefix-cache entries every rank drops once the joiner restored its own.
     evict: list[int] = field(default_factory=list)
@@ -158,8 +184,9 @@ def _all_sum(group, value: mx.array) -> mx.array:
     return mx.distributed.all_sum(value, group=group)
 
 
-# The plan header after [cmd, abort, one leave flag per slot]: the joiner's
-# fields (length 0 = no joiner), then the eviction count.
+# The plan header after [cmd, one leave flag per slot, one abort flag per
+# slot]: the joiner's fields (length 0 = no joiner), then the eviction count.
+# Running and prefilling rows share the slots, so neither list outgrows them.
 _PLAN_TAIL = len(
     ("length", "max_tokens", "reuse_id", "cached", "store_id", "store_at", "evictions")
 )
@@ -173,16 +200,17 @@ def _broadcast_plan(
     ``deciding`` is rank 0 (``plan`` None there means shut down); every other
     rank passes None and learns the plan from the collectives alone.
     """
-    tail = 2 + max_batch
+    tail = 1 + 2 * max_batch
     header = [0] * (tail + _PLAN_TAIL)
     if deciding:
         if plan is None:
             header[0] = _CMD_SHUTDOWN
         else:
             header[0] = _CMD_PLAN
-            header[1] = int(plan.abort)
             for index in plan.leave:
-                header[2 + index] = 1
+                header[1 + index] = 1
+            for index in plan.abort:
+                header[1 + max_batch + index] = 1
             row = plan.joiner
             if row is not None:
                 header[tail : tail + 6] = [
@@ -228,8 +256,8 @@ def _broadcast_plan(
         dropped = list(plan.evict) if deciding else [0] * evictions
         evict = _all_sum(group, mx.array(dropped, dtype=mx.int32)).tolist()
     return _Plan(
-        leave=[index for index in range(max_batch) if header[2 + index]],
-        abort=bool(header[1]),
+        leave=[index for index in range(max_batch) if header[1 + index]],
+        abort=[index for index in range(max_batch) if header[1 + max_batch + index]],
         joiner=joiner,
         evict=evict,
     )
