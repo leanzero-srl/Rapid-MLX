@@ -133,6 +133,19 @@ that samples — holds a tool request's decode to the XML tool-call skeleton
 text, so ``</parameter>`` residue never becomes an argument's payload.  The
 plan carries whether a row declared tools; the guard reads the row's prompt and
 the tokens every rank learns from the step's collective.
+
+A client that leaves ends its request at the next plan (goose Q-181).  After
+goose's Stop the tensor split generated a cancelled request for 4,413 s (48,466
+tokens, max_tokens 222,148) because its server noticed a closed connection only
+when a write failed, and nothing is written while an answer's text is withheld.
+Here a non-streamed answer writes nothing before its end and nothing ended it;
+a streamed one was cancelled only through Starlette's own disconnect listener
+(ASGI spec < 2.4 — at 2.4 it too waits for a write to fail) and nobody said so.
+Every chat request now awaits the client's ``http.disconnect`` beside its
+answer (uvicorn delivers it when the socket reads EOF, no write needed): the
+job is cancelled — every rank drops the row at the next plan, as for any
+cancel — and ``last_engine_stop`` and a ``RANK_CANCELLED_BY_CLIENT`` line name
+it.  The signal is the socket's end, never a clock.
 """
 
 from __future__ import annotations
@@ -1709,6 +1722,11 @@ def _not_served(state: _State, model: str) -> str:
     return f"model '{model}' is not served here; this engine serves '{state.served}'{names}"
 
 
+class _ClientGoneError(Exception):
+    """The client closed the connection before its answer ended (goose Q-181);
+    the stop was named where it was seen, and nobody is left to answer."""
+
+
 class _RequestRefusedError(ValueError):
     """A request field the split cannot honour, named as goose's tensor wrapper
     names one (rank_request.py): ``param`` and ``code`` (unsupported_parameter:
@@ -1930,6 +1948,58 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     def record_stop(stop: dict) -> None:
         state.last_engine_stop = stop
 
+    # The disconnect watches of the requests being answered (a task is only
+    # weakly held by the loop).
+    watching: set[asyncio.Task] = set()
+
+    def watch_client(request: Request, job: _Job, prompt_tokens: int) -> asyncio.Task:
+        """goose Q-181: the job is cancelled once its client has gone, whether or
+        not anything was being written.  The handler cancels the watch when the
+        answer ends by itself."""
+
+        async def watch() -> None:
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+            if job.finished:
+                return
+            job.cancelled = True
+            if job.produced:
+                phase = "generation"
+            elif any(active is job for active in state.active):
+                phase = "prefill"
+            else:
+                phase = "waiting"
+            stop: dict[str, Any] = {
+                "request_id": job.id,
+                "reason": "cancelled_by_client",
+                "how": "http.disconnect",
+                "phase": phase,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": job.produced,
+            }
+            if job.stream is not None:
+                stream = job.stream
+                # Read from the answer's state, not its open episode: the
+                # handler may have ended the episode already (Starlette's own
+                # disconnect listener cancels the stream too).
+                withholding = stream.withholding()
+                stop.update(
+                    withholding=None if withholding is None else withholding[0],
+                    generated_chars=stream.generated_chars,
+                    sent_chars=stream.sent_chars,
+                    tail=stream.tail,
+                )
+                stream.stop = stop
+            record_stop(stop)
+            say("RANK_CANCELLED_BY_CLIENT", stop)
+            # A non-streamed handler is waiting on the job's events.
+            job.events.put_nowait(("cancelled", None))
+
+        task = asyncio.create_task(watch())
+        watching.add(task)
+        task.add_done_callback(watching.discard)
+        return task
+
     def unstreamed(body: dict, tools) -> str | None:
         """Why the relay leaves this request's calls to the post-processor, or None."""
         if not tools:
@@ -2014,8 +2084,8 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             if state.prefix is not None
             else {"enabled": False, "reason": "--no-prefix-cache"},
             "sampling_defaults": state.sampling.report(),
-            # The last answer the engine ended itself (goose Q-161): its row
-            # has left the table with it.
+            # The last answer the engine ended itself (goose Q-161; a client
+            # that left, Q-181): its row has left the table with it.
             "last_engine_stop": state.last_engine_stop,
             "status": "ok",
         }
@@ -2211,6 +2281,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         # Queued only once everything the answer's reader needs exists: a job
         # nobody reads would run to its horizon.
         state.jobs.put(job)
+        client = watch_client(request, job, len(ids))
         fed = ""
 
         def events_of(events) -> list[tuple[dict, str | None]]:
@@ -2262,6 +2333,8 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             completion = 0
             while True:
                 item = await job.events.get()
+                if item[0] == "cancelled":
+                    raise _ClientGoneError()
                 if item[0] == "error":
                     raise RuntimeError(item[1])
                 if item[0] == "done":
@@ -2382,7 +2455,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                         watch.settle()
                         if final is not None and finish == "stop":
                             finish = final
+                except _ClientGoneError:
+                    return
                 except Exception as failure:  # noqa: BLE001 - said on the stream (goose Q-177: never a dropped connection)
+                    client.cancel()
                     if not isinstance(failure, RuntimeError):
                         say(
                             "RANK_STREAM_FAILED",
@@ -2405,6 +2481,8 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 finally:
                     job.cancelled = True
                     watch.end()
+                # The answer ended by itself; a client that leaves now left nothing running.
+                client.cancel()
                 usage = {
                     "prompt_tokens": len(ids),
                     "completion_tokens": completion,
@@ -2432,9 +2510,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                         calls.extend(delta["tool_calls"])
                 if final is not None and finish == "stop":
                     finish = final
+        except _ClientGoneError:
+            return error(499, "the client closed the connection", "client_closed")
         except Exception as failure:  # noqa: BLE001 - a named 500 (goose Q-177)
             return error(500, failure_text(failure), "pipeline_error")
         finally:
+            client.cancel()
             job.cancelled = True
         message: dict[str, Any] = {
             "role": "assistant",

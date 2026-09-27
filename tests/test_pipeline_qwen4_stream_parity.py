@@ -654,6 +654,181 @@ def test_the_client_reads_the_arguments_while_the_generation_waits(tokenizer_dir
         running.close()
 
 
+def _on_a_port(running):
+    """``running``'s app served for real by uvicorn on a free local port."""
+    import uvicorn
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    http = uvicorn.Server(
+        uvicorn.Config(running.app, host="127.0.0.1", port=port, log_level="warning")
+    )
+    threading.Thread(target=http.run, daemon=True).start()
+    deadline = time.monotonic() + 30
+    while not http.started:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    return http, port
+
+
+def _post_raw(port, body) -> socket.socket:
+    raw = json.dumps(body).encode()
+    client = socket.create_connection(("127.0.0.1", port))
+    client.sendall(
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: goose\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(raw)}\r\n\r\n".encode()
+        + raw
+    )
+    return client
+
+
+def _read_then_close(client: socket.socket) -> str:
+    """What the client was sent so far; then it leaves (goose's Stop drops the stream)."""
+    client.setblocking(False)
+    received = b""
+    try:
+        while chunk := client.recv(65536):
+            received += chunk
+    except BlockingIOError:
+        pass
+    client.close()
+    return received.decode(errors="replace")
+
+
+def _until(predicate, what):
+    # A harness guard, never the engine's.
+    deadline = time.monotonic() + 30
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.001)
+
+
+# A call whose value is typed (an array): the relay sends its header and holds
+# the value whole until </parameter> — nothing reaches the socket meanwhile.
+WITHHELD = call(
+    "shell", ("paths", "[" + ", ".join(f'"p{i}"' for i in range(3000)) + "]")
+)
+LEAVE_AFTER = 60
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["streamed", "whole"])
+def test_a_client_that_leaves_while_nothing_is_written_cancels_its_row(
+    tokenizer_dir, stream
+):
+    """goose Q-181: after goose's Stop the tensor split generated the cancelled
+    request for 4,413 s (48,466 tokens; max_tokens 222,148) — nothing was
+    written while its text was withheld, and a closed connection was noticed
+    only by a write.  Served for real (uvicorn, a raw socket): the client reads
+    what it was sent while the value is withheld (a streamed answer) or before
+    any byte (a whole one) and closes the socket.  The job is cancelled within a
+    few tokens of the close — every rank drops a cancelled row at the next plan
+    — and the stop is named (RANK_CANCELLED_BY_CLIENT, ``last_engine_stop``).
+    Measured before the fix: the whole answer ran on (201 tokens at the close,
+    3,087 three seconds later, never cancelled); the streamed one was cancelled
+    only by Starlette's own disconnect listener, and nothing named it."""
+    running = _Server(tokenizer_dir)
+    http, port = _on_a_port(running)
+    try:
+        tokens = running.script(f"<tool_call>{WITHHELD}</tool_call>")
+        client = _post_raw(port, _body(stream=stream))
+        _until(
+            lambda: running.jobs and running.jobs[-1].produced >= LEAVE_AFTER,
+            "the job never ran",
+        )
+        job = running.jobs[-1]
+        received = _read_then_close(client)
+        at_close = job.produced
+        _until(
+            lambda: job.id in running.given, "the batch loop never let go of the job"
+        )
+        given = running.given[job.id]
+        assert job.cancelled
+        assert given < len(tokens) and given - at_close <= 3, (at_close, given)
+        (stop,) = running.said.tags("RANK_CANCELLED_BY_CLIENT")
+        assert (stop["request_id"], stop["reason"], stop["phase"]) == (
+            job.id,
+            "cancelled_by_client",
+            "generation",
+        )
+        assert stop["completion_tokens"] >= LEAVE_AFTER
+        assert running.state.last_engine_stop == stop
+        if stream:
+            assert stop["withholding"] == "tool_typed_value"
+            assert stop["sent_chars"] < stop["generated_chars"]
+            assert '"name": "shell"' in received and "p1" not in received, received
+            assert running.said.tags("RANK_STREAM_FAILED") == []
+        else:
+            assert received == "" and "withholding" not in stop
+    finally:
+        http.should_exit = True
+        running.close()
+
+
+def test_a_queued_request_whose_client_leaves_never_runs(tokenizer_dir):
+    """A request waiting behind another is cancelled where it waits, and the one
+    it waited behind — and every answer that ends by itself — names no stop."""
+    import httpx
+
+    running = _Server(tokenizer_dir)
+    http, port = _on_a_port(running)
+    try:
+        gate = threading.Event()
+        running.script("the first answer runs to its end", pause_at=5, gate=gate)
+        running.script(f"<tool_call>{WITHHELD}</tool_call>")
+        first = {}
+
+        def ask_first():
+            first["reply"] = httpx.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=_body(stream=False),
+                timeout=60,
+            ).json()
+
+        asking = threading.Thread(target=ask_first)
+        asking.start()
+        _until(lambda: running.jobs and running.jobs[-1].produced >= 5, "no first job")
+        client = _post_raw(port, _body(stream=True))
+        _until(
+            lambda: running.state.jobs.qsize() == 1, "the second request never queued"
+        )
+        _read_then_close(client)
+        _until(
+            lambda: running.said.tags("RANK_CANCELLED_BY_CLIENT"),
+            "the stop was never named",
+        )
+        gate.set()
+        asking.join(timeout=60)
+        _until(lambda: len(running.given) == 2, "the second job was never taken")
+        (stop,) = running.said.tags("RANK_CANCELLED_BY_CLIENT")
+        assert (stop["phase"], stop["completion_tokens"]) == ("waiting", 0)
+        second = running.jobs[-1]
+        assert stop["request_id"] == second.id and running.given[second.id] == 0
+        reply = first["reply"]["choices"][0]
+        assert reply["message"]["content"] == "the first answer runs to its end"
+        assert reply["finish_reason"] == "stop"
+
+        # Answers that end by themselves, streamed and whole: nothing is named.
+        running.said.lines.clear()
+        running.state.last_engine_stop = None
+        for stream in (True, False):
+            running.script("done")
+            with httpx.stream(
+                "POST",
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=_body(stream=stream),
+                timeout=60,
+            ) as response:
+                response.read()
+        time.sleep(0.2)
+        assert running.said.tags("RANK_CANCELLED_BY_CLIENT") == []
+        assert running.state.last_engine_stop is None
+    finally:
+        http.should_exit = True
+        running.close()
+
+
 KICKOFF = call(
     "write",
     ("path", "/w/notes/kickoff.md"),
