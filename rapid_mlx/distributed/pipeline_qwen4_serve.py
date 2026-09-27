@@ -156,8 +156,10 @@ from typing import Any
 
 import mlx.core as mx
 from fastapi import Request
+from mlx_lm.models.cache import CacheList
 
 from . import pipeline_qwen4 as pipe
+from .pipeline_stream import Markers, StreamRelay, StreamWatch
 
 _CMD_SHUTDOWN = 1
 _CMD_PLAN = 2
@@ -361,6 +363,9 @@ class _Row:
     # (the prompt, then every sampled token).
     close_guard: Any = field(default=None, compare=False, repr=False)
     history: Any = field(default=None, compare=False, repr=False)
+    # Every rank: what the row's cache will not give back at ``store_at``
+    # (``_boundary_record``), until it leaves and its cache becomes the entry.
+    record: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -622,18 +627,84 @@ def _own_bytes(value, owned: dict[int, Any] | None = None, arrays=None):
     return result
 
 
+def _boundary_record(cache: list[Any]) -> list[Any]:
+    """What a row's cache cannot give back later, taken at its snapshot boundary.
+
+    goose Q-179: the prefix snapshot is no longer a copy of the whole cache
+    beside the running row; the row's own cache BECOMES the entry when it
+    leaves (``_adopted``).  What the row keeps writing over after the
+    boundary is only what is small: a recurrent layer's state (GDN, the PLE
+    n-gram history — a constant per sequence) and a QSA layer's raw-key ring
+    (``compress_ratio`` keys) with its counters.  The attention KV and the
+    QSA compressed keys are append-only, so the positions before the
+    boundary are still in the row's cache when it leaves.
+    """
+    record = []
+    for layer in cache:
+        if isinstance(layer, CacheList):
+            kv, qsa = layer.caches
+            record.append(
+                (
+                    int(kv.offset),
+                    _own_bytes(copy.deepcopy(qsa.raw_ring)),
+                    qsa._offsets[0],
+                    qsa._compressed_counts[0],
+                )
+            )
+        else:
+            record.append(_own_bytes(copy.deepcopy(layer)))
+    return record
+
+
+def _adopted(layer: Any, record: Any, boundary: int) -> Any:
+    """One layer of a leaving row's cache, cut back to its snapshot boundary.
+
+    ``layer`` is the row's own (a lone row's cache, or ``extract`` of its
+    batch row); ``record`` what ``_boundary_record`` kept of it.  The result
+    is exactly the layer a prefill of the first ``boundary`` tokens leaves:
+    the same types ``make_cache`` builds, owning only its own bytes.
+    """
+    if not isinstance(record, tuple):
+        return record
+    offset, raw_ring, qsa_offset, compressed = record
+    kv, qsa = layer.caches
+    if offset != boundary or qsa_offset != boundary or int(kv.offset) < boundary:
+        raise RuntimeError(
+            f"prefix cache: a row leaves at KV offset {kv.offset} with its record at "
+            f"{offset} / QSA {qsa_offset} for a snapshot at {boundary} — the caches "
+            "diverged from the plan"
+        )
+    entry_kv = type(kv)()
+    entry_kv.keys = mx.contiguous(kv.keys[..., :boundary, :])
+    entry_kv.values = mx.contiguous(kv.values[..., :boundary, :])
+    entry_kv.offset = boundary
+    entry_qsa = type(qsa)(qsa.compress_ratio)
+    entry_qsa.raw_ring = raw_ring
+    if compressed:
+        entry_qsa.compressed_keys = mx.contiguous(qsa.compressed_keys[:, :compressed])
+    entry_qsa._offsets = [boundary]
+    entry_qsa._compressed_counts = [compressed]
+    entry_qsa._pending_left_padding = [0]
+    return CacheList(entry_kv, entry_qsa)
+
+
 class _PrefixStore:
     """One rank's prefix snapshots, by the id rank 0 assigned.  Decides nothing."""
 
     def __init__(self):
         self.entries: dict[int, list[Any]] = {}
 
-    def take(self, entry_id: int) -> list[Any]:
+    def take(self, entry_id: int, move: bool = False) -> list[Any]:
+        """The entry's cache for a restoring row; ``move``: rank 0 evicts it
+        in the same plan, so the row takes the entry itself (goose Q-179: one
+        copy, never the entry and its restore side by side)."""
         if entry_id not in self.entries:
             raise RuntimeError(
                 f"prefix cache: rank 0 restores entry {entry_id}, which this rank "
                 f"does not hold (held: {sorted(self.entries)}) — the ranks diverged"
             )
+        if move:
+            return self.entries.pop(entry_id)
         # Generation mutates offsets and writes into the KV buffers: the
         # restored copy must not alias the stored entry (the single engine's
         # MemoryAwarePrefixCache.fetch copies for the same reason).
@@ -641,6 +712,11 @@ class _PrefixStore:
 
     def put(self, entry_id: int, cache: list[Any]) -> int:
         self.entries[entry_id] = _own_bytes(copy.deepcopy(cache))
+        return _held_bytes(self.entries[entry_id])
+
+    def adopt(self, entry_id: int, cache: list[Any]) -> int:
+        """A leaving row's cache, already cut to its boundary, becomes the entry."""
+        self.entries[entry_id] = _own_bytes(cache)
         return _held_bytes(self.entries[entry_id])
 
     def drop(self, entry_ids: list[int]) -> None:
@@ -783,17 +859,20 @@ class _Engine:
                 for index, joining in enumerate(self.prefilling)
                 if index not in aborted
             ]
+        evict = frozenset(plan.evict)
         if plan.leave:
             leaving = set(plan.leave)
-            self._regroup([i for i in range(len(self.rows)) if i not in leaving])
+            self._regroup(
+                [i for i in range(len(self.rows)) if i not in leaving], discard=evict
+            )
         if plan.joiner is not None:
-            self._start(plan.joiner)
+            self._start(plan.joiner, evict)
         if self.store is not None and plan.evict:
-            # After the restore copied its entry: an evicted entry may be the
+            # After the restore took its entry: an evicted entry may be the
             # one this joiner restores from.
             self.store.drop(plan.evict)
 
-    def _start(self, row: _Row) -> None:
+    def _start(self, row: _Row, evict: frozenset = frozenset()) -> None:
         embeddings, rope = pipe.prepare_multimodal(
             self.stage,
             [row.ids],
@@ -808,7 +887,8 @@ class _Engine:
                 "with images (rank 0 never directs either)"
             )
         if row.reuse_id:
-            cache, start = self.store.take(row.reuse_id), row.cached
+            cache = self.store.take(row.reuse_id, move=row.reuse_id in evict)
+            start = row.cached
         else:
             cache, start = self.stage.make_cache(), 0
         if self.close_guard is not None and row.tools:
@@ -878,11 +958,9 @@ class _Engine:
         )
         row = joining.row
         if row.store_id and stop == row.store_at:
-            measured = _agree_bytes(
-                self.stage, self.store.put(row.store_id, joining.cache)
-            )
-            if self.on_stored is not None:
-                self.on_stored(row, measured)
+            # goose Q-179: only what the row will write over; its cache
+            # becomes the entry when it leaves (``_regroup``).
+            row.record = _boundary_record(joining.cache)
         if not last:
             return None, control
         _extend_history(row, sampled[0])
@@ -890,20 +968,46 @@ class _Engine:
         return sampled[0], control
 
     def _regroup(
-        self, keep: list[int], joining: _Joining | None = None, first: int = 0
+        self,
+        keep: list[int],
+        joining: _Joining | None = None,
+        first: int = 0,
+        discard: frozenset = frozenset(),
     ) -> None:
         """Rebuild the running batch from the kept rows (+ the joined row), layer by layer.
 
         Each kept row's cache is extracted and the rows are merged again (a lone
         row keeps its own, unbatched cache).  One layer at a time, evaluated
         before the next, so the rebuild never holds more than one layer twice.
+
+        A leaving row that took a prefix-cache record gives its cache, cut back
+        to the boundary, to the store as that entry (goose Q-179) — unless rank
+        0's plan evicts the entry in the same plan (``discard``).
         """
         count = len(self.rows)
+        adopting = {
+            i: []
+            for i in range(count)
+            if i not in keep
+            and self.rows[i].store_id
+            and self.rows[i].store_id not in discard
+        }
+        for i in adopting:
+            if self.rows[i].record is None or self.store is None:
+                raise RuntimeError(
+                    f"prefix cache: row {i} leaves directed to store entry "
+                    f"{self.rows[i].store_id} with no boundary record on this rank"
+                )
         rebuilt = self.cache if self.cache is not None else list(joining.cache)
         for index in range(len(rebuilt)):
             parts: list[Any] = []
             if self.cache is not None:
                 layer = self.cache[index]
+                for i, entry in adopting.items():
+                    row = self.rows[i]
+                    own = layer if count == 1 else layer.extract(i)
+                    entry.append(_adopted(own, row.record[index], row.store_at))
+                    mx.eval(entry[-1].state)
                 if count == 1:
                     parts = [layer] if keep == [0] else []
                 else:
@@ -919,6 +1023,14 @@ class _Engine:
             if merged is not None:
                 mx.eval(merged.state)
             rebuilt[index] = merged
+        for i, entry in adopting.items():
+            row = self.rows[i]
+            measured = _agree_bytes(self.stage, self.store.adopt(row.store_id, entry))
+            if self.on_stored is not None:
+                self.on_stored(row, measured)
+        for i in range(count):
+            if i not in keep:
+                self.rows[i].record = None
         self.rows = [self.rows[i] for i in keep]
         self.current = [self.current[i] for i in keep]
         self.ropes = [self.ropes[i] for i in keep]
@@ -968,6 +1080,10 @@ class _Job:
     waited: int = 0
     # Prompt tokens it had to prefill when admitted (after its prefix restore).
     prefill: int = 0
+    # Rank 0's HTTP side, a streamed chat answer only: what its client has and
+    # has not been sent (``pipeline_stream.StreamWatch``, goose Q-146) — the
+    # ``stream`` block of its /v1/status row.
+    stream: Any = field(default=None, compare=False, repr=False)
 
     def push(self, item) -> None:
         self.loop.call_soon_threadsafe(self.events.put_nowait, item)
@@ -1160,6 +1276,22 @@ class _KvBudget:
             for stage in self.plan.stages
         ]
 
+    def record_bytes(self) -> list[int]:
+        """Each rank's bound on one row's boundary record (``_boundary_record``):
+        every recurrent layer's state and every QSA layer's raw-key ring — what
+        a directed snapshot holds beside its row until the row leaves."""
+        act = self.plan.checkpoint.activation_bytes
+        ring = int(self.args.indexer_compress_ratio) * int(self.args.indexer_head_dim)
+        return [
+            sum(
+                pipe.layer_state_bytes(self.args, index, 1, 1, act)
+                if self.args.layer_types[index] == "linear_attention"
+                else ring * act
+                for index in range(stage.start, stage.end)
+            )
+            for stage in self.plan.stages
+        ]
+
 
 @dataclass
 class _Entry:
@@ -1171,23 +1303,33 @@ class _PrefixIndex:
     """Rank 0's prefix-cache decisions: what to restore, snapshot and evict.
 
     Bounded by bytes alone, per rank: at every admission the entries plus the
-    snapshot this batch will take must fit each rank's planned KV budget minus
-    what the rows need then (``_KvBudget.admission``), and before a prefilling
-    row's last chunk merges it into the batch they must fit beside what the
-    batch will hold (``yield_to``) — the cache holds only the budget live
-    requests leave idle, and yields it to them first.  LRU order, refreshed
-    on every hit.  No entry count bound: the count can never evict before the
-    bytes do.
+    snapshots in flight must fit each rank's planned KV budget minus what the
+    rows need then (``_KvBudget.admission``), and before a prefilling row's
+    last chunk merges it into the batch they must fit beside what the batch
+    will hold (``yield_to``) — the cache holds only the budget live requests
+    leave idle, and yields it to them first.  LRU order, refreshed on every
+    hit.  No entry count bound: the count can never evict before the bytes do.
+
+    One copy (goose Q-179).  A directed snapshot no longer copies the row's
+    cache beside it: the row keeps a small boundary record (charged at
+    ``record_bytes`` while it runs) and its own cache becomes the entry when
+    it leaves (charged at ``entry_bytes`` from the plan it leaves in —
+    ``leaving`` — and measured once every rank holds it).  A restore whose
+    entry is evicted in the same plan moves the entry into the row.  E2E #5b
+    (Flash, two rows each reserving the whole 262k context): the copy beside
+    the batch stopped fitting rank 1's 0.91 GB of room at 53,409 tokens
+    (entry 0.98 GB), every later call re-read 60-62k tokens, ~4 min each.
     """
 
     def __init__(self, kv: _KvBudget):
         self.kv = kv
         self.entries: OrderedDict[int, _Entry] = OrderedDict()
-        # Snapshots directed but not yet taken (their rows are still
-        # prefilling): charged at their bound until ``stored`` or ``forget``.
-        # Rows prefill interleaved (Q-145), so a snapshot can still be pending
-        # when the next request is admitted.
+        # Snapshots directed but not yet stored: charged at their record's
+        # bound while their rows run, at the entry's bound from the plan the
+        # row leaves in (``leaving``), until ``stored`` or ``forget``.
         self.pending: dict[int, list[int]] = {}
+        # The pending snapshots whose rows leave in the plan being made.
+        self.adopting: set[int] = set()
         # Bumped whenever ``lookup`` could answer differently.
         self.version = 0
         self.next_id = 1
@@ -1271,7 +1413,7 @@ class _PrefixIndex:
                 ):
                     self._skip("already_stored")
                 else:
-                    new = self.kv.entry_bytes(row.boundary)
+                    new = self.kv.record_bytes()
                     row.store_id, row.store_at = self.next_id, row.boundary
                     self.next_id += 1
             evict = []
@@ -1284,11 +1426,44 @@ class _PrefixIndex:
                 evict.append(entry_id)
                 self.evicted += 1
             if any(new) and over(new):
-                # Even an empty cache cannot hold this snapshot beside the batch.
+                # Even an empty cache cannot hold this row's record beside the batch.
                 self._skip("no_room_beside_the_batch")
                 row.store_id = row.store_at = 0
             elif row.store_id:
                 self.pending[row.store_id] = new
+            if evict:
+                self.version += 1
+            return evict
+
+    def leaving(self, rows: list[_Row]) -> None:
+        """Rows that leave in the plan being made: each one's snapshot is its
+        cache, cut back to the boundary, from this plan on (goose Q-179)."""
+        with self.lock:
+            for row in rows:
+                if row.store_id in self.pending:
+                    self.pending[row.store_id] = self.kv.entry_bytes(row.store_at)
+                    self.adopting.add(row.store_id)
+
+    def settle(self, need: list[int]) -> list[int]:
+        """Once the plan's rows need ``need``: entries go, oldest first, until
+        the cache fits beside them; if the snapshots taken in this plan still
+        do not, they are not kept (their ids ride the plan's evictions, so no
+        rank adopts them).  Returns the ids every rank drops."""
+        with self.lock:
+            evict = []
+            while self.entries and not self.kv.fits(
+                [n + h for n, h in zip(need, self._held())]
+            ):
+                entry_id, _ = self.entries.popitem(last=False)
+                evict.append(entry_id)
+                self.evicted += 1
+            for entry_id in sorted(self.adopting):
+                if self.kv.fits([n + h for n, h in zip(need, self._held())]):
+                    break
+                self.pending.pop(entry_id)
+                evict.append(entry_id)
+                self._skip("no_room_after_the_row")
+            self.adopting.clear()
             if evict:
                 self.version += 1
             return evict
@@ -1304,6 +1479,7 @@ class _PrefixIndex:
         """A directed snapshot that will never be taken (its row was aborted)."""
         with self.lock:
             self.pending.pop(entry_id, None)
+            self.adopting.discard(entry_id)
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -1356,6 +1532,17 @@ class _State:
     eos_ids: frozenset = frozenset()
     # Rank 0's sampling layers under each request's own fields (goose Q-159).
     sampling: _SamplingDefaults = field(default_factory=_SamplingDefaults)
+    # The logits' width (the checkpoint's vocab_size): a top_k at or past it
+    # raises in the sampling rank's sampler and ends every rank (goose Q-164's
+    # class), so rank 0 refuses it first.  0 only where no model is loaded (an
+    # app built for a test), which checks nothing against it.
+    vocab: int = 0
+    # serve's ``emit`` (goose's rank log); None prints ``PIPELINE_<tag>`` lines.
+    emit: Any = field(default=None, compare=False, repr=False)
+    # The last answer the engine ended itself (goose Q-161): the request, why
+    # (``tool_call_repeated`` / ``text_cycle``) and the words.  Its row leaves
+    # /v1/status with it; this stays.
+    last_engine_stop: Any = None
 
 
 def _template_parsers(tokenizer) -> tuple[str | None, str | None]:
@@ -1522,6 +1709,101 @@ def _not_served(state: _State, model: str) -> str:
     return f"model '{model}' is not served here; this engine serves '{state.served}'{names}"
 
 
+def _unhonoured(body: dict) -> str | None:
+    """Why this request asks for something the split cannot do, or None.
+
+    goose Q-177 (the tensor split, 2026-09-27): a ``top_logprobs`` above 11
+    dropped the connection with no reply.  Here such fields were ignored — an
+    answer that looked like what was asked and was not — and a malformed
+    ``stop`` raised inside the stream, after its headers, which drops the
+    connection the same way.  Each is now a named 400 before anything runs.
+    """
+    n = body.get("n")
+    if n is not None and n != 1:
+        return f"n={n!r}: the pipeline split writes one choice per request"
+    if body.get("logprobs") or body.get("top_logprobs") not in (None, 0):
+        return (
+            "logprobs / top_logprobs: the pipeline split returns no log-probabilities "
+            "(its sampling rank shares only the sampled token)"
+        )
+    if body.get("logit_bias"):
+        return "logit_bias: the pipeline split's sampler applies no per-token bias"
+    if body.get("seed") is not None:
+        return (
+            "seed: the pipeline split samples from one process-wide random state, so "
+            "a per-request seed cannot be honoured"
+        )
+    response_format = body.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") not in (
+        None,
+        "text",
+    ):
+        return (
+            f"response_format {response_format.get('type')!r}: the pipeline split does "
+            "not constrain its output to a format"
+        )
+    stop = body.get("stop")
+    if stop is not None and not (
+        (isinstance(stop, str) and stop)
+        or (
+            isinstance(stop, list)
+            and all(isinstance(item, str) and item for item in stop)
+        )
+    ):
+        return f"stop must be a non-empty string or a list of them, not {stop!r}"
+    for key in ("max_completion_tokens", "max_tokens"):
+        value = body.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            return f"{key} must be a whole number of at least 1, not {value!r}"
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return "messages must be a non-empty list"
+    if not all(isinstance(message, dict) for message in messages):
+        return "every message must be an object"
+    tools = body.get("tools")
+    if tools is not None and not (
+        isinstance(tools, list)
+        and all(
+            isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and isinstance(tool["function"].get("name"), str)
+            for tool in tools
+        )
+    ):
+        return "tools must be a list of {type: function, function: {name, parameters}}"
+    return None
+
+
+def _sampling_refusal(sampling: dict, vocab: int) -> str | None:
+    """Why the resolved sampling would raise in the sampling rank, or None.
+
+    mlx_lm's sampler raises on a top_k that is not below the logits' width and
+    on a min_p outside [0, 1] (measured, mlx_lm 0.31.3), inside the tick loop
+    every rank runs — so one request would end the pair (goose Q-164's class).
+    The layer that supplied the value is named with it.
+    """
+    top_k, top_p, min_p = (sampling[key] for key in ("top_k", "top_p", "min_p"))
+    temperature = sampling["temperature"]
+    if top_k["value"] is not None and (
+        top_k["value"] < 0 or (vocab and top_k["value"] >= vocab)
+    ):
+        return (
+            f"top_k {top_k['value']} ({top_k['from']}) must be 0 (off) or below the "
+            f"vocabulary's {vocab} tokens"
+        )
+    for key, entry in (("top_p", top_p), ("min_p", min_p)):
+        if entry["value"] is not None and not 0.0 <= entry["value"] <= 1.0:
+            return f"{key} {entry['value']} ({entry['from']}) must be within [0, 1]"
+    if temperature["value"] is not None and temperature["value"] < 0:
+        return (
+            f"temperature {temperature['value']} ({temperature['from']}) must not be "
+            "negative"
+        )
+    return None
+
+
 def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -1555,6 +1837,38 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         capabilities.append("tools")
 
     boundary_renderer = _BoundaryRenderer(tokenizer, state.served)
+    say = state.emit or (
+        lambda tag, payload: print(f"PIPELINE_{tag} {json.dumps(payload)}", flush=True)
+    )
+    # goose Q-178 (pipeline_stream.py): the markers that move an answer between
+    # reasoning, text and a call, and the parser a streamed call is read by.
+    markers = Markers.of(tokenizer)
+    call_reader = None
+    if tool_parser == "qwen3_coder_xml":
+        from ..tool_parsers import ToolParserManager
+
+        call_reader = ToolParserManager.get_tool_parser(tool_parser)(tokenizer)
+
+    def record_stop(stop: dict) -> None:
+        state.last_engine_stop = stop
+
+    def unstreamed(body: dict, tools) -> str | None:
+        """Why the relay leaves this request's calls to the post-processor, or None."""
+        if not tools:
+            return "the request declares no tools"
+        if call_reader is None:
+            return (
+                f"the tool parser {tool_parser} has no streamer on the pipeline split"
+            )
+        if markers.call_start is None or markers.call_end is None:
+            return "the checkpoint's <tool_call> / </tool_call> are not single tokens"
+        if body.get("parallel_tool_calls") is False:
+            return (
+                "parallel_tool_calls is false: the post-processor keeps the first call"
+            )
+        if not call_reader._declared_tool_names(body):
+            return "tool_choice leaves no tool executable"
+        return None
 
     def error(status: int, message: str, kind: str) -> JSONResponse:
         return JSONResponse(
@@ -1612,6 +1926,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             if state.prefix is not None
             else {"enabled": False, "reason": "--no-prefix-cache"},
             "sampling_defaults": state.sampling.report(),
+            # The last answer the engine ended itself (goose Q-161): its row
+            # has left the table with it.
+            "last_engine_stop": state.last_engine_stop,
             "status": "ok",
         }
 
@@ -1642,6 +1959,13 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 "server_busy",
             )
         body = await request.json()
+        if not isinstance(body, dict):
+            return error(
+                400, "the request body must be a JSON object", "invalid_request_error"
+            )
+        refusal = _unhonoured(body)
+        if refusal is not None:
+            return error(400, refusal, "invalid_request_error")
         model = body.get("model")
         if model is not None and model not in _served_names(state):
             return error(404, _not_served(state, model), "model_not_found")
@@ -1673,16 +1997,27 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             sampling = state.sampling.resolve(body)
         except ValueError as refusal:
             return error(400, str(refusal), "invalid_request_error")
+        refusal = _sampling_refusal(sampling, state.vocab)
+        if refusal is not None:
+            return error(400, refusal, "invalid_request_error")
         kwargs = dict(body.get("chat_template_kwargs") or {})
         enable_thinking = kwargs.pop("enable_thinking", body.get("enable_thinking"))
-        prompt = apply_chat_template(
-            tokenizer,
-            messages,
-            tools=convert_tools_for_template(tools) if tools else None,
-            enable_thinking=enable_thinking,
-            model_name=state.served,
-            chat_template_kwargs=kwargs or None,
-        )
+        try:
+            prompt = apply_chat_template(
+                tokenizer,
+                messages,
+                tools=convert_tools_for_template(tools) if tools else None,
+                enable_thinking=enable_thinking,
+                model_name=state.served,
+                chat_template_kwargs=kwargs or None,
+            )
+        except Exception as refusal:  # noqa: BLE001 - the template reads only the request
+            return error(
+                400,
+                f"the chat template cannot render this request: "
+                f"{type(refusal).__name__}: {refusal}",
+                "invalid_request_error",
+            )
         images = None
         if pictures:
             try:
@@ -1699,6 +2034,9 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             )
         else:
             ids = tokenizer.encode(prompt)
+        if not ids:
+            # An empty row would join no plan on any rank and wait forever.
+            return error(400, "the rendered prompt is empty", "invalid_request_error")
         boundary = 0
         if state.prefix is not None and images is None:
             stable = BatchedEngine._stable_messages_before_transient_tail(
@@ -1742,7 +2080,6 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             loop,
             asyncio.Queue(),
         )
-        state.jobs.put(job)
         created = int(time.time())
         processor = StreamingPostProcessor(
             cfg,
@@ -1751,11 +2088,12 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             request=body,
         )
         processor.reset()
-        if processor.reasoning_parser is not None and _should_start_in_thinking(
+        primed = processor.reasoning_parser is not None and _should_start_in_thinking(
             getattr(tokenizer, "chat_template", "") or "",
             enable_thinking,
             tools_requested=bool(tools),
-        ):
+        )
+        if primed:
             # The template opens <think> in the generation prompt, so the
             # model never emits the opener.  deepseek_r1's streaming path
             # flips a tagless stream to content after 64 characters unless it
@@ -1763,9 +2101,71 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             # configure_request on the distill variant).  Measured on Flash:
             # without it every thought past 64 chars streamed as content.
             processor.reasoning_parser._prompt_primed_thinking = True
+        relay = None
+        if body.get("stream"):
+            # goose Q-178 (pipeline_stream.py): the relay streams the calls the
+            # post-processor would hold to the end, reports what the client
+            # has not been sent, and ends an answer that repeats itself.
+            job.stream = StreamWatch(say, job.id)
+            relay = StreamRelay(
+                job.stream,
+                markers,
+                reasoning=primed,
+                parser=call_reader,
+                request=body,
+                owns=unstreamed(body, tools),
+                cycles=bool(tools),
+                say=say,
+                record_stop=record_stop,
+            )
+        # Queued only once everything the answer's reader needs exists: a job
+        # nobody reads would run to its horizon.
+        state.jobs.put(job)
+        fed = ""
+
+        def events_of(events) -> list[tuple[dict, str | None]]:
+            items = []
+            for event in events:
+                delta = delta_of(event)
+                if relay is not None and delta.get("tool_calls"):
+                    delta["tool_calls"] = relay.remap(delta["tool_calls"])
+                items.append((delta, event.finish_reason))
+            return items
+
+        def post(piece: str, completion: int) -> list[tuple[dict, str | None]]:
+            """One piece through the post-processor: (delta, finish_reason) per event."""
+            nonlocal fed
+            fed += piece
+            return events_of(
+                processor.process_chunk(
+                    GenerationOutput(
+                        text=fed,
+                        new_text=piece,
+                        prompt_tokens=len(ids),
+                        completion_tokens=completion,
+                        finished=False,
+                        finish_reason=None,
+                    )
+                )
+            )
+
+        def through(actions, completion: int) -> list[tuple[dict, str | None]]:
+            """The relay's actions, in order: text for the post-processor, calls it sends."""
+            items = []
+            for kind, value in actions:
+                if kind == "call":
+                    items.append(({"tool_calls": [value]}, None))
+                elif value:
+                    items.extend(post(value, completion))
+            return items
+
+        def pieces(token, piece: str, completion: int):
+            if relay is None:
+                return post(piece, completion) if piece else []
+            return through(relay.take(token, piece), completion)
 
         async def generate():
-            """Yield (events, finish_reason, completion_tokens) as tokens arrive."""
+            """Yield ([(delta, finish_reason)], finish_reason, completion_tokens) as tokens arrive."""
             detok = tokenizer.detokenizer
             text = ""
             finish = "length"
@@ -1785,9 +2185,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                     break
                 detok.add_token(token)
                 piece = detok.last_segment
+                hit = False
                 if stops:
                     candidate = text + piece
-                    hit = min(
+                    at = min(
                         (
                             candidate.find(s, max(0, len(text) - len(s)))
                             for s in stops
@@ -1795,61 +2196,37 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                         ),
                         default=-1,
                     )
-                    if hit >= 0:
-                        piece = candidate[:hit][len(text) :]
-                        text += piece
+                    if at >= 0:
+                        piece = candidate[:at][len(text) :]
+                        hit = True
                         finish = "stop"
                         job.finished = True
-                        if piece:
-                            yield (
-                                processor.process_chunk(
-                                    GenerationOutput(
-                                        text=text,
-                                        new_text=piece,
-                                        prompt_tokens=len(ids),
-                                        completion_tokens=completion,
-                                        finished=False,
-                                        finish_reason=None,
-                                    )
-                                ),
-                                None,
-                                completion,
-                            )
-                        break
                 text += piece
-                if piece:
-                    yield (
-                        processor.process_chunk(
-                            GenerationOutput(
-                                text=text,
-                                new_text=piece,
-                                prompt_tokens=len(ids),
-                                completion_tokens=completion,
-                                finished=False,
-                                finish_reason=None,
-                            )
-                        ),
-                        None,
-                        completion,
-                    )
+                # A stop sequence cut this token's text: its marker never ran.
+                items = pieces(None if hit else token, piece, completion)
+                if items:
+                    yield items, None, completion
+                if relay is not None and relay.stop is not None:
+                    # goose Q-161: the engine ended the answer; every rank's
+                    # row leaves at the next plan.
+                    finish = "stop"
+                    job.finished = True
+                    break
+                if hit:
+                    break
             detok.finalize()
             tail = detok.last_segment
             if tail and finish != "stop":
                 text += tail
-                yield (
-                    processor.process_chunk(
-                        GenerationOutput(
-                            text=text,
-                            new_text=tail,
-                            prompt_tokens=len(ids),
-                            completion_tokens=completion,
-                            finished=False,
-                            finish_reason=None,
-                        )
-                    ),
-                    None,
-                    completion,
-                )
+                items = pieces(None, tail, completion)
+                if items:
+                    yield items, None, completion
+            if relay is not None:
+                items = through(relay.finish(), completion)
+                if items:
+                    yield items, None, completion
+                if relay.calls_sent and finish == "stop":
+                    finish = "tool_calls"
             terminal = processor.process_chunk(
                 GenerationOutput(
                     text="",
@@ -1861,7 +2238,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 )
             )
             terminal.extend(processor.finalize())
-            yield terminal, finish, completion
+            yield events_of(terminal), finish, completion
 
         def delta_of(event) -> dict:
             delta: dict[str, Any] = {}
@@ -1873,10 +2250,17 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 delta["tool_calls"] = event.tool_calls
             return delta
 
+        def failure_text(failure: BaseException) -> str:
+            if isinstance(failure, RuntimeError):
+                return str(failure)
+            return f"{type(failure).__name__}: {failure}"
+
         if body.get("stream"):
+            watch = job.stream
 
             async def sse():
                 def chunk(delta, finish=None, usage=None, refusal=None):
+                    watch.sent(delta)
                     payload = {
                         "id": f"chatcmpl-{job.id}",
                         "object": "chat.completion.chunk",
@@ -1899,21 +2283,38 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
                 finish = "stop"
                 completion = 0
                 try:
-                    async for events, final, completion in generate():
-                        for event in events:
-                            if event.finish_reason:
-                                finish = event.finish_reason
-                            delta = delta_of(event)
+                    async for items, final, completion in generate():
+                        for delta, reason in items:
+                            if reason:
+                                finish = reason
                             if delta:
                                 yield chunk(delta)
+                        watch.settle()
                         if final is not None and finish == "stop":
                             finish = final
-                except RuntimeError as failure:
-                    yield f"data: {json.dumps({'error': {'message': str(failure), 'type': 'pipeline_error'}})}\n\n"
+                except Exception as failure:  # noqa: BLE001 - said on the stream (goose Q-177: never a dropped connection)
+                    if not isinstance(failure, RuntimeError):
+                        say(
+                            "RANK_STREAM_FAILED",
+                            {
+                                "request_id": job.id,
+                                "error": failure_text(failure),
+                                "generated_chars": watch.generated_chars,
+                                "tail": watch.tail,
+                            },
+                        )
+                    error_payload = {
+                        "error": {
+                            "message": failure_text(failure),
+                            "type": "pipeline_error",
+                        }
+                    }
+                    yield f"data: {json.dumps(error_payload)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 finally:
                     job.cancelled = True
+                    watch.end()
                 usage = {
                     "prompt_tokens": len(ids),
                     "completion_tokens": completion,
@@ -1929,20 +2330,20 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         finish = "stop"
         completion = 0
         try:
-            async for events, final, completion in generate():
-                for event in events:
-                    if event.finish_reason:
-                        finish = event.finish_reason
-                    if event.content:
-                        content.append(event.content)
-                    if event.reasoning:
-                        reasoning.append(event.reasoning)
-                    if event.tool_calls:
-                        calls.extend(event.tool_calls)
+            async for items, final, completion in generate():
+                for delta, reason in items:
+                    if reason:
+                        finish = reason
+                    if delta.get("content"):
+                        content.append(delta["content"])
+                    if delta.get("reasoning_content"):
+                        reasoning.append(delta["reasoning_content"])
+                    if delta.get("tool_calls"):
+                        calls.extend(delta["tool_calls"])
                 if final is not None and finish == "stop":
                     finish = final
-        except RuntimeError as failure:
-            return error(500, str(failure), "pipeline_error")
+        except Exception as failure:  # noqa: BLE001 - a named 500 (goose Q-177)
+            return error(500, failure_text(failure), "pipeline_error")
         finally:
             job.cancelled = True
         message: dict[str, Any] = {
@@ -2231,11 +2632,23 @@ class _Scheduler:
         ]
         prefilling = [(job, joining.left) for job, joining in pairs]
         joiner, evict = None, []
+        needs = []
+        if state.prefix is not None:
+            # goose Q-179: a leaving row's cache becomes its snapshot in this plan.
+            state.prefix.leaving([self.running[i].row for i in leave])
+            needs.append(
+                state.kv.held(
+                    self._decoding(survivors),
+                    self._prompts([job for job, _ in prefilling]),
+                )
+            )
         if state.prefix is not None and survivors:
             # The target's merge waits on prefix entries: they go first.
             room, need = self._join_room(survivors, pairs)
             if room == "evict":
                 evict = state.prefix.yield_to(need)
+            if need is not None:
+                needs.append(need)
         self._collect(block=block and not survivors and not prefilling)
         while not (self.stopping or state.shutting_down):
             head = self._admissible(survivors, prefilling)
@@ -2244,12 +2657,11 @@ class _Scheduler:
                 self.admitted = head
                 joiner = head.row
                 if state.prefix is not None:
-                    evict += state.prefix.admit(
-                        head.row,
-                        self._admission(
-                            head, survivors, [job for job, _ in prefilling]
-                        ),
+                    need = self._admission(
+                        head, survivors, [job for job, _ in prefilling]
                     )
+                    needs.append(need)
+                    evict += state.prefix.admit(head.row, need)
                 break
             head = self._head(prefilling)
             if head is None or survivors or prefilling:
@@ -2270,6 +2682,8 @@ class _Scheduler:
             self._collect(block=block)
         if self.stopping or state.shutting_down:
             return None
+        if needs:
+            evict += state.prefix.settle([max(values) for values in zip(*needs)])
         return _Plan(leave=leave, abort=abort, joiner=joiner, evict=evict)
 
     def applied(self, plan: _Plan) -> None:
@@ -2602,6 +3016,8 @@ def serve(options, emit=None) -> int:
         prefix=None if store is None else _PrefixIndex(kv),
         eos_ids=frozenset(tokenizer.eos_token_ids),
         sampling=sampling,
+        vocab=plan.args.vocab_size,
+        emit=emit,
     )
 
     import uvicorn

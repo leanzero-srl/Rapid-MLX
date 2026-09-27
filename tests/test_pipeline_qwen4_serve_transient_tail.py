@@ -89,6 +89,9 @@ class _Kv:
     def entry_bytes(self, tokens):
         return [tokens, tokens]
 
+    def record_bytes(self):
+        return [1, 1]
+
 
 class _Server:
     """The pipeline server's app with rank 0's prefix index and a stand-in batch loop."""

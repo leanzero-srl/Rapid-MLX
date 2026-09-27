@@ -584,24 +584,56 @@ class _BytesKv:
     def entry_bytes(self, tokens: int) -> list[int]:
         return [tokens, 2 * tokens]
 
+    def record_bytes(self) -> list[int]:
+        return [1, 2]
+
+    def fits(self, need: list[int]) -> bool:
+        return all(n <= budget for n, budget in zip(need, self.budgets))
+
 
 def test_a_pending_snapshot_is_charged_until_it_is_stored_or_forgotten():
-    """Rows prefill interleaved, so a directed snapshot can still be untaken at the next admission."""
+    """Rows prefill interleaved, so a directed snapshot can still be untaken at the next admission.
+
+    goose Q-179: while its row runs, a snapshot is only the row's boundary
+    record; from the plan its row leaves in, it is the row's own cache cut back
+    to the boundary, charged as the entry it becomes.
+    """
     index = serve._PrefixIndex(_BytesKv([100, 100]))
     first = serve._Row([1] * 30, 4, 0.0, 1.0, boundary=20)
     assert index.admit(first, index.kv.reserve([30])) == []
-    assert first.store_at == 20 and index.pending == {first.store_id: [20, 40]}
-    # Beside it, the batch leaves room 40 per rank: the pending [20, 40] plus
-    # a second [20, 40] would not fit rank 1, so the second is not directed.
+    assert first.store_at == 20 and index.pending == {first.store_id: [1, 2]}
+    # Beside two rows (room 40 per rank) the second row's record fits.  Before
+    # Q-179 its snapshot was a copy beside the batch ([20, 40]) and was refused.
     second = serve._Row([2] * 30, 4, 0.0, 1.0, boundary=20)
     index.admit(second, index.kv.reserve([30, 30]))
-    assert second.store_id == 0
-    assert index.status()["skipped"] == {"no_room_beside_the_batch": 1}
+    assert second.store_id
+    assert index.pending == {first.store_id: [1, 2], second.store_id: [1, 2]}
+    assert index.status()["skipped"] == {}
     # The first row was aborted before its snapshot: the charge goes.
     index.forget(first.store_id)
-    third = serve._Row([3] * 30, 4, 0.0, 1.0, boundary=20)
-    index.admit(third, index.kv.reserve([30, 30]))
-    assert third.store_id and index.pending == {third.store_id: [20, 40]}
+    assert index.pending == {second.store_id: [1, 2]}
+    # The second row leaves: from this plan on its snapshot is the entry.
+    index.leaving([second])
+    assert index.pending == {second.store_id: [20, 40]}
+    assert index.settle([30, 30]) == []
     version = index.version
-    index.stored(third.store_id, tuple(third.ids[:20]), [20, 40])
+    index.stored(second.store_id, tuple(second.ids[:20]), [20, 40])
     assert index.pending == {} and index.version == version + 1
+
+
+def test_a_leaving_rows_snapshot_that_cannot_fit_beside_the_rows_is_not_kept():
+    index = serve._PrefixIndex(_BytesKv([100, 100]))
+    old = serve._Row([4] * 30, 4, 0.0, 1.0, boundary=10)
+    index.admit(old, index.kv.reserve([30]))
+    index.leaving([old])
+    assert index.settle([30, 30]) == []
+    index.stored(old.store_id, tuple(old.ids[:10]), [10, 20])
+    row = serve._Row([5] * 40, 4, 0.0, 1.0, boundary=30)
+    index.admit(row, index.kv.reserve([40]))
+    index.leaving([row])
+    # The rows staying need 70 per rank; rank 1 would hold 20 + 60 beside
+    # them.  The oldest entry goes first; the new snapshot still does not fit,
+    # so no rank adopts it: its id is among the plan's evictions.
+    assert index.settle([70, 70]) == [old.store_id, row.store_id]
+    assert index.pending == {} and not index.entries
+    assert index.status()["skipped"] == {"no_room_after_the_row": 1}
