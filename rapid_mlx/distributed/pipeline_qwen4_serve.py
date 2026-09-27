@@ -1911,8 +1911,16 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
         lambda tag, payload: print(f"PIPELINE_{tag} {json.dumps(payload)}", flush=True)
     )
     # goose Q-178 (pipeline_stream.py): the markers that move an answer between
-    # reasoning, text and a call, and the parser a streamed call is read by.
-    markers = Markers.of(tokenizer)
+    # reasoning, text and a call — read from the tokenizer by the first streamed
+    # request, not while the app is built (building it encodes nothing) — and
+    # the parser a streamed call is read by.
+    resolved_markers: list[Markers] = []
+
+    def markers() -> Markers:
+        if not resolved_markers:
+            resolved_markers.append(Markers.of(tokenizer))
+        return resolved_markers[0]
+
     call_reader = None
     if tool_parser == "qwen3_coder_xml":
         from ..tool_parsers import ToolParserManager
@@ -1930,7 +1938,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             return (
                 f"the tool parser {tool_parser} has no streamer on the pipeline split"
             )
-        if markers.call_start is None or markers.call_end is None:
+        if markers().call_start is None or markers().call_end is None:
             return "the checkpoint's <tool_call> / </tool_call> are not single tokens"
         if body.get("parallel_tool_calls") is False:
             return (
@@ -2191,7 +2199,7 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             job.stream = StreamWatch(say, job.id)
             relay = StreamRelay(
                 job.stream,
-                markers,
+                markers(),
                 reasoning=primed,
                 parser=call_reader,
                 request=body,

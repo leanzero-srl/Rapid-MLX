@@ -879,3 +879,19 @@ def test_a_failure_inside_the_stream_is_said_on_it_not_a_dropped_connection(
     (failed,) = server.said.tags("RANK_STREAM_FAILED")
     assert "fine so far" in failed["tail"]
     assert server.jobs[-1].cancelled
+
+
+def test_building_the_app_encodes_nothing(tokenizer_dir):
+    """The relay's markers are read by the first streamed request: goose's
+    render test replaces ``encode`` to capture the prompt, and an app built
+    over such a tokenizer must still build."""
+    from mlx_lm.utils import load_tokenizer
+
+    tokenizer = load_tokenizer(tokenizer_dir)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the app encoded while it was built")
+
+    tokenizer.encode = refuse
+    state = serve._State(served=SERVED, context=4096, max_batch=1)
+    serve._build_app(state, tokenizer, set(tokenizer.eos_token_ids))
