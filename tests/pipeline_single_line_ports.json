@@ -1,7 +1,7 @@
 {
   "_what": "Every single-engine commit (tags v*-lz.*) this pipeline line does not contain by ancestry, reviewed: ported (the pipeline commits that carry it), equivalent (the pipeline already did it its own way) or n/a (the code path does not exist in the pipeline server). tests/test_pipeline_single_line_ports_audit.py fails on any commit missing here. goose Q-144: this line branched at v0.14.3-lz.2 and silently missed lz.6 until Q-143.",
   "upstream_base": "v0.14.3",
-  "reviewed_through": "v0.14.3-lz.9",
+  "reviewed_through": "v0.14.3-lz.10",
   "commits": {
     "999d43ea656bd2f2dfd7834bf4e3dca7e2ad5a14": {
       "tag": "v0.14.3-lz.3",
@@ -76,6 +76,16 @@
       "status": "equivalent",
       "pipeline": ["a863c60c5db1ae69b6fee22311e205d940daf6b9"],
       "reason": "the pipeline server's own --served-model-alias landed the same day for the same finding"
+    },
+    "f0a3cd07b9096eb6a815b912c525d6086de3256f": {
+      "tag": "v0.14.3-lz.10",
+      "fixes": "shortest-remaining-prefill-first on the one-row (MTP) engine: a short request takes the engine at the prefilling row's next chunk boundary, the row is parked with its cache (goose Q-103)",
+      "status": "equivalent",
+      "pipeline": [
+        "f8a2461a53301eb55fc859d415a5e90c2b4250cc",
+        "7d3327202c7692ce0f616571b6c89f610b157b8f"
+      ],
+      "reason": "lz.10 is the port OF this line's order to the single engine: _Scheduler._head's jumper-only half-slack SRPF at chunk granularity (goose Q-145) and admission by the KV a request needs (Q-160). The single-engine code it adds (scheduler.py park/resume through BatchGenerator.remove and the prefix-hit path, seconds-based aging because that engine decodes a jumper before the parked row resumes) has no counterpart path here: the pipeline prefills several rows in their own caches and batches their decode"
     }
   }
 }
