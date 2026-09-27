@@ -763,37 +763,79 @@ def test_the_recorded_flash_stream_naming_shell_is_one_streamed_call(server):
 # goose Q-177 / Q-164: what the split cannot honour is a named 400
 # ---------------------------------------------------------------------------
 
+UNSUPPORTED, INVALID = "unsupported_parameter", "invalid_value"
+# case: (fields, words the message holds, the field it names, its code)
 REFUSALS = {
-    "n": ({"n": 2}, "n=2"),
-    "logprobs": ({"logprobs": True}, "log-probabilities"),
-    "top_logprobs": ({"top_logprobs": 12}, "log-probabilities"),
-    "logit_bias": ({"logit_bias": {"5": 10}}, "logit_bias"),
-    "seed": ({"seed": 7}, "seed"),
+    "n": ({"n": 2}, "n=2", "n", UNSUPPORTED),
+    "logprobs": ({"logprobs": True}, "log-probabilities", "logprobs", UNSUPPORTED),
+    "top_logprobs": (
+        {"top_logprobs": 12},
+        "log-probabilities",
+        "top_logprobs",
+        UNSUPPORTED,
+    ),
+    "logit_bias": (
+        {"logit_bias": {"5": 10}},
+        "per-token bias",
+        "logit_bias",
+        UNSUPPORTED,
+    ),
+    "seed": ({"seed": 7}, "seed=7", "seed", UNSUPPORTED),
     "response_format": (
         {"response_format": {"type": "json_object"}},
+        "response_format type 'json_object'",
         "response_format",
+        UNSUPPORTED,
     ),
-    "stop_not_text": ({"stop": [123]}, "stop must be"),
-    "stop_empty": ({"stop": ""}, "stop must be"),
-    "max_tokens_zero": ({"max_tokens": 0}, "max_tokens must be"),
-    "max_tokens_text": ({"max_tokens": "5"}, "max_tokens must be"),
-    "max_tokens_bool": ({"max_tokens": True}, "max_tokens must be"),
-    "no_messages": ({"messages": []}, "messages must be"),
-    "tools_shape": ({"tools": [{"type": "function"}]}, "tools must be"),
-    "top_k_past_vocab": ({"top_k": 10_000}, "top_k 10000 (request)"),
-    "top_k_negative": ({"top_k": -1}, "top_k -1 (request)"),
-    "min_p": ({"min_p": 1.5}, "min_p 1.5 (request)"),
-    "top_p": ({"top_p": 2.0}, "top_p 2.0 (request)"),
-    "temperature": ({"temperature": -0.5}, "temperature -0.5 (request)"),
+    "stop_not_text": ({"stop": [123]}, "stop[0] must be a string", "stop", INVALID),
+    "stop_empty": ({"stop": ""}, "stop[0] is empty", "stop", INVALID),
+    "max_tokens_zero": ({"max_tokens": 0}, "max_tokens must be", "max_tokens", INVALID),
+    "max_tokens_text": (
+        {"max_tokens": "5"},
+        "max_tokens must be",
+        "max_tokens",
+        INVALID,
+    ),
+    "max_tokens_bool": (
+        {"max_tokens": True},
+        "max_tokens must be",
+        "max_tokens",
+        INVALID,
+    ),
+    "no_messages": ({"messages": []}, "messages must be", "messages", INVALID),
+    "tools_shape": (
+        {"tools": [{"type": "function"}]},
+        "tools must be",
+        "tools",
+        INVALID,
+    ),
+    "stream_options": (
+        {"stream_options": "usage"},
+        "stream_options must be",
+        "stream_options",
+        INVALID,
+    ),
+    "top_k_past_vocab": ({"top_k": 10_000}, "top_k 10000 (request)", "top_k", INVALID),
+    "top_k_negative": ({"top_k": -1}, "top_k -1 (request)", "top_k", INVALID),
+    "min_p": ({"min_p": 1.5}, "min_p 1.5 (request)", "min_p", INVALID),
+    "top_p": ({"top_p": 2.0}, "top_p 2.0 (request)", "top_p", INVALID),
+    "temperature": (
+        {"temperature": -0.5},
+        "temperature -0.5 (request)",
+        "temperature",
+        INVALID,
+    ),
 }
 
 
 @pytest.mark.parametrize("case", sorted(REFUSALS))
 def test_a_field_the_split_cannot_honour_is_a_named_400(server, case):
-    extra, words = REFUSALS[case]
+    extra, words, param, code = REFUSALS[case]
     response = server.client.post("/v1/chat/completions", json={**_body(), **extra})
     assert response.status_code == 400, response.text
-    assert words in response.json()["error"]["message"]
+    error = response.json()["error"]
+    assert words in error["message"], error
+    assert (error["param"], error["code"]) == (param, code), error
     assert server.state.jobs.qsize() == 0 and server.jobs == []
 
 

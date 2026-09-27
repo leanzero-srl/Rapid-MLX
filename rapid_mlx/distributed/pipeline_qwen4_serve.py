@@ -1709,59 +1709,112 @@ def _not_served(state: _State, model: str) -> str:
     return f"model '{model}' is not served here; this engine serves '{state.served}'{names}"
 
 
-def _unhonoured(body: dict) -> str | None:
-    """Why this request asks for something the split cannot do, or None.
+class _RequestRefusedError(ValueError):
+    """A request field the split cannot honour, named as goose's tensor wrapper
+    names one (rank_request.py): ``param`` and ``code`` (unsupported_parameter:
+    a value the OpenAI API accepts and this split cannot serve; invalid_value)."""
+
+    def __init__(self, param: str | None, message: str, code: str):
+        super().__init__(message)
+        self.param = param
+        self.code = code
+
+
+def _unhonoured(body: dict) -> None:
+    """Raises ``_RequestRefusedError`` for the first field this split cannot honour.
 
     goose Q-177 (the tensor split, 2026-09-27): a ``top_logprobs`` above 11
-    dropped the connection with no reply.  Here such fields were ignored — an
-    answer that looked like what was asked and was not — and a malformed
-    ``stop`` raised inside the stream, after its headers, which drops the
-    connection the same way.  Each is now a named 400 before anything runs.
+    dropped the connection with no reply.  Here such fields were IGNORED — an
+    answer that looked like what was asked and was not — and a ``stop`` that is
+    not a string list raised inside the stream after its headers, which drops
+    the connection the same way.  Each is now a named 400 before anything runs.
     """
     n = body.get("n")
-    if n is not None and n != 1:
-        return f"n={n!r}: the pipeline split writes one choice per request"
-    if body.get("logprobs") or body.get("top_logprobs") not in (None, 0):
-        return (
-            "logprobs / top_logprobs: the pipeline split returns no log-probabilities "
-            "(its sampling rank shares only the sampled token)"
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n != 1):
+        raise _RequestRefusedError(
+            "n",
+            f"n={n!r}: the pipeline split writes one choice per request",
+            "unsupported_parameter",
         )
+    for key in ("logprobs", "top_logprobs"):
+        if body.get(key) not in (None, False, 0):
+            raise _RequestRefusedError(
+                key,
+                f"{key}={body[key]!r}: the pipeline split returns no log-probabilities "
+                "(its sampling rank shares only the sampled token)",
+                "unsupported_parameter",
+            )
     if body.get("logit_bias"):
-        return "logit_bias: the pipeline split's sampler applies no per-token bias"
+        raise _RequestRefusedError(
+            "logit_bias",
+            "logit_bias: the pipeline split's sampler applies no per-token bias",
+            "unsupported_parameter",
+        )
     if body.get("seed") is not None:
-        return (
-            "seed: the pipeline split samples from one process-wide random state, so "
-            "a per-request seed cannot be honoured"
+        raise _RequestRefusedError(
+            "seed",
+            f"seed={body['seed']!r}: the pipeline split samples from one process-wide random "
+            "state, so a per-request seed cannot be honoured; send no seed",
+            "unsupported_parameter",
         )
     response_format = body.get("response_format")
-    if isinstance(response_format, dict) and response_format.get("type") not in (
-        None,
-        "text",
-    ):
-        return (
-            f"response_format {response_format.get('type')!r}: the pipeline split does "
-            "not constrain its output to a format"
-        )
+    if response_format is not None:
+        if not isinstance(response_format, dict):
+            raise _RequestRefusedError(
+                "response_format",
+                f"response_format must be an object, not {type(response_format).__name__}",
+                "invalid_value",
+            )
+        if response_format.get("type") != "text":
+            raise _RequestRefusedError(
+                "response_format",
+                f"response_format type {response_format.get('type')!r}: the pipeline split does "
+                'not constrain its output; only {"type": "text"} is served',
+                "unsupported_parameter",
+            )
     stop = body.get("stop")
-    if stop is not None and not (
-        (isinstance(stop, str) and stop)
-        or (
-            isinstance(stop, list)
-            and all(isinstance(item, str) and item for item in stop)
+    words = [stop] if isinstance(stop, str) else stop
+    if stop is not None and not isinstance(words, list):
+        raise _RequestRefusedError(
+            "stop",
+            f"stop must be a string or a list of strings, not {type(stop).__name__}",
+            "invalid_value",
         )
-    ):
-        return f"stop must be a non-empty string or a list of them, not {stop!r}"
+    for position, word in enumerate(words or []):
+        if not isinstance(word, str):
+            raise _RequestRefusedError(
+                "stop",
+                f"stop[{position}] must be a string, not {type(word).__name__}",
+                "invalid_value",
+            )
+        if not word:
+            # An empty sequence matches at once: the answer would end as if the model stopped.
+            raise _RequestRefusedError(
+                "stop",
+                f"stop[{position}] is empty: a stop sequence needs text",
+                "invalid_value",
+            )
     for key in ("max_completion_tokens", "max_tokens"):
         value = body.get(key)
         if value is not None and (
             isinstance(value, bool) or not isinstance(value, int) or value < 1
         ):
-            return f"{key} must be a whole number of at least 1, not {value!r}"
+            raise _RequestRefusedError(
+                key,
+                f"{key} must be a whole number of at least 1, not {value!r}",
+                "invalid_value",
+            )
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
-        return "messages must be a non-empty list"
+        raise _RequestRefusedError(
+            "messages",
+            "messages must be a non-empty list of message objects",
+            "invalid_value",
+        )
     if not all(isinstance(message, dict) for message in messages):
-        return "every message must be an object"
+        raise _RequestRefusedError(
+            "messages", "every message must be an object", "invalid_value"
+        )
     tools = body.get("tools")
     if tools is not None and not (
         isinstance(tools, list)
@@ -1772,36 +1825,53 @@ def _unhonoured(body: dict) -> str | None:
             for tool in tools
         )
     ):
-        return "tools must be a list of {type: function, function: {name, parameters}}"
-    return None
+        raise _RequestRefusedError(
+            "tools",
+            "tools must be a list of {type: function, function: {name, parameters}}",
+            "invalid_value",
+        )
+    stream_options = body.get("stream_options")
+    if stream_options is not None and not isinstance(stream_options, dict):
+        raise _RequestRefusedError(
+            "stream_options",
+            f"stream_options must be an object, not {type(stream_options).__name__}",
+            "invalid_value",
+        )
 
 
-def _sampling_refusal(sampling: dict, vocab: int) -> str | None:
-    """Why the resolved sampling would raise in the sampling rank, or None.
+def _sampling_refusal(sampling: dict, vocab: int) -> None:
+    """Raises ``_RequestRefusedError`` when the resolved sampling would raise in the sampling rank.
 
     mlx_lm's sampler raises on a top_k that is not below the logits' width and
     on a min_p outside [0, 1] (measured, mlx_lm 0.31.3), inside the tick loop
     every rank runs — so one request would end the pair (goose Q-164's class).
     The layer that supplied the value is named with it.
     """
-    top_k, top_p, min_p = (sampling[key] for key in ("top_k", "top_p", "min_p"))
-    temperature = sampling["temperature"]
+    top_k = sampling["top_k"]
     if top_k["value"] is not None and (
         top_k["value"] < 0 or (vocab and top_k["value"] >= vocab)
     ):
-        return (
+        raise _RequestRefusedError(
+            "top_k",
             f"top_k {top_k['value']} ({top_k['from']}) must be 0 (off) or below the "
-            f"vocabulary's {vocab} tokens"
+            f"vocabulary's {vocab} tokens",
+            "invalid_value",
         )
-    for key, entry in (("top_p", top_p), ("min_p", min_p)):
+    for key in ("top_p", "min_p"):
+        entry = sampling[key]
         if entry["value"] is not None and not 0.0 <= entry["value"] <= 1.0:
-            return f"{key} {entry['value']} ({entry['from']}) must be within [0, 1]"
+            raise _RequestRefusedError(
+                key,
+                f"{key} {entry['value']} ({entry['from']}) must be within [0, 1]",
+                "invalid_value",
+            )
+    temperature = sampling["temperature"]
     if temperature["value"] is not None and temperature["value"] < 0:
-        return (
-            f"temperature {temperature['value']} ({temperature['from']}) must not be "
-            "negative"
+        raise _RequestRefusedError(
+            "temperature",
+            f"temperature {temperature['value']} ({temperature['from']}) must not be negative",
+            "invalid_value",
         )
-    return None
 
 
 def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
@@ -1870,9 +1940,19 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             return "tool_choice leaves no tool executable"
         return None
 
-    def error(status: int, message: str, kind: str) -> JSONResponse:
+    def error(status: int, message: str, kind: str, **named) -> JSONResponse:
         return JSONResponse(
-            status_code=status, content={"error": {"message": message, "type": kind}}
+            status_code=status,
+            content={"error": {"message": message, "type": kind, **named}},
+        )
+
+    def refused(refusal: _RequestRefusedError) -> JSONResponse:
+        return error(
+            400,
+            str(refusal),
+            "invalid_request_error",
+            param=refusal.param,
+            code=refusal.code,
         )
 
     @app.get("/v1/models")
@@ -1963,9 +2043,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             return error(
                 400, "the request body must be a JSON object", "invalid_request_error"
             )
-        refusal = _unhonoured(body)
-        if refusal is not None:
-            return error(400, refusal, "invalid_request_error")
+        try:
+            _unhonoured(body)
+        except _RequestRefusedError as refusal:
+            return refused(refusal)
         model = body.get("model")
         if model is not None and model not in _served_names(state):
             return error(404, _not_served(state, model), "model_not_found")
@@ -1997,9 +2078,10 @@ def _build_app(state: _State, tokenizer, eos_ids: set[int], vision=None):
             sampling = state.sampling.resolve(body)
         except ValueError as refusal:
             return error(400, str(refusal), "invalid_request_error")
-        refusal = _sampling_refusal(sampling, state.vocab)
-        if refusal is not None:
-            return error(400, refusal, "invalid_request_error")
+        try:
+            _sampling_refusal(sampling, state.vocab)
+        except _RequestRefusedError as refusal:
+            return refused(refusal)
         kwargs = dict(body.get("chat_template_kwargs") or {})
         enable_thinking = kwargs.pop("enable_thinking", body.get("enable_thinking"))
         try:
