@@ -609,7 +609,21 @@ class SchedulerConfig:
     # stays exactly on the cold image path. Appended for positional callers.
     mllm_media_prefix_cache: str = "auto"
 
+    # LeanZero Q-103. Order of prefill on an engine that runs ONE request at a
+    # time (the vendored B=1 MTP verifier, or ``max_num_seqs=1``). ``fifo`` is
+    # the historical order: a request waits for every earlier request's whole
+    # prefill AND decode. ``srpf`` (shortest remaining prefill first): at each
+    # chunk boundary of a prefilling request, a waiting request with fewer
+    # prompt tokens left takes the engine — the prefilling one is parked with
+    # its cache and resumes where it stopped — while no later arrival may take
+    # more than half of an earlier request's slack (see ``_srpf_head``), and a
+    # park happens only when the measured memory holds both. Decode is never
+    # interrupted. Appended for positional callers.
+    singleton_prefill_order: str = "srpf"
+
     def __post_init__(self) -> None:
+        if self.singleton_prefill_order not in ("srpf", "fifo"):
+            raise ValueError("singleton_prefill_order must be 'srpf' or 'fifo'")
         if self.mllm_singleton_fastpath not in ("auto", "off"):
             raise ValueError(
                 "mllm_singleton_fastpath must be 'auto' or 'off', "
@@ -3853,6 +3867,16 @@ class Scheduler:
     # on its first decode step — the #1834 step-zero barrier generalized to
     # every activation, not just construction (codex #1895 r2+r3).
     _recurrent_prev_running = 0
+    # LeanZero Q-103 (``singleton_prefill_order``). Class-level so
+    # ``__new__``-built stubs step cleanly. The prefill rate is measured on the
+    # engine's own full-chunk prefill steps (seconds and prompt tokens,
+    # summed); the clock is an attribute so the CPU tests can drive it.
+    _srpf_clock = staticmethod(time.perf_counter)
+    _srpf_arrivals = 0
+    _srpf_rate_seconds = 0.0
+    _srpf_rate_tokens = 0
+    num_srpf_parks = 0
+    num_srpf_park_cache_dropped = 0
 
     def __init__(
         self,
@@ -7962,6 +7986,12 @@ class Scheduler:
         """
         if request_processors:
             self.uid_to_request_processors[uid] = list(request_processors)
+            # A processor admitted again under a new uid (a request resumed
+            # after an SRPF park) is live, not a tombstone of its old uid.
+            tombstones = getattr(self, "_stateful_tombstones", None)
+            if tombstones:
+                for processor in request_processors:
+                    tombstones.discard(id(processor))
         if grammar_lp is not None:
             self._uids_with_grammar.add(uid)
             self._known_stateful_processors.add(id(grammar_lp))
@@ -8379,6 +8409,7 @@ class Scheduler:
                 )
                 request.prompt_cache = None
                 request.cached_tokens = 0
+                request._srpf_parked_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
         except Exception as _trim_exc:  # noqa: BLE001
@@ -8397,6 +8428,7 @@ class Scheduler:
             )
             request.prompt_cache = None
             request.cached_tokens = 0
+            request._srpf_parked_tokens = 0
             request.remaining_tokens = request.prompt_token_ids
             return request.prompt_token_ids
         return tokens_to_process
@@ -8609,6 +8641,364 @@ class Scheduler:
             return 1
         return self.config.max_num_seqs
 
+    # ------------------------------------------------------------------
+    # LeanZero Q-103: shortest-remaining-prefill-first on the one-row engine
+    # ------------------------------------------------------------------
+    #
+    # The vendored MTP verifier decodes one request at a time, and admission
+    # kept that request alone for its whole life, prefill included. Under
+    # three streams of unique 13k-token prompts a 1-token request waited up
+    # to 161 s behind prefills it could have gone between. This is the
+    # pipeline runner's order (fork lz-pipeline-qwen4.10/.11, goose Q-145 and
+    # Q-160) adapted to an engine that holds ONE row: rows still prefilling
+    # are the unit of choice, a waiting request with fewer prompt tokens left
+    # takes the engine at the prefilling row's next chunk boundary, and the
+    # prefilling row is PARKED — removed from the generator with its cache,
+    # which comes back as that request's ``prompt_cache`` exactly as a prefix
+    # hit would — and resumes where it stopped. Decode stays batch-1 MTP and
+    # is never interrupted. Each row prefills alone in its own cache, so the
+    # singleton cache form the MTP decode rate depends on is never promoted.
+
+    def _srpf_applies(self) -> bool:
+        return (
+            getattr(self.config, "singleton_prefill_order", "fifo") == "srpf"
+            and getattr(self.config, "scheduling_policy", "fcfs") == "fcfs"
+            and self._max_running_sequences() == 1
+        )
+
+    def _srpf_seconds_per_token(self) -> float | None:
+        """Measured seconds per prompt token of the engine's full-chunk prefill steps."""
+        if self._srpf_rate_tokens <= 0:
+            return None
+        return self._srpf_rate_seconds / self._srpf_rate_tokens
+
+    def _srpf_note_arrival(self, request: Request) -> None:
+        if request._srpf_seq:
+            return
+        self._srpf_arrivals += 1
+        request._srpf_seq = self._srpf_arrivals
+        request._srpf_own_tokens = max(1, self._validated_prompt_tail_cost(request))
+
+    def _srpf_row_progress(self, request: Request) -> tuple[int, int] | None:
+        """(prompt tokens this admission put in the row's cache, tokens still to
+        prefill incl. the kickoff token) while ``request`` prefills in the
+        generator; None once it decodes or when the generator does not hold it."""
+        bg = self.batch_generator
+        uid = request.batch_uid
+        if bg is None or uid is None:
+            return None
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        uids = list(getattr(prompt_batch, "uids", None) or ())
+        processing = list(getattr(bg, "_currently_processing", None) or ())
+        if uid in uids:
+            index = uids.index(uid)
+            if index >= len(processing) or index >= len(prompt_batch.tokens):
+                return None
+            left = sum(len(segment) for segment in processing[index][0])
+            return len(prompt_batch.tokens[index]), left
+        for sequence in getattr(bg, "_unprocessed_sequences", None) or ():
+            if sequence[0] == uid:
+                return 0, sum(len(segment) for segment in sequence[1])
+        return None
+
+    def _srpf_slack(
+        self,
+        request: Request,
+        left: int,
+        admitted: list[tuple[Request, int]],
+        rate: float | None,
+    ) -> float:
+        """Prompt tokens later arrivals may still take ahead of ``request``.
+
+        Its own prefill (the tokens it had to prefill when it arrived) less the
+        engine time LATER arrivals already ran ahead of it — measured seconds,
+        prefill and decode alike, at the measured prefill rate — less what the
+        later rows already admitted (running or parked) will still prefill
+        ahead of it: every one while it has not been admitted, the ones with
+        fewer tokens left once it has. Spent in full, the jumpers doubled its
+        prefill. With no measured rate a delay cannot be priced: a request that
+        has waited behind a later arrival counts as having no slack.
+        """
+        if request._srpf_waited_s > 0.0:
+            if rate is None or rate <= 0.0:
+                return -math.inf
+            waited = request._srpf_waited_s / rate
+        else:
+            waited = 0.0
+        own_admitted = request._srpf_parked or request.status == RequestStatus.RUNNING
+        ahead = sum(
+            other_left
+            for other, other_left in admitted
+            if other is not request
+            and other._srpf_seq > request._srpf_seq
+            and (not own_admitted or other_left < left)
+        )
+        return request._srpf_own_tokens - waited - ahead
+
+    def _srpf_head(
+        self, running: tuple[Request, int] | None = None
+    ) -> tuple[Request, int] | None:
+        """The waiting request that takes the engine next, with its tokens left.
+
+        Fewest prompt tokens left first, then the oldest. A request may go
+        ahead of an earlier arrival — waiting, parked, or the prefilling
+        ``running`` row as (request, tokens left) — only when it takes at most
+        HALF of that one's ``_srpf_slack``: a jump never leaves less slack than
+        it took, a long prompt barely shorter than an earlier one keeps
+        first-come order, and a stream of jumpers stops before an earlier
+        request's slack runs out (goose Q-145's rule). A jumper's decode is
+        not known when it jumps; it ages the requests it passed as it runs, so
+        the bound is their own prefill plus at most one jumper's decode. The
+        oldest waiting request is never held by another waiting one.
+        """
+        waiting = list(self.waiting)
+        if not waiting:
+            return None
+        for request in waiting:
+            self._srpf_note_arrival(request)
+        rate = self._srpf_seconds_per_token()
+        lefts = {id(r): max(1, self._validated_prompt_tail_cost(r)) for r in waiting}
+        admitted = [(r, lefts[id(r)]) for r in waiting if r._srpf_parked]
+        earlier = [(r, lefts[id(r)]) for r in waiting]
+        if running is not None:
+            admitted.append(running)
+            earlier.append(running)
+        slacks = [
+            (other, self._srpf_slack(other, other_left, admitted, rate))
+            for other, other_left in earlier
+        ]
+        candidates = [r for r in waiting if self._request_is_generator_compatible(r)]
+        for request in sorted(candidates, key=lambda r: (lefts[id(r)], r._srpf_seq)):
+            left = lefts[id(request)]
+            if all(
+                2 * left <= slack
+                for other, slack in slacks
+                if other._srpf_seq < request._srpf_seq
+            ):
+                return request, left
+        return None
+
+    @staticmethod
+    def _srpf_cache_bytes(cache: Any) -> tuple[int, float, int]:
+        """(fixed bytes, bytes per token, total bytes) of a live row cache.
+
+        A layer that carries a positional ``offset`` grows with its tokens and
+        is priced per token from its own bytes; anything else (recurrent
+        state) is a fixed size. Measured from the buffers, so it holds for
+        models whose config states no KV dimensions (the 27B's projection is 0).
+        """
+        fixed = 0
+        per_token = 0.0
+        total = 0
+
+        def visit(layer: Any) -> None:
+            nonlocal fixed, per_token, total
+            children = getattr(layer, "caches", None)
+            if isinstance(children, (list, tuple)):
+                for child in children:
+                    visit(child)
+                return
+            try:
+                nbytes = int(getattr(layer, "nbytes", 0) or 0)
+            except (TypeError, ValueError):
+                nbytes = 0
+            total += nbytes
+            offset = getattr(layer, "offset", None)
+            if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0:
+                per_token += nbytes / offset
+            else:
+                fixed += nbytes
+
+        for layer in cache or ():
+            visit(layer)
+        return fixed, per_token, total
+
+    def _srpf_refuse(self, reason: str, detail: str = "") -> None:
+        refusals = self.__dict__.setdefault("_srpf_refusals", {})
+        refusals[reason] = refusals.get(reason, 0) + 1
+        self._srpf_last_refusal = f"{reason}: {detail}" if detail else reason
+
+    def _srpf_park_fits(
+        self, running: Request, candidate: Request, live_cache: list[Any]
+    ) -> bool:
+        """Whether ``candidate`` may run beside ``running``'s parked cache.
+
+        The Q-110 bound: nothing opens unless the measured memory holds it.
+        Priced from the live row's own buffers — the parked copy (the removed
+        row's cache is copied before its batch buffer is freed) plus the
+        candidate's cache at its horizon (every prompt token, its max_tokens
+        and the step after), fixed state included — against the same Metal
+        cap and active-memory reading the admission gate uses
+        (``_enforce_metal_cap_at_admission``), measured now. Prefix-cache
+        entries are counted as held: they yield under pressure, but nothing
+        here is priced on memory that has not been given back yet.
+        """
+        cap = self._resolve_metal_cap_bytes()
+        if cap <= 0:
+            self._srpf_refuse("no_memory_cap")
+            return False
+        fixed, per_token, live_bytes = self._srpf_cache_bytes(live_cache)
+        if live_bytes <= 0:
+            self._srpf_refuse("unmeasured_cache_bytes")
+            return False
+        prompt = len(candidate.prompt_token_ids or ())
+        max_tokens = int(getattr(candidate.sampling_params, "max_tokens", 0) or 0)
+        need = live_bytes + fixed + per_token * (prompt + max_tokens + 1)
+        active = self._current_metal_active_bytes()
+        if active + need >= cap:
+            self._srpf_refuse(
+                "kv_budget", f"active {active} + need {int(need)} >= cap {cap}"
+            )
+            return False
+        return True
+
+    def _srpf_preempt(self) -> Request | None:
+        """Park the prefilling row when a waiting request should take the engine.
+
+        Returns the request to admit in its place, or None when the row keeps
+        the engine (it decodes, nothing waiting has fewer tokens left, no one
+        may jump it, or the memory would not hold both).
+        """
+        if len(self.running) != 1 or not self.waiting:
+            return None
+        request = next(iter(self.running.values()))
+        progress = self._srpf_row_progress(request)
+        if progress is None:
+            return None
+        in_cache, left = progress
+        self._srpf_note_arrival(request)
+        head = self._srpf_head(running=(request, left))
+        if head is None or head[1] >= left:
+            return None
+        candidate = head[0]
+        bg = self.batch_generator
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if in_cache <= 0 or list(getattr(prompt_batch, "uids", ()) or ()) != [
+            request.batch_uid
+        ]:
+            self._srpf_refuse("row_not_in_a_lone_prefill")
+            return None
+        live_cache = list(prompt_batch.prompt_cache or ())
+        expected = int(request.cached_tokens or 0) + in_cache
+        offsets, valid = self._observable_prompt_cache_offsets(live_cache)
+        if not valid or any(offset != expected for offset in offsets):
+            self._srpf_refuse(
+                "unverifiable_cache", f"offsets {offsets[:4]} vs {expected}"
+            )
+            return None
+        if not self._srpf_park_fits(request, candidate, live_cache):
+            return None
+        if not self._srpf_park(request, in_cache):
+            return None
+        return candidate
+
+    def _srpf_park(self, request: Request, in_cache: int) -> bool:
+        """Take the prefilling row out of the generator; its cache waits with it."""
+        uid = request.batch_uid
+        extracted = self.batch_generator.remove([uid], return_prompt_caches=True)
+        payload = extracted.get(uid) if isinstance(extracted, dict) else None
+        cache = payload[0] if isinstance(payload, tuple) and payload else None
+        expected = int(request.cached_tokens or 0) + in_cache
+        if cache:
+            self._attach_hybrid_checkpoints(uid, cache)
+            # Materialize the copy now, so the removed row's batch buffer is
+            # the only thing freed and the parked cache owns exactly its bytes.
+            mx.eval([layer.state for layer in cache])
+        offsets, valid = self._observable_prompt_cache_offsets(cache)
+        self.uid_to_request_id.pop(uid, None)
+        self.request_id_to_uid.pop(request.request_id, None)
+        self._hybrid_checkpoints.pop(uid, None)
+        self._forget_uid_grammar(uid)
+        del self.running[request.request_id]
+        request.batch_uid = None
+        request.status = RequestStatus.WAITING
+        if cache and valid and all(offset == expected for offset in offsets):
+            request.prompt_cache = cache
+            request.cached_tokens = expected
+            request.remaining_tokens = list(request.prompt_token_ids[expected:])
+            request._srpf_parked = True
+            request._srpf_parked_tokens += in_cache
+            self.num_srpf_parks += 1
+            logger.info(
+                "[srpf] parked request=%s at %d/%d prompt tokens",
+                request.request_id[:12],
+                expected,
+                len(request.prompt_token_ids),
+            )
+        else:
+            # The generator gave back something this code cannot resume from.
+            # Correctness first: the request re-prefills from its start.
+            self.num_srpf_park_cache_dropped += 1
+            logger.warning(
+                "[srpf] request=%s: the parked cache could not be verified "
+                "(offsets %s, expected %d); it re-prefills from the start",
+                request.request_id[:12],
+                offsets[:4],
+                expected,
+            )
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request._srpf_parked_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            request._srpf_parked = False
+        self.waiting.append(request)
+        return True
+
+    def _srpf_step_begin(self) -> tuple[Any, ...] | None:
+        """Snapshot before ``BatchGenerator.next``: what the step will age and measure."""
+        if not self.running or not self._srpf_applies():
+            return None
+        active = next(iter(self.running.values()))
+        progress = self._srpf_row_progress(active)
+        generation = getattr(self.batch_generator, "_generation_batch", None)
+        pure_prefill = progress is not None and not len(
+            getattr(generation, "uids", None) or ()
+        )
+        chunk = int(getattr(self.batch_generator, "prefill_step_size", 0) or 0)
+        return active, progress, pure_prefill, chunk, self._srpf_clock()
+
+    def _srpf_step_end(self, snapshot: tuple[Any, ...] | None) -> None:
+        if snapshot is None:
+            return
+        active, before, pure_prefill, chunk, started = snapshot
+        seconds = max(0.0, self._srpf_clock() - started)
+        # A step ages only the requests that arrived BEFORE its row: that is
+        # the delay the shortest-first order cost them. An earlier arrival's
+        # step is the order a later request had anyway (goose Q-145 26d).
+        for request in self.waiting:
+            if request._srpf_seq and request._srpf_seq < active._srpf_seq:
+                request._srpf_waited_s += seconds
+        # The rate prices a request's OWN prefill, which for anything worth
+        # protecting is full chunks: a short prompt's partial chunk costs the
+        # step's fixed overhead over few tokens and would inflate every slack.
+        if not pure_prefill or before is None or chunk <= 0:
+            return
+        after = self._srpf_row_progress(active)
+        if after is None or after[0] - before[0] != chunk:
+            return
+        self._srpf_rate_seconds += seconds
+        self._srpf_rate_tokens += chunk
+
+    def _srpf_stats(self) -> dict[str, Any]:
+        return {
+            "order": getattr(self.config, "singleton_prefill_order", "fifo"),
+            "active": self._srpf_applies(),
+            "parks": self.num_srpf_parks,
+            "parks_cache_dropped": self.num_srpf_park_cache_dropped,
+            "refused": dict(self.__dict__.get("_srpf_refusals", {})),
+            "last_refusal": self.__dict__.get("_srpf_last_refusal"),
+            "prefill_seconds_per_token": self._srpf_seconds_per_token(),
+            "parked": [
+                {
+                    "request_id": request.request_id,
+                    "tokens_in_cache": request.cached_tokens,
+                    "tokens_left": len(request.remaining_tokens or ()),
+                }
+                for request in list(self.waiting)
+                if request._srpf_parked
+            ],
+        }
+
     def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
@@ -8627,8 +9017,21 @@ class Scheduler:
             == "shortest_validated_tail"
             and getattr(self, "_shortest_tail_runtime_supported", None) is not False
         )
+        srpf = self._srpf_applies()
+        preferred = self._srpf_preempt() if srpf else None
         while self.waiting and len(self.running) < self._max_running_sequences():
-            if shortest_tail:
+            if srpf:
+                if preferred is not None and any(r is preferred for r in self.waiting):
+                    request = preferred
+                else:
+                    head = self._srpf_head()
+                    if head is None:
+                        break
+                    request = head[0]
+                preferred = None
+                self.waiting.remove(request)
+                selection_forced = False
+            elif shortest_tail:
                 if self._shortest_tail_admission_capacity() <= 0:
                     break
                 selection = self._select_waiting_request()
@@ -8706,6 +9109,7 @@ class Scheduler:
                 cache_to_use = None
                 request.prompt_cache = None
                 request.cached_tokens = 0
+                request._srpf_parked_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
@@ -8870,7 +9274,14 @@ class Scheduler:
             # A non-trimmable exact hit cannot use the usual trim-one then
             # re-forward-last-token kickoff. Capture the cold prompt at N-1;
             # an identical repeat becomes a safe one-token prefix extension.
-            snapshot_boundary = self._resolve_snapshot_boundary(request)
+            # A request resumed after an SRPF park keeps the boundary its
+            # first admission resolved: the snapshot hooks read that value,
+            # and its parked cache is not a prefix-cache hit.
+            if request._srpf_parked:
+                snapshot_boundary = request._srpf_admitted_boundary
+            else:
+                snapshot_boundary = self._resolve_snapshot_boundary(request)
+                request._srpf_admitted_boundary = snapshot_boundary
             if (
                 self.memory_aware_cache is not None
                 and snapshot_boundary > 0
@@ -8913,6 +9324,7 @@ class Scheduler:
                     cache_to_use = None
                     request.prompt_cache = None
                     request.cached_tokens = 0
+                    request._srpf_parked_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     # Recompute split against the now-full prompt
@@ -8966,7 +9378,11 @@ class Scheduler:
                     self._admission_prefill_uids.add(uid)
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
-                request._prefill_started_at = time.time()
+                resumed = request._srpf_admissions > 0
+                request._srpf_admissions += 1
+                request._srpf_parked = False
+                if not resumed:
+                    request._prefill_started_at = time.time()
                 # #558 PR-3 / #558 budget: record this request's FULL processor
                 # list (grammar + penalties + budget) by uid as the authoritative
                 # state the per-tick realign guard rebuilds from — immune to
@@ -8984,12 +9400,15 @@ class Scheduler:
                 self.running[request.request_id] = request
                 scheduled.append(request)
 
-                self.total_prompt_tokens += request.num_prompt_tokens
+                if not resumed:
+                    self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = (
                     f", {request.cached_tokens} cached"
                     if request.cached_tokens > 0
                     else ""
                 )
+                if resumed:
+                    cache_info += " (resumed after an srpf park)"
                 tokens_to_prefill = len(tokens_to_process)
                 logger.info(
                     f"[schedule] request={request.request_id[:12]} uid={uid} "
@@ -9115,7 +9534,7 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
-                cached_tokens=request.cached_tokens,
+                cached_tokens=request.cached_tokens - request._srpf_parked_tokens,
                 logprobs=response.logprobs,
             )
 
@@ -9850,6 +10269,7 @@ class Scheduler:
             request.batch_uid = None
             request.prompt_cache = None
             request.cached_tokens = 0
+            request._srpf_parked_tokens = 0
             request.remaining_tokens = request.prompt_token_ids
 
             # Move to waiting queue (at front for priority)
@@ -9914,6 +10334,7 @@ class Scheduler:
                     # Tighten that chunk before dispatch when a long cold or
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
+                    srpf_step = self._srpf_step_begin()
                     if self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
                         if st is None:
@@ -9946,6 +10367,7 @@ class Scheduler:
                             st[0], st[1] = [], []
                     else:
                         raw_next = self.batch_generator.next()
+                    self._srpf_step_end(srpf_step)
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires
                     # off the live chain DEPTH (steps since the last barrier),
@@ -10493,7 +10915,10 @@ class Scheduler:
                 {
                     "request_id": req.request_id,
                     "status": "waiting",
-                    "phase": "queued",
+                    # A request parked mid-prefill by the SRPF order waits
+                    # with its cache (``prefilled_tokens`` of the prompt).
+                    "phase": "parked" if req._srpf_parked else "queued",
+                    "prefilled_tokens": req.cached_tokens if req._srpf_parked else 0,
                     "elapsed_s": round(now - req.arrival_time, 2),
                     "prompt_tokens": req.num_prompt_tokens,
                     "completion_tokens": 0,
@@ -10502,7 +10927,7 @@ class Scheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": req.cache_hit_type,
-                    "cached_tokens": req.cached_tokens,
+                    "cached_tokens": req.cached_tokens - req._srpf_parked_tokens,
                 }
             )
 
@@ -10542,7 +10967,7 @@ class Scheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": req.cache_hit_type,
-                    "cached_tokens": req.cached_tokens,
+                    "cached_tokens": req.cached_tokens - req._srpf_parked_tokens,
                 }
             )
 
@@ -10626,6 +11051,7 @@ class Scheduler:
             "adaptive_prefill_reduced_chunks": getattr(
                 self, "_adaptive_prefill_reduced_chunks", 0
             ),
+            "singleton_prefill_order": self._srpf_stats(),
         }
         # R15-P1 (task #296): disk-backed KV checkpoint counters.
         # Folded straight from the module-level ``disk_kv_checkpoint``

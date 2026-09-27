@@ -3681,6 +3681,12 @@ Examples:
         help="Prompt-slot admission order (default: fcfs).",
     )
     parser.add_argument(
+        "--singleton-prefill-order",
+        choices=("srpf", "fifo"),
+        default="srpf",
+        help="Prefill order on a one-request-at-a-time engine (default: srpf).",
+    )
+    parser.add_argument(
         "--scheduling-max-deferrals",
         type=int,
         default=8,
@@ -4086,6 +4092,7 @@ Examples:
         prefill_step_size=args.prefill_step_size,
         scheduling_policy=args.scheduling_policy,
         scheduling_max_deferrals=args.scheduling_max_deferrals,
+        singleton_prefill_order=args.singleton_prefill_order,
         vision_prefill_token_budget=vision_prefill_token_budget,
         vision_min_pixels=args.vision_min_pixels,
         vision_max_pixels=args.vision_max_pixels,
