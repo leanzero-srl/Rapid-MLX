@@ -5238,6 +5238,7 @@ def serve_command(args):
         completion_batch_size=args.completion_batch_size,
         scheduling_policy=args.scheduling_policy,
         scheduling_max_deferrals=args.scheduling_max_deferrals,
+        singleton_prefill_order=getattr(args, "singleton_prefill_order", "srpf"),
         enable_prefix_cache=enable_prefix_cache,
         prefix_cache_size=args.prefix_cache_size,
         # R15-P1 (task #303): radix-tree prefix-cache index.
@@ -11961,6 +11962,19 @@ Examples:
             "Prompt-slot admission order (default: fcfs). "
             "shortest_validated_tail favors cache-hot and short prompts while "
             "bounding how often an older compatible request may be deferred."
+        ),
+    )
+    serve_parser.add_argument(
+        "--singleton-prefill-order",
+        choices=("srpf", "fifo"),
+        default="srpf",
+        help=(
+            "Prefill order when the engine runs one request at a time (MTP "
+            "decode, or --max-num-seqs 1). srpf (default): a request with "
+            "fewer prompt tokens left takes the engine at the next prefill "
+            "chunk boundary and the prefilling one resumes after it, while no "
+            "later request takes more than half an earlier one's slack. fifo: "
+            "each request waits for every earlier request's prefill and decode."
         ),
     )
     serve_parser.add_argument(

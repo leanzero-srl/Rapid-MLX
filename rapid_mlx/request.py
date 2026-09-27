@@ -255,6 +255,21 @@ class Request:
     # public and positional Request constructor unchanged.
     _admission_deferrals: int = field(default=0, init=False, repr=False)
 
+    # LeanZero Q-103: shortest-remaining-prefill-first on the one-row engine
+    # (``Scheduler._srpf_head``). Arrival order, the prompt tokens it had to
+    # prefill when it arrived, and the measured engine seconds that LATER
+    # arrivals ran ahead of it while it waited. A prefilling request can be
+    # parked at a chunk boundary: its cache comes back as ``prompt_cache``
+    # (``cached_tokens`` grows) and ``_srpf_parked_tokens`` keeps those tokens
+    # out of the prefix-cache hit the client is told about.
+    _srpf_seq: int = field(default=0, init=False, repr=False)
+    _srpf_own_tokens: int = field(default=0, init=False, repr=False)
+    _srpf_waited_s: float = field(default=0.0, init=False, repr=False)
+    _srpf_parked: bool = field(default=False, init=False, repr=False)
+    _srpf_parked_tokens: int = field(default=0, init=False, repr=False)
+    _srpf_admissions: int = field(default=0, init=False, repr=False)
+    _srpf_admitted_boundary: int = field(default=0, init=False, repr=False)
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
