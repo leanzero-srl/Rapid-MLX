@@ -2768,25 +2768,37 @@ def _bare_generator(monkeypatch, *, mb=None, percent=None):
     return gen
 
 
-def test_cache_memory_mb_reaches_the_mllm_budget_and_the_apc_snapshot_cap(monkeypatch):
+def _auto_cap_manager():
+    apc = pytest.importorskip("mlx_vlm.apc")
+    return apc.from_env(
+        overrides={"enabled": True, "num_blocks": 0, "disk_enabled": False}
+    )
+
+
+def test_cache_memory_mb_reaches_the_mllm_budget_and_raises_the_apc_snapshot_cap(
+    monkeypatch,
+):
     """Before lz.11 the lane built a bare MemoryCacheConfig(), so
     --cache-memory-mb 9000 still logged the 20%-of-free default (measured on a
     64 GB Mac serving a 27B hybrid, 2026-10-14) and APC kept skipping every
     snapshot past its own min(8 GiB, working set / 10) cap."""
-    gen = _bare_generator(monkeypatch, mb=12 * 1024)
-    assert gen._configured_cache_budget_bytes() == 12 * 1024 * 1024 * 1024
-    assert gen._operator_snapshot_cap_gb() == pytest.approx(12.0)
+    gen = _bare_generator(monkeypatch, mb=64 * 1024)
+    assert gen._configured_cache_budget_bytes() == 64 * (1 << 30)
+    manager = _auto_cap_manager()
+    automatic = manager.memory_max_bytes
+    assert automatic < 64 * (1 << 30)
+    gen._raise_apc_snapshot_cap(manager)
+    assert manager.memory_max_bytes == 64 * (1 << 30)
 
-    apc = pytest.importorskip("mlx_vlm.apc")
-    manager = apc.from_env(
-        overrides={
-            "enabled": True,
-            "num_blocks": 0,
-            "disk_enabled": False,
-            "memory_max_gb": gen._operator_snapshot_cap_gb(),
-        }
-    )
-    assert manager.memory_max_bytes == 12 * (1 << 30)
+
+def test_an_operator_budget_never_lowers_the_apc_snapshot_cap(monkeypatch):
+    """goose passes --cache-memory-percent 0.35 on every mount; with little
+    free memory that budget is below APC's automatic cap, which must stay."""
+    gen = _bare_generator(monkeypatch, mb=1)
+    manager = _auto_cap_manager()
+    automatic = manager.memory_max_bytes
+    gen._raise_apc_snapshot_cap(manager)
+    assert manager.memory_max_bytes == automatic
 
 
 def test_an_explicit_cache_percent_is_honoured(monkeypatch):
@@ -2795,7 +2807,7 @@ def test_an_explicit_cache_percent_is_honoured(monkeypatch):
     gen = _bare_generator(monkeypatch, percent=0.35)
     expected = MemoryCacheConfig(max_memory_percent=0.35).compute_memory_limit()
     assert gen._configured_cache_budget_bytes() == pytest.approx(expected, rel=0.05)
-    assert gen._operator_snapshot_cap_gb() is not None
+    assert gen._operator_snapshot_cap_bytes() is not None
 
 
 def test_a_server_on_defaults_keeps_both_budgets_exactly_as_before(monkeypatch):
@@ -2803,19 +2815,23 @@ def test_a_server_on_defaults_keeps_both_budgets_exactly_as_before(monkeypatch):
 
     for percent in (None, _DEFAULT_MEMORY_PERCENT):
         gen = _bare_generator(monkeypatch, percent=percent)
-        assert gen._operator_snapshot_cap_gb() is None, percent
+        assert gen._operator_snapshot_cap_bytes() is None, percent
         assert gen._configured_cache_budget_bytes() == pytest.approx(
             MemoryCacheConfig().compute_memory_limit(), rel=0.05
         )
     # The bare fixture (no __init__) reads as defaults too.
     gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
-    assert gen._operator_snapshot_cap_gb() is None
+    assert gen._operator_snapshot_cap_bytes() is None
+    manager = _auto_cap_manager()
+    automatic = manager.memory_max_bytes
+    gen._raise_apc_snapshot_cap(manager)
+    assert manager.memory_max_bytes == automatic
 
 
 def test_an_operator_pinned_apc_cap_and_the_env_budget_still_win(monkeypatch):
     gen = _bare_generator(monkeypatch, mb=12 * 1024)
     monkeypatch.setenv("APC_MEMORY_MAX_GB", "3")
-    assert gen._operator_snapshot_cap_gb() is None
+    assert gen._operator_snapshot_cap_bytes() is None
     monkeypatch.delenv("APC_MEMORY_MAX_GB")
     monkeypatch.setenv("RAPID_MLX_PREFIX_CACHE_MAX_BYTES", str(5 << 30))
     assert gen._configured_cache_budget_bytes() == 5 << 30

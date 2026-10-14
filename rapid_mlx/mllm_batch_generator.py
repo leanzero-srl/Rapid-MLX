@@ -1214,10 +1214,8 @@ class MLLMBatchGenerator:
                     }
                     if "APC_DISK_ENABLED" not in os.environ:
                         apc_overrides["disk_enabled"] = False
-                    snapshot_cap_gb = self._operator_snapshot_cap_gb()
-                    if snapshot_cap_gb is not None:
-                        apc_overrides["memory_max_gb"] = snapshot_cap_gb
                     self._prefix_cache = _apc.from_env(overrides=apc_overrides)
+                    self._raise_apc_snapshot_cap(self._prefix_cache)
                     self._prefix_cache_mode = mode
                     self._configure_exact_cache_capacity(self._prefix_cache)
                     self._prefix_cache_extra_hash = _apc.semantic_extra_hash(
@@ -2529,18 +2527,10 @@ class MLLMBatchGenerator:
             kwargs["max_memory_percent"] = percent
         return max(0, int(MemoryCacheConfig(**kwargs).compute_memory_limit()))
 
-    def _operator_snapshot_cap_gb(self) -> float | None:
-        """mlx-vlm's APC refuses (silently, with no disk tier) any exact
-        snapshot larger than ``memory_max_bytes``, whose default is
-        ``min(8 GiB, Metal working set / 10)``: on a 64 GB Mac nothing past
-        ~85k tokens of a 27B hybrid is ever stored, whatever the operator set.
-        When the operator chose a budget (``--cache-memory-mb``, or a
-        ``--cache-memory-percent`` other than the default) and did not pin
-        ``APC_MEMORY_MAX_GB`` themselves, that budget is APC's cap too, so one
-        snapshot may use what the operator gave the cache. A server on
-        defaults keeps APC's automatic cap exactly as before. APC's own
-        headroom test (free RAM / working set minus a reserve) still refuses
-        a store that would not fit."""
+    def _operator_snapshot_cap_bytes(self) -> int | None:
+        """The operator's cache budget when they chose one (``--cache-memory-mb``,
+        or a ``--cache-memory-percent`` other than the default) and did not pin
+        ``APC_MEMORY_MAX_GB`` themselves; ``None`` otherwise."""
         from .memory_cache import _DEFAULT_MEMORY_PERCENT
 
         if "APC_MEMORY_MAX_GB" in os.environ:
@@ -2558,13 +2548,29 @@ class MLLMBatchGenerator:
                 exc,
             )
             return None
-        if budget <= 0:
-            return None
+        return budget if budget > 0 else None
+
+    def _raise_apc_snapshot_cap(self, cache: Any) -> None:
+        """mlx-vlm's APC refuses (silently, with no disk tier) any exact
+        snapshot larger than ``memory_max_bytes``, whose automatic value is
+        ``min(8 GiB, Metal working set / 10)``: on a 64 GB Mac nothing past
+        ~85k tokens of a 27B hybrid is ever stored, whatever the operator set.
+        An operator-chosen budget may RAISE that cap to itself, never lower it
+        (goose always passes 0.35, which on a Mac with little free memory left
+        would otherwise shrink the cap below APC's own). APC's headroom test
+        (free RAM / working set minus a reserve) still refuses a store that
+        would not fit."""
+        budget = self._operator_snapshot_cap_bytes()
+        current = getattr(cache, "memory_max_bytes", None)
+        if budget is None or not isinstance(current, int) or budget <= current:
+            return
+        cache.memory_max_bytes = budget
         logger.info(
-            "[mllm_apc] APC snapshot cap follows the operator cache budget: %.1f GB",
+            "[mllm_apc] APC snapshot cap raised to the operator cache budget: "
+            "%.1f GB (automatic %.1f GB)",
             budget / (1 << 30),
+            current / (1 << 30),
         )
-        return budget / (1 << 30)
 
     def _configure_exact_cache_capacity(self, cache: Any) -> None:
         """Raise mlx-vlm's exact-entry LRU to the lane default and adopt the
