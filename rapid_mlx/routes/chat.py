@@ -4857,6 +4857,18 @@ async def _create_chat_completion_impl(
     if request.rapid_mlx_transient_tail:
         chat_kwargs["transient_tail"] = request.rapid_mlx_transient_tail
 
+    # LeanZero fork, memory guard: the client's own name for the
+    # conversation (goose sends ``agent-session-id`` on every chat request;
+    # a subagent has its own, a compaction keeps it). The engine's per-
+    # session cache decisions key on it; engines that do not take it never
+    # see it.
+    if getattr(engine, "ACCEPTS_SESSION_ID", False) is True and raw_request is not None:
+        session_id = raw_request.headers.get(
+            getattr(engine, "SESSION_ID_HEADER", "agent-session-id")
+        )
+        if session_id:
+            chat_kwargs["session_id"] = session_id
+
     # Context-length pre-check (DoS defense + UX, rapid-desktop#273 / #463).
     # See ``service/helpers.py::enforce_context_length_for_messages`` for
     # the rationale (8 MiB body still holds ~2M tokens → context window
