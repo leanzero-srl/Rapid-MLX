@@ -42,6 +42,7 @@ bytes as its value, and no extra call is made.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from collections.abc import Iterable
@@ -299,18 +300,32 @@ class CallShape:
                     is then inconsistent: the value may still be running.
     """
 
-    __slots__ = ("end", "free", "canonical", "consistent")
+    __slots__ = ("end", "free", "canonical", "consistent", "stray")
 
-    def __init__(self, end: int, free: bool, canonical: bool, consistent: bool):
+    def __init__(
+        self,
+        end: int,
+        free: bool,
+        canonical: bool,
+        consistent: bool,
+        stray: bool = False,
+    ):
         self.end = end
         self.free = free
         self.canonical = canonical
         self.consistent = consistent
+        # A ``</parameter>`` OUTSIDE every value of this call (between its
+        # parameters, or in a body that has none). A well-formed call never
+        # has one; a header that is really text inside an earlier value does
+        # (``… <function=tree> ok\n</parameter>\n</function>`` — the close is
+        # the enclosing value's). Such a header is never a sibling.
+        self.stray = stray
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"CallShape(end={self.end}, free={self.free}, "
-            f"canonical={self.canonical}, consistent={self.consistent})"
+            f"canonical={self.canonical}, consistent={self.consistent}, "
+            f"stray={self.stray})"
         )
 
 
@@ -338,11 +353,17 @@ def call_shape(
     free = False
     canonical = True
     consistent = True
+    stray = False
     saw_param = False
     while True:
         next_close = text.find(closer, j)
         next_param = text.find(param_open, j)
-        if header is not None:
+        if header is not None and not saw_param:
+            # Only BEFORE the first parameter: a header met after one is
+            # inside a value or after it, and the loop below decides that.
+            # (Checking it on every pass read a ``write`` whose content shows
+            # a call as "header first", dropped the write and promoted the
+            # example call to the top level — review of 7a1d93272.)
             next_header = text.find(header, j)
             if next_header != -1 and all(
                 pos == -1 or next_header < pos for pos in (next_close, next_param)
@@ -351,9 +372,16 @@ def call_shape(
         if next_close == -1:
             return None
         if next_param == -1 or next_param > next_close:
-            if not saw_param and text[j:next_close].strip():
+            gap = text[j:next_close]
+            if not saw_param and gap.strip():
                 free = True
-            return CallShape(next_close + len(closer), free, canonical, consistent)
+            if param_close in gap:
+                stray = True
+            return CallShape(
+                next_close + len(closer), free, canonical, consistent, stray
+            )
+        if param_close in text[j:next_param]:
+            stray = True
         saw_param = True
         name_end = text.find(">", next_param + len(param_open))
         if name_end == -1:
@@ -652,73 +680,116 @@ def top_level_calls(
     if not units:
         return []
     header_literal = _header_literal(header)
-    shapes = [
-        call_shape(
-            text,
-            unit.end(),
-            closer,
-            header=header_literal,
-            param_open=param_open,
-            param_close=param_close,
-        )
-        for unit in units
-    ]
+    shape_cache: dict[int, CallShape | str | None] = {}
+
+    def shape_of(k: int) -> CallShape | str | None:
+        # Lazy: a header that lies inside an earlier call's value is never
+        # read, so a value quoting thousands of headers costs one read.
+        if k not in shape_cache:
+            shape_cache[k] = call_shape(
+                text,
+                units[k].end(),
+                closer,
+                header=header_literal,
+                param_open=param_open,
+                param_close=param_close,
+            )
+        return shape_cache[k]
+
     names = [unit.group(1).strip() for unit in units]
     declared = [name in valid_names for name in names]
     orphan = _end_of_parameters(param_close, closer)
     starts = [unit.start() for unit in units]
 
-    def next_unit_start(pos: int) -> int:
-        for start in starts:
-            if start >= pos:
-                return start
-        return len(text)
+    def first_unit_at(pos: int) -> int:
+        return bisect.bisect_left(starts, pos)
+
+    def free(k: int) -> bool:
+        shape = shape_of(k)
+        return isinstance(shape, CallShape) and shape.free
 
     def sibling(cur: int, k: int) -> bool:
-        cur_shape = shapes[cur]
+        cur_shape = shape_of(cur)
         if not isinstance(cur_shape, CallShape):
             return declared[k] and closer in text[units[cur].end() : starts[k]]
         if starts[k] < cur_shape.end:
             return False
-        k_shape = shapes[k]
+        k_shape = shape_of(k)
         if not isinstance(k_shape, CallShape) and not declared[k]:
             return False
         if cur_shape.free:
             if not cur_shape.consistent:
                 return False
-            if isinstance(k_shape, CallShape) and orphan.search(
-                text, k_shape.end, next_unit_start(k_shape.end)
-            ):
-                return False
+            if isinstance(k_shape, CallShape):
+                if k_shape.stray:
+                    return False
+                nxt = first_unit_at(k_shape.end)
+                limit = starts[nxt] if nxt < len(starts) else len(text)
+                if orphan.search(text, k_shape.end, limit):
+                    return False
         return True
 
     picked: list[int] = []
+    # A header judged to be TEXT inside a running value takes the headers it
+    # structurally contains with it: they are text too, never siblings.
+    skip_until = 0
     for k in range(len(units)):
-        if shapes[k] == HEADER_FIRST:
+        if starts[k] < skip_until:
+            continue
+        if picked:
+            cur_shape = shape_of(picked[-1])
+            if isinstance(cur_shape, CallShape) and starts[k] < cur_shape.end:
+                continue  # inside one of cur's values
+        if shape_of(k) == HEADER_FIRST:
             continue
         if not picked:
-            if declared[k] or isinstance(shapes[k], CallShape):
+            if declared[k] or isinstance(shape_of(k), CallShape):
                 picked.append(k)
             continue
         if sibling(picked[-1], k):
             picked.append(k)
+        else:
+            k_shape = shape_of(k)
+            if isinstance(k_shape, CallShape):
+                skip_until = max(skip_until, k_shape.end)
+
+    def body_end_of(index: int) -> tuple[int, bool]:
+        """``(body_end, runs_on)`` of ``picked[index]`` in its region."""
+        k = picked[index]
+        unit = units[k]
+        region_end = starts[picked[index + 1]] if index + 1 < len(picked) else len(text)
+        shape = shape_of(k)
+        if not isinstance(shape, CallShape):
+            return text.rfind(closer, unit.end(), region_end), False
+        payload = first_unit_at(shape.end)
+        runs_on = bool(
+            orphan.search(text, shape.end, region_end)
+            or (payload < len(starts) and starts[payload] < region_end)
+        )
+        if runs_on:
+            return text.rfind(closer, unit.end(), region_end), True
+        return shape.end - len(closer), False
+
+    # A later call whose value runs on (an orphan close, or a header inside
+    # its region) shows that SOME value runs over it; read on its own it
+    # would hand the bytes after it to a call. The safer reading attributes
+    # them to the earlier free call: merge, and look again. The sibling test
+    # above sees only up to the next header, so two calls quoted back to back
+    # inside one value passed it (review of 7a1d93272).
+    merged = True
+    while merged:
+        merged = False
+        for index in range(1, len(picked)):
+            if free(picked[index - 1]) and body_end_of(index)[1]:
+                del picked[index]
+                merged = True
+                break
 
     tops: list[TopCall] = []
     for index, k in enumerate(picked):
         unit = units[k]
-        region_end = starts[picked[index + 1]] if index + 1 < len(picked) else len(text)
-        shape = shapes[k]
-        if isinstance(shape, CallShape):
-            runs_on = orphan.search(text, shape.end, region_end) or any(
-                shape.end <= start < region_end for start in starts
-            )
-            body_end = (
-                text.rfind(closer, unit.end(), region_end)
-                if runs_on
-                else shape.end - len(closer)
-            )
-        else:
-            body_end = text.rfind(closer, unit.end(), region_end)
+        body_end, _runs_on = body_end_of(index)
+        shape = shape_of(k)
         tops.append(
             TopCall(
                 unit.start(),
@@ -826,23 +897,60 @@ def _exact_quoted_value(
     return k, k + len(closer)
 
 
-def _second_call_start(
-    block: str, value_start: int, closer: str, call_close: str, call_header: str
-) -> int | None:
-    """Where a SECOND call begins inside a body, if one does.
+def _nested_call_spans(
+    block: str,
+    value_start: int,
+    closer: str,
+    call_close: str,
+    call_header: str,
+    param_open: str | None = None,
+) -> list[tuple[int, int]]:
+    """The spans of OTHER calls written inside a body, from ``value_start``.
 
-    ``…</parameter></function>…<function=other>`` inside a call's body means
-    a value ran over a whole call's markup: the body was read as one call
-    (the safer reading), so whatever follows that header is that value's
-    text. Its ``<parameter=…>`` openers must never become parameters of
-    this call — that is how ``rm -rf ~`` from a following call overwrote
-    ``shell``'s ``command`` (review of 26452cbe3).
+    Two shapes say a value holds another call's markup, so the body was read
+    as one call (the safer reading) and that call's ``<parameter=…>`` openers
+    must never become parameters of THIS call:
+
+    * ``…</parameter></function>…<function=other>`` — that is how
+      ``rm -rf ~`` from a following call overwrote ``shell``'s ``command``
+      (review of 26452cbe3);
+    * a header followed directly by its own ``<parameter=`` — a document
+      that SHOWS a call (``<function=shell>\n<parameter=command>…``) gave its
+      ``command`` to the ``write`` holding it (review of 7a1d93272). A
+      header merely mentioned in prose (``see <function=x> below``) is not
+      one.
+
+    Each span runs from that header to the nested call's own ``call_close``
+    (or the end of the body when it never closes), so a real parameter of
+    this call AFTER a quoted, closed example still counts.
     """
-    end = _end_of_parameters(closer, call_close).search(block, value_start)
-    if end is None:
-        return None
-    start = block.find(call_header, end.end())
-    return start if start != -1 else None
+    shaped = (
+        re.compile(re.escape(call_header) + r"[^>\n]*>\s*" + re.escape(param_open))
+        if param_open
+        else None
+    )
+    end_of_params = _end_of_parameters(closer, call_close)
+    spans: list[tuple[int, int]] = []
+    pos = value_start
+    while pos < len(block):
+        found: list[int] = []
+        end = end_of_params.search(block, pos)
+        if end is not None:
+            start = block.find(call_header, end.end())
+            if start != -1:
+                found.append(start)
+        if shaped is not None:
+            header = shaped.search(block, pos)
+            if header is not None:
+                found.append(header.start())
+        if not found:
+            break
+        start = min(found)
+        close = block.find(call_close, start)
+        stop = close + len(call_close) if close != -1 else len(block)
+        spans.append((start, stop))
+        pos = stop
+    return spans
 
 
 def split_marked_parameters(
@@ -912,13 +1020,23 @@ def scan_marked_parameters(
                 i += 1
             continue
         live = openers
-        dead: int | None = None
+        nested: list[tuple[int, int]] = []
         if call_close and call_header:
-            dead = _second_call_start(
-                block, openers[i].end(), closer, call_close, call_header
+            nested = _nested_call_spans(
+                block,
+                openers[i].end(),
+                closer,
+                call_close,
+                call_header,
+                _header_literal(opener),
             )
-            if dead is not None:
-                live = [match for match in openers if match.start() < dead]
+            if nested:
+                live = [
+                    match
+                    for match in openers
+                    if not any(lo <= match.start() < hi for lo, hi in nested)
+                ]
+                protected.extend(nested)
         if reject_undeclared_siblings and valid_names is not None:
             current_end = live[i].end()
             for candidate in live[i + 1 :]:
@@ -936,12 +1054,12 @@ def scan_marked_parameters(
         if segmented is not None:
             out.append((live[i].group(1).strip(), trim_wrapping_newlines(segmented[0])))
         if sibling >= len(live):
-            if dead is not None:
-                protected.append((dead, len(block)))
             break
         # Jump to the sibling, not i+1: the openers in between are literal
         # text inside the value just consumed. Advancing one at a time is
         # what turns a value containing "<parameter=x>" into a phantom
         # parameter named x, passed to the tool as if the model sent it.
-        i = sibling if sibling > i else i + 1
+        # ``live`` only drops openers AFTER ``i`` (inside nested calls), so
+        # ``live[i]`` is ``openers[i]``; map the sibling back to ``openers``.
+        i = openers.index(live[sibling]) if sibling > i else i + 1
     return out, protected
