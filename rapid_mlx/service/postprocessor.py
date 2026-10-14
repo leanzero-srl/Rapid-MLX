@@ -66,8 +66,13 @@ def _offered_tool_header_re(request) -> re.Pattern[str] | None:
             names.append(re.escape(name))
     if not names:
         return None
+    # Call-OPENING shapes only (``<function=NAME``, ``<tool_call>NAME``,
+    # ``<ifm|tool_call>NAME``, ``"name": "NAME"``, ``name="NAME"``): a bare
+    # ``=NAME`` / ``>NAME`` also matched content (``MODE=shell``,
+    # ``<td>tree</td>``), so a long call whose content mentioned a tool counted
+    # two headers and was released as text (review of 975a84f7b).
     return re.compile(
-        r"(?:[=>][\"']?|\"name\"\s*:\s*\")\s*(?:"
+        r"(?:<function=|tool_call>\s*|\"name\"\s*:\s*\"|\bname=[\"'])(?:"
         + "|".join(sorted(names, key=len, reverse=True))
         + r")(?![\w-])"
     )
