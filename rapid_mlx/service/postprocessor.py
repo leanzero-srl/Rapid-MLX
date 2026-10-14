@@ -40,7 +40,31 @@ logger = logging.getLogger(__name__)
 # hundred bytes; incremental-argument parsers emit tool_call deltas well
 # before this, which also trips the ``_tool_calls_emitted_to_wire`` guard) yet
 # bounds the stall to ~16 K tokens.
+#
+# The budget is NOT a bound on how long a call may be. A withheld block that
+# names a tool the request offered (or that the parser reports as a call in
+# progress, ``holds_call_in_progress``) is a call being written: it ends at
+# its own close or at the end of the stream, where finalize parses it or
+# releases it as text. Releasing it at 64 KB turned every longer call into
+# text for every parser that withholds a call until it closes — a 67 KB
+# ``write_file`` became the answer (review of 26452cbe3, item 2). The budget
+# keeps its #1359 job for markup that is not a call to an offered tool.
 _MAX_TOOL_SUPPRESSION_BYTES = 65536
+
+
+def _names_an_offered_tool(text: str, request) -> bool:
+    """Whether ``text`` names a tool ``request`` offered, as a whole word."""
+    tools = request.get("tools") if isinstance(request, dict) else None
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if (
+            isinstance(name, str)
+            and name
+            and re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])", text)
+        ):
+            return True
+    return False
 
 
 def _find_json_start(text: str) -> int:
@@ -472,6 +496,9 @@ class StreamingPostProcessor:
         # plain content instead of wedging behind SSE keepalives.
         self._tool_suppressed_buffer: str = ""
         self._tool_suppression_released: bool = False
+        # Latched once the withheld block is known to be a call in progress,
+        # so the (whole-buffer) test runs once per block, not per delta.
+        self._tool_suppressed_is_call: bool = False
         self.tool_markup_possible = False
         # R10-C8 (Mira r10-R1): tool-prose-prefix hold-back. When the
         # request declares ``tools`` and the model emits a UI-TARS-style
@@ -2442,6 +2469,7 @@ class StreamingPostProcessor:
         # processor doesn't carry a prior turn's released state into a new stream.
         self._tool_suppressed_buffer = ""
         self._tool_suppression_released = False
+        self._tool_suppressed_is_call = False
         self.tool_markup_possible = False
         # R10-C8: clear the tool-prose hold-back so a re-used processor
         # doesn't ship the prior turn's buffered preamble bytes.
@@ -3699,6 +3727,24 @@ class StreamingPostProcessor:
             return [StreamEvent(type="content", content=content)]
         return []
 
+    def _withheld_block_is_a_call(self) -> bool:
+        """Whether the withheld block is a call in progress (see
+        ``_MAX_TOOL_SUPPRESSION_BYTES``): the parser says so, or the block
+        names a tool the request offered."""
+        if self._tool_suppressed_is_call:
+            return True
+        hook = getattr(self.tool_parser, "holds_call_in_progress", None)
+        is_call = False
+        if callable(hook):
+            try:
+                is_call = hook(self.tool_accumulated_text, self.request) is True
+            except Exception:
+                is_call = False
+        if not is_call:
+            is_call = _names_an_offered_tool(self._tool_suppressed_buffer, self.request)
+        self._tool_suppressed_is_call = is_call
+        return is_call
+
     def finalize(self) -> list[StreamEvent]:
         """Finalize stream — flush remaining tool calls, emit corrections.
 
@@ -3712,6 +3758,11 @@ class StreamingPostProcessor:
                 self.tool_accumulated_text or self.accumulated_text,
                 request=self.request,
             )
+            # Text the parser deferred with the calls (a span kept as text,
+            # prose between calls) is read from the same end-of-stream parse.
+            raw_content = raw_delta.get("content") if raw_delta else None
+            if isinstance(raw_content, str) and raw_content:
+                events.append(StreamEvent(type="content", content=raw_content))
             if raw_delta and raw_delta.get("tool_calls"):
                 allowed = self._apply_parallel_cap(raw_delta["tool_calls"])
                 if allowed:
@@ -4199,7 +4250,10 @@ class StreamingPostProcessor:
             # guard leaves genuine (incrementally-streamed) tool calls alone.
             if self._tool_calls_emitted_to_wire == 0:
                 self._tool_suppressed_buffer += content
-                if len(self._tool_suppressed_buffer) > _MAX_TOOL_SUPPRESSION_BYTES:
+                if (
+                    len(self._tool_suppressed_buffer) > _MAX_TOOL_SUPPRESSION_BYTES
+                    and not self._withheld_block_is_a_call()
+                ):
                     released = self._tool_suppressed_buffer
                     self._tool_suppression_released = True
                     self._tool_suppressed_buffer = ""
@@ -4216,6 +4270,7 @@ class StreamingPostProcessor:
         # Parser made progress (emitted content or resolved the block) — drop
         # any partial suppression buffer so a later block is bounded afresh.
         self._tool_suppressed_buffer = ""
+        self._tool_suppressed_is_call = False
 
         if "tool_calls" in tool_result:
             if self._suppress_tool_calls:
