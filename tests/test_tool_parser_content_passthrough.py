@@ -169,7 +169,13 @@ def _qwen3coder():
 
 
 class TestOnlyDeclaredToolsBecomeCalls:
-    """A name the request never offered can never be executed."""
+    """A name the request never offered is never PROMOTED from prose.
+
+    A canonical call to one (wrapped, closed, top-level) does surface, so the
+    client can answer it with "tool not found" — see
+    ``tests/test_tool_call_undeclared_surfaced.py``. Everything else that
+    merely names an unoffered tool stays text.
+    """
 
     def test_balanced_prose_with_no_tools_declared(self):
         """codex r1 BLOCKING: closed spans in prose were still promoted."""
@@ -325,6 +331,10 @@ class TestOnlyDeclaredToolsBecomeCalls:
         assert result.content == ("Docs: <function=read_file></function> then call: ")
 
     def test_shared_wrapper_is_preserved_for_a_rejected_sibling(self):
+        # The sibling is rejected by a NAMED tool_choice. Under "auto" a
+        # wrapped, closed call to an undeclared name is surfaced so the client
+        # can answer it (asserted at the end), so the wrapper bookkeeping for
+        # a rejected sibling is exercised through the rejection that remains.
         text = (
             "<tool_call><function=read_file></function>"
             "<function=write_file>"
@@ -332,13 +342,24 @@ class TestOnlyDeclaredToolsBecomeCalls:
             "<parameter=content>hi</parameter>"
             "</function></tool_call>"
         )
-        result = _qwen3coder().extract_tool_calls(text, {"tools": DECLARED_TOOLS})
+        named = {
+            "tools": DECLARED_TOOLS,
+            "tool_choice": {"type": "function", "function": {"name": "write_file"}},
+        }
+        result = _qwen3coder().extract_tool_calls(text, named)
 
         assert result.tools_called is True
         assert [call["name"] for call in result.tool_calls] == ["write_file"]
         assert result.content == (
             "<tool_call><function=read_file></function></tool_call>"
         )
+
+        result = _qwen3coder().extract_tool_calls(text, {"tools": DECLARED_TOOLS})
+        assert [call["name"] for call in result.tool_calls] == [
+            "read_file",
+            "write_file",
+        ]
+        assert not result.content
 
     def test_shared_wrapper_admits_a_later_zero_argument_call(self):
         ping = {
@@ -349,7 +370,11 @@ class TestOnlyDeclaredToolsBecomeCalls:
             "<tool_call><function=read_file></function>"
             "<function=ping></function></tool_call>"
         )
-        result = _qwen3coder().extract_tool_calls(text, {"tools": [ping]})
+        named = {
+            "tools": [ping],
+            "tool_choice": {"type": "function", "function": {"name": "ping"}},
+        }
+        result = _qwen3coder().extract_tool_calls(text, named)
 
         assert result.tools_called is True
         assert [call["name"] for call in result.tool_calls] == ["ping"]
@@ -415,9 +440,7 @@ class TestOnlyDeclaredToolsBecomeCalls:
         result = parser.extract_tool_calls_streaming("", text, text, request=request)
         assert result == {"content": text}
 
-    @pytest.mark.parametrize(
-        "structured", [None, [{"name": "read_file", "arguments": "{}"}]]
-    )
+    @pytest.mark.parametrize("structured", [None])
     def test_service_helper_cannot_repromote_an_undeclared_span(
         self, monkeypatch, structured
     ):
@@ -483,6 +506,45 @@ class TestOnlyDeclaredToolsBecomeCalls:
 
         assert content == text
         assert calls is None
+
+    def test_service_helper_surfaces_an_undeclared_structured_call(
+        self, monkeypatch, caplog
+    ):
+        """A structured call to an unoffered name reaches the client, loudly.
+
+        Same rule as the text parser: the client answers "tool not found" and
+        the model recovers. Dropping it — and every declared call beside it —
+        into text was the silent failure (2026-10-14).
+        """
+        text = "Reading the file."
+
+        class Request:
+            def model_dump(self):
+                return {"tools": DECLARED_TOOLS}
+
+        cfg = get_config()
+        saved = (cfg.enable_auto_tool_choice, cfg.tool_call_parser)
+        cfg.enable_auto_tool_choice = True
+        cfg.tool_call_parser = "qwen3_coder_xml"
+        try:
+            with caplog.at_level("WARNING"):
+                content, calls = helpers._parse_tool_calls_with_parser(
+                    text,
+                    Request(),
+                    structured_tool_calls=[
+                        {"name": "read_file", "arguments": "{}"},
+                        {"name": "write_file", "arguments": "{}"},
+                    ],
+                )
+        finally:
+            cfg.enable_auto_tool_choice, cfg.tool_call_parser = saved
+
+        assert content == text
+        assert [call.function.name for call in calls] == ["read_file", "write_file"]
+        assert any(
+            "[TOOL-CALL-UNDECLARED]" in r.getMessage() and "read_file" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestTruncatedCallsStillRecover:
