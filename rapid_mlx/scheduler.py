@@ -6658,9 +6658,11 @@ class Scheduler:
             getattr(self, "waiting", ())
         ):
             present.add(self._memguard_line(r)[0])
+        kept = self.__dict__.get("_memguard_turn_boundaries", {})
         for line in [k for k in lines if k not in present]:
             lines.pop(line, None)
-            self.__dict__.get("_memguard_turn_boundaries", {}).pop(line, None)
+            for owner in [o for o in kept if o[0] == line]:
+                kept.pop(owner, None)
             self.__dict__.get("_memguard_rewriting_lines", set()).discard(line)
         outlived: set[Any] = set()
         latest_older = 0
@@ -8320,7 +8322,7 @@ class Scheduler:
         entries = mac._entries  # noqa: SLF001
         return {
             key
-            for line, key in kept.items()
+            for (line, _frame), key in kept.items()
             if key in entries
             and line not in outlived
             and self._memguard_line_rewrites(line)
@@ -8416,7 +8418,10 @@ class Scheduler:
         if keep and getattr(hint, "turn_start", False):
             # The boundary this turn started at: a template that rewrites the
             # turn's tool loop on the next user message resumes there.
-            self.__dict__.setdefault("_memguard_turn_boundaries", {})[line[0]] = next(
+            # Keyed by (line, frame): a helper call of the session (a title,
+            # a summary, its own frame) starts a "turn" too and must not
+            # replace the main frame's boundary (review 6, item 4).
+            self.__dict__.setdefault("_memguard_turn_boundaries", {})[line] = next(
                 iter(keep)
             )
         superseded = 0
