@@ -6701,9 +6701,11 @@ class Scheduler:
         a short side-request entry goes before a 36k session's), then LRU.
         Caller holds the cache lock.
 
-        Levels (``memory_guard.EVICT_*``): UNUSED, REDUNDANT (a running
-        request fetched it: duplicated in its live cache), HEAD (an abandoned
-        head: its conversation was compacted, or an older one outlived it),
+        Levels (``memory_guard.EVICT_*``): UNUSED (also a head its own
+        conversation has since diverged from: compacted, re-rendered),
+        REDUNDANT (a running request fetched it: duplicated in its live
+        cache), HEAD (an abandoned head: an older conversation outlived its
+        own),
         NEEDED (a live or queued request still needs it, or a live
         conversation's newest head). A head is
         the newest entry of a session that finished a turn -- an entry no
@@ -6768,25 +6770,41 @@ class Scheduler:
             reps.append((*self._memguard_line(r), r.prompt_token_ids))
         outlived = self._memguard_outlived_lines()
         protected: set[tuple] = set()
+        # Heads a NEWER request of their own line and frame diverged from:
+        # the conversation's dead branches, which ``_memguard_supersede``
+        # drops at the line's next store anyway. They keep the level their
+        # live use gives them (EVICT_UNUSED: "a finished turn's completion
+        # entry a re-rendered next prompt will not match") instead of
+        # ranking beside other conversations' heads, where the shortest went
+        # first. Gabee Q8 ladder (b06acd8ea, k=57): main's admission evicted
+        # the side subagent's two entries and kept main's dead 72,260-token
+        # branch; the side then re-prefilled 22.6k tokens at the floor chunk
+        # and that cost main its 73,223-token boundary. As in the store: the
+        # anonymous line (raw prompts, no hint) is many conversations, so it
+        # has no branches.
+        branches: set[tuple] = set()
         for key in reversed(list(entries)):  # MRU -> LRU
             if key not in heads:
                 continue
             line, frame = self._memguard_entry_line(entries[key])
-            dead = line in outlived or any(
+            diverged = any(
                 rep_line == line
                 and rep_frame == frame
                 and not self._memguard_seq_prefix(key, tokens)
                 and not self._memguard_seq_prefix(tokens, key)
                 for rep_line, rep_frame, tokens in reps
             )
-            if not dead:
+            if not diverged and line not in outlived:
                 protected.add(key)
+            elif diverged and line not in outlived and line != _ANONYMOUS_LINE:
+                branches.add(key)
             reps.append((line, frame, key))  # a newer head for older ones
         protected |= self._memguard_kept_turn_boundaries(outlived)
+        branches -= protected
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
-            if (key in heads or key in protected) and (
+            if (key in heads or key in protected) and key not in branches and (
                 level == EVICT_UNUSED
                 or (
                     finished is not None

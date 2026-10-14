@@ -596,7 +596,9 @@ EVICT_UNUSED = 1
 EVICT_REDUNDANT = 2
 # 3: the HEAD of a session that finished a turn (the entry its next turn
 #    fetches) other than the most recently used one (an abandoned session, a
-#    finished side request, a pre-compaction head): evicted -- cheapest to re-prefill
+#    finished side request; a head its OWN conversation has since diverged
+#    from -- compaction, a re-rendered reply -- is level 1, it is dead
+#    weight the line's next store drops): evicted -- cheapest to re-prefill
 #    first, so a short side request's head goes before a long session's --
 #    after the unused and redundant entries and BEFORE the chunk is reduced
 #    (losing a 1.6k-token head costs one 1.6k re-prefill; a reduced chunk
