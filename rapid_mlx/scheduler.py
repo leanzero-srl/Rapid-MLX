@@ -10644,7 +10644,10 @@ class Scheduler:
                     self.waiting.appendleft(request)
                 break
             if any(
+                # Only while it prefills: once its first token is out it is an
+                # ordinary decoding row (review 2026-10-14, item 7).
                 getattr(r, "_memguard_wait_for_idle", False)
+                and int(r.num_output_tokens) == 0
                 for r in self.running.values()
             ):
                 if not shortest_tail:
