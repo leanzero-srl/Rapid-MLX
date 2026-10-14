@@ -6639,14 +6639,23 @@ class Scheduler:
         seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
         self._memguard_seq = seq
         lines = self.__dict__.setdefault("_memguard_lines", {})
-        if line in lines:
-            lines[line][1] = seq
-        else:
-            lines[line] = [seq, seq]
+        rid = getattr(request, "request_id", None)
+        # [first, latest, the line's first request, its latest NEW user
+        # turn]: a request that ends in a user message and is not the line's
+        # first request (a subagent's or a helper's task is its first).
+        record = lines.get(line)
+        if record is None:
+            lines[line] = [seq, seq, rid, 0]
+            return
+        record[1] = seq
+        hint = getattr(request, "session_hint", None)
+        if getattr(hint, "turn_start", False) and rid != record[2]:
+            record[3] = seq
 
     def _memguard_outlived_lines(self) -> set[Any]:
-        """``(line, frame)`` pairs an OLDER one outlived: it started before this one and ran
-        again after this one's latest activity. goose's shape: the main
+        """``(line, frame)`` pairs an OLDER one outlived (it started before
+        this one and ran again after this one's latest activity), or a
+        YOUNGER conversation left behind (below). goose's shape: the main
         session waits while a subagent (its own session) runs, then the main
         session's next turn -- the subagent is finished; likewise a helper
         call the main turn followed. A line that runs again stops being
@@ -6671,10 +6680,25 @@ class Scheduler:
                 )
         outlived: set[Any] = set()
         latest_older = 0
-        for line, (first, last) in sorted(lines.items(), key=lambda kv: kv[1][0]):
+        for line, (first, last, *_r) in sorted(lines.items(), key=lambda kv: kv[1][0]):
             if latest_older > last:
                 outlived.add(line)
             latest_older = max(latest_older, last)
+        # Review 6, item 1: a conversation is also abandoned once a YOUNGER
+        # conversation (another session, not a helper frame of its own) has
+        # started a NEW user turn after its last activity -- the user left
+        # chat A for chat B (or the next benchmark task). A subagent never
+        # starts a second user turn, so main stays protected while one runs;
+        # main running again (or its next user turn) revives it. Abandoned
+        # heads still go only under duress (before the chunk is reduced).
+        for line, (first, last, *_r) in lines.items():
+            if line in outlived:
+                continue
+            if any(
+                other[0] != line[0] and o_first > first and o_turn > last
+                for other, (o_first, _l, _rid, o_turn) in lines.items()
+            ):
+                outlived.add(line)
         return outlived
 
     def _memguard_entry_level(
