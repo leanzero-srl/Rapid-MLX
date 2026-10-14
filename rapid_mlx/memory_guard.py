@@ -52,6 +52,13 @@ model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
   BACKSTOP_CONTEXT_FRACTION / _DECAY / _DROP_FRACTION
                                 0.75 / 0.97 / 0.01   algorithm (decay)
   EVICT_UNUSED..EVICT_NEEDED    1..4   enumeration (eviction order)
+  _PLAN_ATTEMPTS (scheduler)    64     algorithm bound: re-plans per step
+                                       (each defers / refuses / hands over /
+                                       evicts one thing); exhausting it is a
+                                       defect signal (plan_exhausted)
+  SYSTEM_PRESSURE_WARN /        2 / 4  the kernel's own memory-pressure enum
+    _CRITICAL (memory_budget)          (kern.memorystatus_vm_pressure_level)
+  idle-base window              OBS_PER_GROUP idle samples (statistics)
   floor chunk                   KVCache.step (mlx-lm, read at runtime;
                                 256) unless the operator sets one
   normal (largest) chunk        the engine's prefill_step_size; the guard
@@ -66,7 +73,10 @@ model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
                                 a typed 512 MiB -- removed)
   prefix budget                 the guard's idle room unless the operator
                                 chose one (the 20%-of-RAM heuristic and its
-                                100 MiB floor only seed the cache)
+                                100 MiB floor only seed the cache); given
+                                back at once when the KERNEL reports memory
+                                pressure (other apps / engines), and a
+                                session's superseded entries are dropped
 
 Absolutes that remain, and why: the unknown-shape prior (64 query heads,
 8192 hidden) when the model config cannot be read -- it governs only the
@@ -585,7 +595,8 @@ EVICT_UNUSED = 1
 #    cache, so evicting it frees memory and loses nothing for that session.
 EVICT_REDUNDANT = 2
 # 3: the HEAD of a session that finished a turn (the entry its next turn
-#    fetches) other than the costliest one: evicted -- cheapest to re-prefill
+#    fetches) other than the most recently used one (an abandoned session, a
+#    finished side request, a pre-compaction head): evicted -- cheapest to re-prefill
 #    first, so a short side request's head goes before a long session's --
 #    after the unused and redundant entries and BEFORE the chunk is reduced
 #    (losing a 1.6k-token head costs one 1.6k re-prefill; a reduced chunk
@@ -594,8 +605,8 @@ EVICT_REDUNDANT = 2
 #    reductions on the main session (session sim, 2026-10-14).
 EVICT_HEAD = 3
 # 4: an entry a live session still needs: stored during this turn beyond what
-#    the running request fetched, on a waiting request's path, or the
-#    costliest session head. Evicted only after the chunk is at the floor,
+#    the running request fetched, on a waiting request's path, or the most
+#    recently used session head. Evicted only after the chunk is at the floor,
 #    before refusing a prefill, or under hard pressure at the cap.
 EVICT_NEEDED = 4
 
@@ -656,6 +667,12 @@ class MemoryGuard:
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
+            # Older entries of a session superseded by its newest
+            # end-of-turn entry (dead weight, not pressure).
+            "superseded": 0,
+            # Entries given back because the kernel reported machine-wide
+            # memory pressure (other apps / engines need it).
+            "system_pressure_evictions": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
