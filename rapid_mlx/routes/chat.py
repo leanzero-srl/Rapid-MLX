@@ -5800,6 +5800,14 @@ async def _create_chat_completion_impl(
         err_msg = str(e)
         err_type = type(e).__name__
         if isinstance(e, InferenceAbortedError):
+            from ..errors import DEVICE_MEMORY_ERROR_KIND
+
+            if e.error_kind == DEVICE_MEMORY_ERROR_KIND and isinstance(
+                getattr(e, "detail", None), dict
+            ):
+                # Memory guard refused the prefill mid-flight: the same 400
+                # body as the admission refusal, so the client compacts.
+                raise HTTPException(status_code=400, detail={"error": e.detail})
             # Engine aborted the request (e.g. Metal runtime error caught
             # in the engine loop). 503 — the server is still up and a
             # smaller request may succeed (#353).

@@ -4340,6 +4340,8 @@ async def _disconnect_guard(
                 )
                 import json as _json
 
+                from ..errors import DEVICE_MEMORY_ERROR_KIND
+
                 # F-131 belt-and-suspenders: never leak the raw Python
                 # exception message or class name through the SSE
                 # ``data:`` payload. Pre-fix, a tokenizer crash (e.g.
@@ -4373,7 +4375,20 @@ async def _disconnect_guard(
                 # F-131's generic sanitisation.
                 from ..request import ClientRequestError, InferenceAbortedError
 
+                _sse_error_object = None
                 if (
+                    isinstance(exc, InferenceAbortedError)
+                    and exc.error_kind == DEVICE_MEMORY_ERROR_KIND
+                    and isinstance(getattr(exc, "detail", None), dict)
+                ):
+                    # Memory guard: the stream was already committed when the
+                    # scheduler refused the prefill; send the same error object
+                    # the admission 400 carries.
+                    _sse_error_object = dict(exc.detail)
+                    _sse_type = _sse_error_object.get("type", "invalid_request_error")
+                    _sse_message = _sse_error_object.get("message", str(exc))
+                    _sse_code = _sse_error_object.get("code")
+                elif (
                     isinstance(exc, InferenceAbortedError)
                     and exc.error_kind == "lifecycle"
                 ):
@@ -4394,6 +4409,8 @@ async def _disconnect_guard(
                 }
                 if _sse_code is not None:
                     error["code"] = _sse_code
+                if _sse_error_object is not None:
+                    error = _sse_error_object
                 error_data = _json.dumps(
                     {
                         "error": error,
@@ -4895,6 +4912,7 @@ def enforce_context_length(
     completion = int(max_tokens) if max_tokens else 0
     requested_total = int(prompt_tokens) + max(0, completion)
     if requested_total <= max_context:
+        enforce_device_memory(engine, prompt_tokens)
         return
 
     # Format the message in the OpenAI shape so SDKs can branch on the
@@ -4917,6 +4935,36 @@ def enforce_context_length(
             }
         },
     )
+
+
+def enforce_device_memory(engine, prompt_tokens: int) -> None:
+    """Raise HTTP 400 when this device cannot prefill ``prompt_tokens`` at all.
+
+    Memory guard (LeanZero fork). Runs at admission -- before any SSE 200 is
+    committed -- on every route that counts its prompt (chat, completions,
+    anthropic, responses). The text scheduler judges feasibility from the
+    prompt's token count with its step-peak model at the floor chunk, after
+    clearing the allocator cache and evicting every prefix entry (it charges
+    only the weights and the request's own KV/state). The body is the OpenAI
+    ``context_length_exceeded`` shape with ``n_prompt_tokens`` / ``n_ctx`` so
+    a client (goose) compacts to ``n_ctx`` and resends; ``lz_reason`` says
+    why. A no-op when no text scheduler is reachable or it cannot judge.
+    """
+    if getattr(engine, "is_mllm", False) or int(prompt_tokens or 0) <= 0:
+        return
+    try:
+        from ..routes.models import _scheduler_of
+
+        scheduler = _scheduler_of(engine, "device_memory_admission")
+        if scheduler is None:
+            return
+        refusal = scheduler.device_memory_admission(int(prompt_tokens))
+    except Exception:  # noqa: BLE001
+        logger.debug("enforce_device_memory: probe failed", exc_info=True)
+        return
+    if refusal is None:
+        return
+    raise HTTPException(status_code=400, detail={"error": refusal.error_object()})
 
 
 def _build_prompt_with_thinking_compat(

@@ -149,8 +149,10 @@ class RequestOutputCollector:
         # ``new.error or existing.error`` behaviour for the ``error`` field.)
         if new.error:
             merged_error, merged_error_kind = new.error, new.error_kind
+            merged_error_detail = new.error_detail
         else:
             merged_error, merged_error_kind = existing.error, existing.error_kind
+            merged_error_detail = existing.error_detail
 
         return RequestOutput(
             request_id=new.request_id,
@@ -173,6 +175,9 @@ class RequestOutputCollector:
             # stale "repetition" kind.
             error=merged_error,
             error_kind=merged_error_kind,
+            # The typed refusal's error object travels with its error (the
+            # same atomic selection as ``error_kind``).
+            error_detail=merged_error_detail,
             # H-03: prefer the newer chunk's matched_stop (the scheduler
             # pins it exactly once on the chunk where the stop fires);
             # fall back to the existing buf so we never demote a

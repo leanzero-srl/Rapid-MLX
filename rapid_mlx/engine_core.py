@@ -1469,7 +1469,21 @@ class EngineCore:
             completion_tokens=req_output.completion_tokens,
             cached_tokens=req_output.cached_tokens,
             logprobs=(prev_lp + new_lp) or None,
+            # ``error`` / ``error_kind`` / ``error_detail`` are one unit: take
+            # all three from the newer step when it carries an error, else from
+            # the buffer (a dropped ``error_kind`` turned a repetition stop or
+            # a typed memory-guard refusal into a generic 503).
             error=req_output.error or (buf.error if buf is not None else None),
+            error_kind=(
+                req_output.error_kind
+                if req_output.error
+                else (buf.error_kind if buf is not None else None)
+            ),
+            error_detail=(
+                req_output.error_detail
+                if req_output.error
+                else (buf.error_detail if buf is not None else None)
+            ),
             # H-03: prefer the newer step's matched_stop (the scheduler
             # pins it exactly once on the chunk where the stop fires);
             # fall back to the existing buffer so a stop that fired on a
@@ -1567,6 +1581,7 @@ class EngineCore:
                             raise InferenceAbortedError(
                                 output.error,
                                 error_kind=output.error_kind,
+                                detail=output.error_detail,
                             )
 
                     yield output
@@ -1684,6 +1699,7 @@ class EngineCore:
                 raise InferenceAbortedError(
                     final_output.error,
                     error_kind=final_output.error_kind,
+                    detail=final_output.error_detail,
                 )
 
             return final_output
