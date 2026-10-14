@@ -23,6 +23,7 @@ after every step here, which is stricter.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import math
 from types import SimpleNamespace
@@ -98,57 +99,67 @@ def _context_of(batch, n: int) -> int:
 
 
 class _Device:
-    """Simulated Metal allocator over the real scheduler's live objects."""
+    """A simulated Metal device whose RESIDENT memory is the real allocator.
+
+    ``active`` is the CPU device's real ``mx.get_active_memory()`` above the
+    reading at install, plus a simulated weights offset: every buffer the
+    engine really holds counts -- the live batch, prefix entries, a finished
+    request's extracted cache still referenced by its response, admission
+    copies, padded merges -- whether or not the engine knows about it. Only
+    the attention scratch of a big model is simulated, and its cost
+    deliberately does NOT have the guard's model form (a context**1.15 term,
+    a per-step constant, +-6% noise), so calibration cannot pass by
+    construction::
+
+        step = (0.2*B*C*X**1.15 + 700*B*C + 30*X + 40 kB) * (1 +- 6%)
+
+    An allocation the guard did not plan is caught twice: before a prompt
+    step (resident + the simulated scratch over ``physical`` raises the
+    real Metal OOM text, as on Gabee) and after the fact (``max_seen``, the
+    real peak plus the simulated scratch, folded in at every peak reset and
+    after every step; the tests assert it never crossed ``physical``).
+    """
 
     def __init__(self, physical: int):
         self.physical = physical
-        self.peak = BASE
         self.ooms = 0
         self.fail_next = 0
         self.steps = 0
+        self.scratch_peak = 0
+        self.max_seen = BASE
         self.scheduler: Scheduler | None = None
 
     def active(self) -> int:
-        s = self.scheduler
-        live = 0
-        bg = getattr(s, "batch_generator", None)
-        if bg is not None:
-            try:
-                live = int(bg.prompt_cache_nbytes)
-            except Exception:
-                live = 0
-        ledger = s.memory_aware_cache._current_memory if s.memory_aware_cache else 0
-        return BASE + live + ledger
+        return BASE + max(0, self._real_active() - self._baseline)
+
+    def peak(self) -> int:
+        real = BASE + max(0, self._real_peak() - self._baseline)
+        return max(real, self.scratch_peak)
+
+    def fold(self) -> None:
+        self.max_seen = max(self.max_seen, self.peak())
+
+    def reset(self) -> None:
+        self.fold()
+        self._real_reset()
+        self.scratch_peak = 0
 
     def _transient(self, b: int, n: int, x: int) -> int:
-        # NOT the guard's form: x**1.15 attention, a per-step constant, and
-        # deterministic +-6% noise.
         self.steps += 1
         noise = 1.0 + 0.06 * math.sin(self.steps * 1.7)
         att = 1.6 * b * n * (x**1.15) / 8.0
         return int((att + 700 * b * n + 30 * x + 40_000) * noise)
 
-    def _first_write_copy(self, batch) -> int:
-        s = self.scheduler
-        mac = s.memory_aware_cache
-        extra = 0
-        for uid in list(getattr(batch, "uids", ())):
-            if uid in self._seen_uids:
-                continue
-            self._seen_uids.add(uid)
-            rid = s.uid_to_request_id.get(uid)
-            req = s.requests.get(rid) if rid else None
-            cached = int(getattr(req, "cached_tokens", 0) or 0)
-            if not cached or mac is None:
-                continue
-            prefix = tuple(req.prompt_token_ids[:cached])
-            if any(len(k) >= cached and k[:cached] == prefix for k in mac._entries):
-                extra += 512 * cached
-        return extra
-
     def install(self, monkeypatch, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
-        self._seen_uids: set = set()
+        scheduler._test_device = self
+        self._real_active = mx.get_active_memory
+        self._real_peak = mx.get_peak_memory
+        self._real_reset = mx.reset_peak_memory
+        gc.collect()
+        mx.clear_cache()
+        self._baseline = self._real_active()
+        self._real_reset()
         device = self
 
         def prompt(batch, tokens):
@@ -158,31 +169,30 @@ class _Device:
                 x = _context_of(batch, n)
                 before = device.active()
                 transient = device._transient(b, n, x)
-                # The first write of a row whose cached KV a prefix entry
-                # still holds grows every layer into new buffers: a one-off
-                # copy of the cached KV (Gabee Q8: +3-4 GB at 51-62k).
-                transient += device._first_write_copy(batch)
-                device.peak = max(device.peak, before + transient)
                 if device.fail_next > 0 or before + transient > device.physical:
                     device.fail_next = max(0, device.fail_next - 1)
                     device.ooms += 1
                     raise RuntimeError(OOM_TEXT)
+                out = _REAL_PROMPT(batch, tokens)
+                # The scratch lives beside whatever the real step held.
+                real = BASE + max(0, device._real_peak() - device._baseline)
+                device.scratch_peak = max(
+                    device.scratch_peak, before + transient, real + transient // 2
+                )
+                return out
             return _REAL_PROMPT(batch, tokens)
 
         monkeypatch.setattr(_GEN.PromptProcessingBatch, "prompt", prompt)
-        monkeypatch.setattr(mx, "get_peak_memory", lambda: device.peak)
-
-        def reset():
-            device.peak = device.active()
-
-        monkeypatch.setattr(mx, "reset_peak_memory", reset)
+        monkeypatch.setattr(mx, "get_active_memory", device.active)
+        monkeypatch.setattr(mx, "get_peak_memory", device.peak)
+        monkeypatch.setattr(mx, "reset_peak_memory", device.reset)
         scheduler._current_metal_active_bytes = device.active
         scheduler._current_metal_cache_bytes = lambda: 0
         scheduler._current_process_resident_bytes = device.active
         cap = int(device.physical * 0.97)
         scheduler._resolve_metal_cap_bytes = lambda: cap
         # A near-truth prior so these tests pin the eviction / budget /
-        # deferral POLICY, not the calibration (tested separately).
+        # deferral / handoff POLICY, not the calibration (tested separately).
         scheduler._memory_guard = MemoryGuard(
             PeakPrior(
                 attention_bytes_per_unit=6.0,
@@ -238,6 +248,9 @@ def _drive(scheduler: Scheduler, requests, steps: int = 4000, arrive=None):
             scheduler.add_request(r)
         out = scheduler.step()
         scheduler.evict_prefix_cache_under_pressure()
+        device = getattr(scheduler, "_test_device", None)
+        if device is not None:
+            device.fold()
         for o in out.outputs:
             outputs.setdefault(o.request_id, []).append(o)
         if step >= max(arrive, default=0) and not scheduler.has_requests():
