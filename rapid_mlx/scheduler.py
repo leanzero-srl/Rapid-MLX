@@ -8631,17 +8631,23 @@ class Scheduler:
         return raw_fraction
 
     def _memguard_pressure_fraction(self) -> float:
-        """The pressure evictors' trigger as a fraction of the cap.
+        """The Metal pressure trigger (and the idle room) as a fraction of
+        the cap.
 
-        Guard off: the operator's ``metal_pressure_evict_fraction`` (0.9),
-        lz.10 exactly. Guard on: the guard's own static margin
-        (1 - MARGIN_CEILING_RATIO). Every allocation is planned against the
-        ceiling at dispatch (E1) and store time, so an IDLE engine may hold
-        entries up to the margin; a 10% idle reserve capped the largest
-        storable session at 0.9 x ceiling - weights, below the context the
-        guard itself admits, and every later turn re-prefilled (session sim,
-        2026-10-14: entries vanished at 18.6k with a 22.9k window)."""
-        if getattr(self, "_memory_guard", None) is None and not guard_enabled():
+        Guard off, or a prefix cache the guard does not plan (legacy trie,
+        paged): the operator's ``metal_pressure_evict_fraction`` (0.9),
+        lz.10 exactly. Guard on with the memory-aware cache: the guard's own
+        static margin (1 - MARGIN_CEILING_RATIO). Every allocation is planned
+        against the ceiling at dispatch (E1) and store time, so an IDLE
+        engine may hold entries up to the margin; a 10% idle reserve capped
+        the largest storable session at 0.9 x ceiling - weights, below the
+        context the guard itself admits, and every later turn re-prefilled
+        (session sim, 2026-10-14: entries vanished at 18.6k with a 22.9k
+        window). The cache-self trigger (a share of the cache's own budget)
+        is unchanged."""
+        if getattr(self, "memory_aware_cache", None) is None or (
+            getattr(self, "_memory_guard", None) is None and not guard_enabled()
+        ):
             return self._resolve_pressure_evict_fraction()
         return 1.0 - MARGIN_CEILING_RATIO
 
@@ -8682,7 +8688,7 @@ class Scheduler:
         max_memory = int(getattr(cache, "_max_memory", 0) or 0)
         if max_memory <= 0:
             return 0
-        return int(max_memory * self._memguard_pressure_fraction())
+        return int(max_memory * self._resolve_pressure_evict_fraction())
 
     def _cache_self_pressure_current_bytes(self) -> int:
         """Snapshot of memory_aware_cache's current ledger in bytes.
