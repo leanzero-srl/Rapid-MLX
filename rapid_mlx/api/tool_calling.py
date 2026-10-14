@@ -535,7 +535,13 @@ def parse_tool_calls(
     #
     # No tools declared => None => the position-only rules, which is the
     # pre-existing behaviour.
+    #
+    # Structure decides nesting (``tool_call_scan.call_shape``): a bare
+    # ``<function=…>`` header is a boundary here too even though this branch
+    # only emits wrapped calls, so a declared call can never run on into the
+    # call after it and take that call's parameters (review of 26452cbe3).
     declared_tools = _declared_tool_names(request)
+    call_format = "<function="
     nemotron_matches = split_marked_calls(
         text,
         r"<tool_call>\s*<function=(\w+)>",
@@ -543,13 +549,17 @@ def parse_tool_calls(
         "</tool_call>",
         valid_names=declared_tools,
         surface_undeclared=True,
-    ) or split_marked_calls(
-        text,
-        r"<toolcall>\s*(\w+)\s*\n",
-        "</toolcall>",
-        valid_names=declared_tools,
-        surface_undeclared=True,
+        header=r"<function=([^>]+)>",
     )
+    if not nemotron_matches:
+        call_format = "<toolcall>"
+        nemotron_matches = split_marked_calls(
+            text,
+            r"<toolcall>\s*(\w+)\s*\n",
+            "</toolcall>",
+            valid_names=declared_tools,
+            surface_undeclared=True,
+        )
 
     for name, params_block, _, _ in nemotron_matches:
         arguments = {}
@@ -565,6 +575,8 @@ def parse_tool_calls(
             "</parameter>",
             valid_names=declared,
             reject_undeclared_siblings=declared is not None,
+            call_close="</function>" if call_format == "<function=" else "</toolcall>",
+            call_header=call_format,
         )
         if parsed_params is None:
             continue
