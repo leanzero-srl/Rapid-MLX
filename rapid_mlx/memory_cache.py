@@ -917,6 +917,37 @@ def _shared_state_arrays(cache: list[Any]) -> tuple[tuple[tuple[Any, int], ...],
     return tuple(distinct.values()), charged
 
 
+def entry_bytes_by_component(cache: list[Any]) -> dict[str, int]:
+    """Split an entry's charged bytes into what holds them (metadata only).
+
+    ``checkpoints``: recurrent-state checkpoints riding on hybrid layers;
+    ``recurrent``: the live recurrent state (GatedDeltaNet/Mamba conv +
+    SSM arrays) of non-trimmable layers; ``kv``: everything else (attention
+    keys/values incl. quantized tuples). Sums to
+    :func:`estimate_kv_cache_memory`. Used by the per-entry store log so a
+    measured per-token entry size (e.g. ~165 KB/token on Qwen3.5-27B, goose
+    T12) can be attributed to attention KV vs recurrent state vs checkpoints.
+    """
+    total = estimate_kv_cache_memory(cache)
+    checkpoints = checkpoint_bytes(cache) if cache else 0
+    recurrent = 0
+    for layer in cache or ():
+        if layer is None or isinstance(layer, dict):
+            continue
+        if is_recurrent_layer(layer):
+            try:
+                recurrent += _state_memory(layer.state)
+            except (AttributeError, TypeError, ValueError):
+                pass
+    kv = max(0, total - checkpoints - recurrent)
+    return {
+        "total": total,
+        "kv": kv,
+        "recurrent": recurrent,
+        "checkpoints": checkpoints,
+    }
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -2545,10 +2576,12 @@ class MemoryAwarePrefixCache:
                 self._message_boundary_sequence += 1
                 entry.message_boundary_sequence = self._message_boundary_sequence
             self._entries[tokens_key] = entry
+            ledger_cost = self._ledger_cost(entry)
             self._ledger_add(entry)
             bisect.insort(self._sorted_keys, tokens_key)
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
+            ledger_total = self._current_memory
             # R15-P1: keep the radix index in sync. Insert happens INSIDE
             # the cache lock so the radix and ``_entries`` are observed
             # coherently from concurrent fetchers. Skips silently if the
@@ -2568,10 +2601,26 @@ class MemoryAwarePrefixCache:
             if entry.non_trimmable:
                 self._enforce_hybrid_bound_locked()
 
-        logger.debug(
-            f"Stored cache: {len(tokens)} tokens, "
-            f"{entry.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-            f"total={self._current_memory / _BYTES_PER_MB:.1f}MB"
+        # One line per stored entry, bytes by component (memory guard E4):
+        # explains the measured per-token entry size and shows whether a turn
+        # stored a duplicate (``boundary`` marks the message-boundary copy).
+        parts = entry_bytes_by_component(entry.cache)
+        logger.info(
+            "[cache_store_bytes] tokens=%d boundary=%s total=%.1fMB kv=%.1fMB "
+            "recurrent=%.1fMB checkpoints=%.1fMB shared=%.1fMB charged=%.1fMB "
+            "per_token=%.1fKB entries=%d ledger=%.1fMB/%.1fMB",
+            len(tokens),
+            message_boundary,
+            entry.memory_bytes / _BYTES_PER_MB,
+            parts["kv"] / _BYTES_PER_MB,
+            parts["recurrent"] / _BYTES_PER_MB,
+            parts["checkpoints"] / _BYTES_PER_MB,
+            entry.shared_bytes / _BYTES_PER_MB,
+            ledger_cost / _BYTES_PER_MB,
+            entry.memory_bytes / max(1, len(tokens)) / 1024,
+            len(self._entries),
+            ledger_total / _BYTES_PER_MB,
+            self._max_memory / _BYTES_PER_MB,
         )
 
         return True

@@ -137,7 +137,11 @@ from .hybrid_state_checkpoints import (  # noqa: E402
 from .hybrid_state_checkpoints import (  # noqa: E402
     record_checkpoints as _record_state_checkpoints,
 )
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
+from .memory_cache import (  # noqa: E402
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+    _cache_has_non_trimmable,
+)
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
 from .prefix_cache import (
@@ -266,6 +270,13 @@ def _assemble_stop_tokens(
 # Rows per tile in MLX's quantized matmuls; see
 # ``Scheduler._prefill_tile_rows`` for the measurements behind it.
 _PREFILL_TILE_ROWS = 32
+# Ported from upstream 1394f1696 (agent-session prefix policy, the
+# supersede rule only). A non-trimmable (hybrid recurrent-state) N-token
+# prompt entry can only save the tokens between the stored message boundary
+# and N over the boundary entry (an exact repeat cannot trim-one into it).
+# When that gap is this small the second ~full-size owned copy is not worth
+# its memory: on goose's text lane each copy is ~3.7 GB at 22.5k tokens.
+_BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
 
 
 @dataclass
@@ -5152,6 +5163,24 @@ class Scheduler:
                 and getattr(request, "_cache_snapshot_stored", False)
             ):
                 return
+            # Same reasoning for a MESSAGE-boundary snapshot on a
+            # non-trimmable (hybrid recurrent-state) cache that sits just
+            # before the generation prompt: the N-token entry could only save
+            # those few tokens over the boundary entry, yet doubles the
+            # per-turn footprint and can LRU-evict the boundary entry the
+            # next turn needs (upstream 1394f1696).
+            if self._boundary_snapshot_supersedes(
+                request, extracted_cache, len(request.prompt_token_ids)
+            ):
+                logger.info(
+                    "[prompt_cache_save] request=%s skipped: the stored "
+                    "message-boundary entry supersedes this %d-token prompt "
+                    "entry (gap <= %d tokens, non-trimmable cache)",
+                    request_id[:12],
+                    len(request.prompt_token_ids),
+                    _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP,
+                )
+                return
 
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
@@ -5170,6 +5199,34 @@ class Scheduler:
                 )
 
         return _prompt_cache_save
+
+    def _boundary_snapshot_supersedes(
+        self, request: Any, cache: list[Any], entry_len: int
+    ) -> bool:
+        """True when this request's stored message-boundary snapshot makes a
+        second non-trimmable entry of ``entry_len`` tokens not worth storing.
+
+        Only for non-trimmable caches (an exact hit cannot trim-one, so the
+        longer entry is useful only as an extension base) and only when it
+        would add at most ``_BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP`` tokens of
+        reuse beyond the boundary. Internal N-1 snapshots keep their own rule.
+        Ported from upstream 1394f1696.
+        """
+        if not getattr(request, "_cache_snapshot_stored", False) or getattr(
+            request, "_cache_snapshot_is_internal", False
+        ):
+            return False
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        if boundary <= 0 or entry_len - boundary > _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP:
+            return False
+        return _cache_has_non_trimmable(cache)
 
     def _hybrid_checkpoints_enabled(self) -> bool:
         """Checkpoints are only worth recording when hybrid entries are kept."""
