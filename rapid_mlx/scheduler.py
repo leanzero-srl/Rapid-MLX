@@ -48,7 +48,12 @@ from ._sampler_fast_path import (  # noqa: E402
     make_fused_top_p_temp_sampler,
 )
 from ._seeded_sampler import make_seeded_sampler  # noqa: E402
-from .errors import BackpressureError, PagedCacheUnsupportedLayoutError  # noqa: E402
+from .errors import (  # noqa: E402
+    DEVICE_MEMORY_ERROR_KIND,
+    BackpressureError,
+    ContextExceedsDeviceMemoryError,
+    PagedCacheUnsupportedLayoutError,
+)
 from .kv_estimation import (  # noqa: E402
     _cfg_get,
     _valid_layer_types,
@@ -142,6 +147,18 @@ from .memory_cache import (  # noqa: E402
     MemoryCacheConfig,
     _cache_has_non_trimmable,
 )
+from .memory_guard import (  # noqa: E402
+    CACHE_LIMIT_FLOOR_RATIO,
+    REAPPLY_RATIO,
+    GuardPlan,
+    GuardProbe,
+    MemoryGuard,
+    PeakPrior,
+    RowPlan,
+    guard_enabled,
+    is_metal_oom,
+)
+from .memory_guard import GUARD_ENV as MEMORY_GUARD_ENV  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
 from .prefix_cache import (
@@ -6123,7 +6140,7 @@ class Scheduler:
         if cap <= 0:
             return 0
         resident = max(
-            self._current_metal_active_bytes(),
+            self._current_metal_active_bytes() + self._current_metal_cache_bytes(),
             self._current_process_resident_bytes(),
         )
         return max(0, cap - resident)
@@ -6198,7 +6215,8 @@ class Scheduler:
         if cap <= 0:
             return configured
         footprint = max(
-            self._current_metal_active_bytes(), self._current_process_resident_bytes()
+            self._current_metal_active_bytes() + self._current_metal_cache_bytes(),
+            self._current_process_resident_bytes(),
         )
         ratio = footprint / cap
         floor = max(
@@ -6261,6 +6279,691 @@ class Scheduler:
             )
             self._last_adaptive_prefill_size = selected
         return selected
+
+    # ------------------------------------------------------------------
+    # Memory guard (LeanZero fork, goose T12): a prefill chunk is dispatched
+    # only when its projected step peak fits. See ``rapid_mlx/memory_guard``.
+    # E1 runs before EVERY prefill chunk on the text lane at any context
+    # (the 32k ``adaptive_prefill_min_tokens`` threshold does not apply).
+    # ------------------------------------------------------------------
+    def _memguard(self) -> MemoryGuard | None:
+        """The scheduler's guard, built lazily from the loaded model."""
+        guard = getattr(self, "_memory_guard", None)
+        if guard is not None:
+            return guard
+        if getattr(self, "_memory_guard_disabled", False):
+            return None
+        if not guard_enabled():
+            self._memory_guard_disabled = True
+            logger.warning(
+                "[memory_guard] DISABLED by %s (A/B only): prefill chunks are "
+                "not checked against the device memory ceiling",
+                MEMORY_GUARD_ENV,
+            )
+            return None
+        config = getattr(self, "config", None)
+        floor = max(1, int(getattr(config, "adaptive_prefill_min_chunk_size", 256)))
+        guard = MemoryGuard(self._memguard_prior(), floor_tokens=floor)
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None:
+            guard.configured_prefix_budget = int(
+                getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0))
+                or 0
+            )
+        self._memory_guard = guard
+        prior = guard.model.prior
+        logger.info(
+            "[memory_guard] enabled: prior attention=%.1f B/(chunk*context) "
+            "token=%.0f B kv_copy=%.0f B/context-token floor_chunk=%d",
+            prior.attention_bytes_per_unit,
+            prior.token_bytes,
+            prior.kv_copy_bytes_per_context,
+            guard.floor_tokens,
+        )
+        return guard
+
+    def _memguard_prior(self) -> PeakPrior:
+        """Conservative analytic prior from the model config."""
+        dims = None
+        try:
+            dims = _read_kv_dims(getattr(self, "model", None))
+        except Exception:  # noqa: BLE001
+            dims = None
+        terms = None
+        try:
+            terms = self._kv_footprint_terms()
+        except Exception:  # noqa: BLE001
+            terms = None
+        per_tok = int(terms[0]) if terms else 0
+        if dims is None:
+            # Unknown shape: a large-dense-model prior (64 query heads,
+            # 8192 hidden). It only governs the first chunks; the peak model
+            # replaces it with measurement.
+            return PeakPrior.from_dims(
+                query_heads=64,
+                score_itemsize=2,
+                hidden_size=8192,
+                mlp_intermediate=3 * 8192,
+                kv_bytes_per_token=per_tok,
+                layer_kv_bytes_per_token=0,
+            )
+        _layers, kv_heads, head_dim, cfg = dims
+
+        def _int(name: str) -> int:
+            value = _cfg_get(cfg, name)
+            return (
+                value if isinstance(value, int) and not isinstance(value, bool) else 0
+            )
+
+        dtype_bytes = int(self._infer_kv_dtype_bytes(cfg))
+        query_heads = _int("num_attention_heads") or kv_heads
+        hidden = _int("hidden_size")
+        mlp = _int("intermediate_size")
+        moe = _int("moe_intermediate_size") * max(1, _int("num_experts_per_tok"))
+        mlp = max(mlp, moe + _int("shared_expert_intermediate_size"))
+        return PeakPrior.from_dims(
+            query_heads=query_heads,
+            score_itemsize=dtype_bytes,
+            hidden_size=hidden,
+            mlp_intermediate=mlp,
+            kv_bytes_per_token=per_tok,
+            layer_kv_bytes_per_token=2 * kv_heads * head_dim * dtype_bytes,
+        )
+
+    def _memguard_ceiling(self) -> int:
+        """The bytes the guard plans under: the engine's Metal cap (the same
+        limit ``mx.set_memory_limit`` holds), else the device working set at
+        the auto floor. 0 off Metal (guard inert)."""
+        cap = self._resolve_metal_cap_bytes()
+        if cap > 0:
+            return cap
+        try:
+            if not mx.metal.is_available():
+                return 0
+            info = mx.device_info()
+            base = int(
+                info.get("max_recommended_working_set_size", info.get("memory_size", 0))
+                or 0
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+        from .memory_budget import AUTO_UTILIZATION_FLOOR
+
+        return int(base * AUTO_UTILIZATION_FLOOR) if base > 0 else 0
+
+    def _current_metal_cache_bytes(self) -> int:
+        """MLX allocator cache: freed buffers MLX still holds (E2)."""
+        try:
+            return int(mx.get_cache_memory())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _metal_footprint_bytes(self, *, reclaim_over: int = 0) -> int:
+        """Active + allocator cache. With ``reclaim_over > 0`` and the sum at
+        or above it, the cache is cleared first and the sum re-read (E2: the
+        cache counts wherever pressure is checked, and it is given back
+        before anything with value is evicted or refused)."""
+        active = self._current_metal_active_bytes()
+        cache = self._current_metal_cache_bytes()
+        if reclaim_over > 0 and active + cache >= reclaim_over and cache > 0:
+            mx.clear_cache()
+            active = self._current_metal_active_bytes()
+            cache = self._current_metal_cache_bytes()
+        return active + cache
+
+    def _memguard_prefix_entry_count(self) -> int:
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None:
+            return len(getattr(mac, "_entries", ()) or ())
+        pc = getattr(self, "prefix_cache", None)
+        if pc is not None:
+            return len(getattr(pc, "_lru", ()) or ())
+        bac = getattr(self, "block_aware_cache", None)
+        if bac is not None:
+            return len(getattr(bac, "_request_tables", ()) or ())
+        return 0
+
+    def _memguard_evict_one(self, keep_newest: bool) -> bool:
+        if keep_newest and self._memguard_prefix_entry_count() <= 1:
+            return False
+        evicted = self._evict_one_prefix_cache_entry()
+        if evicted:
+            self.num_prefix_cache_pressure_evictions = (
+                getattr(self, "num_prefix_cache_pressure_evictions", 0) + 1
+            )
+        return evicted
+
+    def _memguard_probe(self) -> GuardProbe:
+        return GuardProbe(
+            active=self._current_metal_active_bytes,
+            cache=self._current_metal_cache_bytes,
+            clear_cache=mx.clear_cache,
+            evict_one=self._memguard_evict_one,
+            entry_count=self._memguard_prefix_entry_count,
+        )
+
+    def _memguard_request_for_uid(self, uid: Any) -> Request | None:
+        if uid is None:
+            return None
+        request_id = self.uid_to_request_id.get(uid)
+        if request_id is None:
+            return None
+        return self.running.get(request_id) or self.requests.get(request_id)
+
+    def _memguard_rows(self) -> list[RowPlan]:
+        """The prompt rows the next ``BatchGenerator.next()`` will prefill.
+
+        Mirrors mlx-lm 0.31 ``BatchGenerator._next``: no prefill when the
+        generation batch is full; rows already in ``_currently_processing``
+        plus as many queued sequences as the prefill batch has room for; a
+        row whose only segment is its last token moves to generation. A row's
+        KV offset is the larger of the tokens mlx-lm says its cache holds and
+        the prefix-cache hit plus the tokens processed so far (a prefix hit is
+        inserted without ``all_tokens``, so mlx-lm alone understates it).
+        """
+        bg = getattr(self, "batch_generator", None)
+        if bg is None:
+            return []
+        gen = getattr(bg, "_generation_batch", None)
+        try:
+            gen_len = len(gen) if gen is not None else 0
+        except TypeError:
+            gen_len = 0
+        completion = int(getattr(bg, "completion_batch_size", 0) or 0)
+        if completion and gen_len >= completion:
+            return []
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        uids = list(getattr(prompt_batch, "uids", None) or ())
+        known_tokens = getattr(prompt_batch, "tokens", None) or ()
+        rows: list[RowPlan] = []
+
+        def _row(uid: Any, segments: Any, offset_known: int, processed: int) -> None:
+            try:
+                if not segments:
+                    return
+                if len(segments) == 1 and len(segments[0]) <= 1:
+                    return
+                segment = len(segments[0])
+            except TypeError:
+                return
+            request = self._memguard_request_for_uid(uid)
+            cached = int(getattr(request, "cached_tokens", 0) or 0)
+            offset = max(int(offset_known), cached + int(processed))
+            prompt_tokens = int(
+                getattr(request, "model_prompt_tokens", 0)
+                or getattr(request, "num_prompt_tokens", 0)
+                or 0
+            )
+            rows.append(
+                RowPlan(
+                    request_id=str(getattr(request, "request_id", uid)),
+                    offset=offset,
+                    segment=segment,
+                    chunk_cap=int(getattr(request, "_memguard_chunk_cap", 0) or 0),
+                    chunk_floor=int(getattr(request, "_memguard_chunk_floor", 0) or 0),
+                    prompt_tokens=prompt_tokens,
+                )
+            )
+
+        for index, item in enumerate(getattr(bg, "_currently_processing", ()) or ()):
+            try:
+                segments, processed = item[0], int(item[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            known = len(known_tokens[index]) if index < len(known_tokens) else 0
+            _row(uids[index] if index < len(uids) else None, segments, known, processed)
+        try:
+            room = int(getattr(bg, "prefill_batch_size", 0) or 0) - len(prompt_batch)
+        except TypeError:
+            room = 0
+        if completion:
+            room = min(room, completion - gen_len)
+        for item in list(getattr(bg, "_unprocessed_sequences", ()) or ())[
+            : max(0, room)
+        ]:
+            try:
+                uid, segments, all_tokens = item[0], item[1], item[4]
+            except (IndexError, TypeError):
+                continue
+            _row(uid, segments, len(all_tokens or ()), 0)
+        return rows
+
+    def _memguard_set_chunk(self, chunk: int) -> None:
+        bg = self.batch_generator
+        current = int(getattr(bg, "prefill_step_size", chunk) or chunk)
+        if chunk < current:
+            bg.prefill_step_size = chunk
+            prompt_batch = getattr(bg, "_prompt_batch", None)
+            if prompt_batch is not None:
+                prompt_batch.prefill_step_size = chunk
+
+    def _memguard_before_dispatch(self) -> tuple[GuardPlan | None, list[RequestOutput]]:
+        """E1: plan the next prefill chunk. Returns the plan (``None`` when
+        nothing is prefilled or the guard is inert) and terminal outputs for
+        any request refused because it cannot fit even at the floor chunk."""
+        refusals: list[RequestOutput] = []
+        try:
+            return self._memguard_plan_dispatch(refusals)
+        except Exception:  # noqa: BLE001
+            # A guard defect must never take the step down (the generic
+            # handler would abort every running request). Log loudly and
+            # dispatch as the unguarded engine would.
+            logger.exception("[memory_guard] plan failed; dispatching unguarded")
+            return None, refusals
+
+    def _memguard_plan_dispatch(
+        self, refusals: list[RequestOutput]
+    ) -> tuple[GuardPlan | None, list[RequestOutput]]:
+        guard = self._memguard()
+        if guard is None or self.batch_generator is None:
+            return None, refusals
+        ceiling = self._memguard_ceiling()
+        if ceiling <= 0:
+            return None, refusals
+        probe = self._memguard_probe()
+        for _ in range(64):
+            rows = self._memguard_rows()
+            if not rows:
+                return None, refusals
+            configured = int(
+                getattr(self.batch_generator, "prefill_step_size", 0)
+                or getattr(self.config, "prefill_step_size", 2048)
+            )
+            plan = guard.plan(
+                rows, configured_chunk=configured, ceiling=ceiling, probe=probe
+            )
+            if plan.refuse is None:
+                self._memguard_set_chunk(plan.chunk)
+                return plan, refusals
+            refusals.append(self._memguard_refuse(plan))
+        return None, refusals
+
+    def _memguard_refuse(self, plan: GuardPlan) -> RequestOutput:
+        """Abort the refused row BEFORE anything is allocated for its chunk
+        and return its terminal output carrying the typed error."""
+        row = plan.refuse
+        assert row is not None
+        refusal = ContextExceedsDeviceMemoryError(
+            prompt_tokens=row.prompt_tokens or (row.offset + row.segment),
+            needed_bytes=plan.needed,
+            available_bytes=plan.ceiling,
+            max_context=self.memory_guard_max_context() or 0,
+        )
+        self._do_abort_request(row.request_id)
+        request = self.requests.get(row.request_id)
+        if request is not None:
+            request.status = RequestStatus.FINISHED_ABORTED
+        logger.warning(
+            "[memory_guard] refused request %s: %s",
+            row.request_id[:12],
+            refusal.message,
+        )
+        return RequestOutput(
+            request_id=row.request_id,
+            finished=True,
+            finish_reason="abort",
+            error=refusal.message,
+            error_kind=DEVICE_MEMORY_ERROR_KIND,
+            error_detail=refusal.error_object(),
+        )
+
+    def _memguard_measure_begin(self, plan: GuardPlan | None) -> tuple[int, int] | None:
+        if plan is None or plan.shape.batch <= 0:
+            return None
+        try:
+            # Carry the process-lifetime peak across the per-chunk reset so
+            # ``metal_peak_memory_gb`` in the stats stays "since start".
+            self._memguard_process_peak = max(
+                getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
+            )
+            mx.reset_peak_memory()
+            return (
+                self._current_metal_active_bytes(),
+                self._cache_self_pressure_current_bytes(),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _memguard_measure_end(
+        self, plan: GuardPlan | None, begin: tuple[int, int] | None
+    ) -> None:
+        if plan is None or begin is None:
+            return
+        try:
+            self._memguard_observe_dispatch(plan, begin)
+        except Exception:  # noqa: BLE001
+            logger.exception("[memory_guard] observation failed")
+
+    def _memguard_observe_dispatch(
+        self, plan: GuardPlan, begin: tuple[int, int]
+    ) -> None:
+        try:
+            peak = int(mx.get_peak_memory())
+        except Exception:  # noqa: BLE001
+            return
+        self._memguard_process_peak = max(
+            getattr(self, "_memguard_process_peak", 0), peak
+        )
+        active_before, prefix_before = begin
+        transient = max(0, peak - active_before)
+        base = getattr(self, "_memguard_idle_base_bytes", 0)
+        live = max(0, active_before - prefix_before - base) if base > 0 else 0
+        guard = self._memguard()
+        if guard is not None and guard.observe(
+            plan.shape, transient, live_beyond_base=live
+        ):
+            self._memguard_apply_budgets()
+
+    def _memguard_idle_base(self) -> int:
+        """Weights + fixed runtime state: Metal active with nothing running,
+        less the (evictable) prefix-cache ledger. Re-measured whenever the
+        scheduler is idle; while busy the last idle measurement stands."""
+        running = getattr(self, "running", None)
+        stored = int(getattr(self, "_memguard_idle_base_bytes", 0) or 0)
+        if running and stored > 0:
+            return stored
+        active = self._current_metal_active_bytes()
+        prefix = self._cache_self_pressure_current_bytes()
+        base = max(0, active - prefix)
+        if not running:
+            self._memguard_idle_base_bytes = base
+        return base
+
+    def memory_guard_max_context(self, native_context: int | None = None) -> int | None:
+        """The honest largest context one sequence can hold on this device:
+        idle base (weights) + its live KV/state + the floor chunk's step peak
+        + margin under the ceiling, capped at ``native_context`` (or the
+        model's own window). Recomputed from the live peak model on every
+        call. ``None`` when the guard is inert or the KV terms are unknown."""
+        try:
+            guard = self._memguard()
+            if guard is None:
+                return None
+            ceiling = self._memguard_ceiling()
+            if ceiling <= 0:
+                return None
+            kv_fn = self._kv_footprint_fn()
+            if kv_fn is None:
+                return None
+            upper = native_context
+            if not (isinstance(upper, int) and upper > 0):
+                upper = self._memguard_native_context() or 8_000_000
+            return guard.max_context(
+                base=self._memguard_idle_base(),
+                kv_footprint=kv_fn,
+                ceiling=ceiling,
+                upper=upper,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[memory_guard] max context probe failed", exc_info=True)
+            return None
+
+    def _memguard_native_context(self) -> int | None:
+        dims = _read_kv_dims(getattr(self, "model", None))
+        if dims is None:
+            return None
+        value = _cfg_get(dims[3], "max_position_embeddings")
+        return value if isinstance(value, int) and value > 0 else None
+
+    def device_memory_admission(
+        self, prompt_tokens: int
+    ) -> ContextExceedsDeviceMemoryError | None:
+        """Admission-time feasibility (route thread, before any stream is
+        committed): can a ``prompt_tokens`` prompt be prefilled at all on
+        this device, after the allocator cache is cleared and every prefix
+        entry evicted? Returns the refusal, or ``None`` when it fits or the
+        guard cannot judge (inert / unknown KV terms)."""
+        try:
+            tokens = int(prompt_tokens)
+            if tokens <= 0:
+                return None
+            guard = self._memguard()
+            if guard is None:
+                return None
+            ceiling = self._memguard_ceiling()
+            kv_fn = self._kv_footprint_fn()
+            if ceiling <= 0 or kv_fn is None:
+                return None
+            base = self._memguard_idle_base()
+            need = guard.single_sequence_need(
+                tokens, base=base, kv_footprint=kv_fn, ceiling=ceiling
+            )
+            if need <= ceiling:
+                return None
+            max_ctx = guard.max_context(
+                base=base,
+                kv_footprint=kv_fn,
+                ceiling=ceiling,
+                upper=self._memguard_native_context() or max(tokens, 1),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[memory_guard] admission probe failed", exc_info=True)
+            return None
+        guard.counts["admission_refusals"] += 1
+        refusal = ContextExceedsDeviceMemoryError(
+            prompt_tokens=tokens,
+            needed_bytes=need,
+            available_bytes=ceiling,
+            max_context=max_ctx,
+        )
+        logger.warning(
+            "[memory_guard] admission refused: %s (idle base %.2fGB)",
+            refusal.message,
+            base / 1e9,
+        )
+        return refusal
+
+    def _memguard_apply_budgets(self) -> None:
+        """E2 + E3, re-derived whenever the peak model moves.
+
+        Headroom = ceiling - idle base (weights) - worst observed dispatch
+        (that request's live KV/state + its step transient) - margin.
+        E3: the prefix-cache budget is min(configured, headroom); the
+        operator's --cache-memory-percent / --cache-memory-mb are upper
+        bounds only. E2: the MLX allocator cache limit is the same headroom
+        (the Q-127 rule: budget less the plan less its step peak), never
+        above the boot-time 25% cap and never below a small floor.
+        """
+        guard = self._memguard()
+        if guard is None:
+            return
+        ceiling = self._memguard_ceiling()
+        if ceiling <= 0:
+            return
+        base = self._memguard_idle_base()
+        headroom = max(0, guard.derived_headroom(ceiling=ceiling, base=base))
+
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None and hasattr(mac, "set_max_memory"):
+            configured = int(
+                getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0))
+                or 0
+            )
+            guard.configured_prefix_budget = configured
+            effective = min(configured, headroom)
+            previous = guard.effective_prefix_budget
+            if previous is None or abs(effective - previous) > REAPPLY_RATIO * max(
+                1, previous
+            ):
+                evicted = mac.set_max_memory(effective)
+                guard.effective_prefix_budget = effective
+                if previous is None and effective == configured:
+                    pass
+                else:
+                    logger.warning(
+                        "[memory_guard] prefix budget %.2fGB -> %.2fGB "
+                        "(configured %.2fGB, ceiling %.2fGB, base %.2fGB, "
+                        "worst step %.2fGB) evicted=%d",
+                        (previous if previous is not None else configured) / 1e9,
+                        effective / 1e9,
+                        configured / 1e9,
+                        ceiling / 1e9,
+                        base / 1e9,
+                        guard.worst_step_footprint / 1e9,
+                        evicted,
+                    )
+
+        from .memory_budget import compute_metal_cache_limit
+
+        boot_cap = compute_metal_cache_limit(ceiling)
+        floor = int(CACHE_LIMIT_FLOOR_RATIO * ceiling)
+        limit = min(boot_cap, max(floor, headroom))
+        previous_limit = guard.cache_limit
+        if previous_limit is None and limit >= boot_cap:
+            guard.cache_limit = boot_cap
+            return
+        if previous_limit is None or abs(limit - previous_limit) > REAPPLY_RATIO * max(
+            1, previous_limit
+        ):
+            try:
+                mx.set_cache_limit(limit)
+            except Exception:  # noqa: BLE001
+                logger.warning("[memory_guard] set_cache_limit failed", exc_info=True)
+                return
+            guard.cache_limit = limit
+            logger.warning(
+                "[memory_guard] allocator cache limit %.2fGB -> %.2fGB "
+                "(boot cap %.2fGB, headroom %.2fGB)",
+                (previous_limit if previous_limit is not None else boot_cap) / 1e9,
+                limit / 1e9,
+                boot_cap / 1e9,
+                headroom / 1e9,
+            )
+
+    def _memguard_backstop(
+        self, error: Exception, plan: GuardPlan | None, begin: tuple[int, int] | None
+    ) -> tuple[set[str], list[RequestOutput]] | None:
+        """E5: a Metal OOM got through. Learn from it, then requeue ONCE every
+        running request that has emitted no token; abort the rest as today.
+
+        Returns ``(aborted_ids, outputs)`` or ``None`` when ``error`` is not a
+        Metal OOM / the guard is inert (the caller then recovers as before).
+        """
+        guard = self._memguard()
+        if guard is None or not is_metal_oom(error):
+            return None
+        try:
+            return self._memguard_backstop_recover(guard, error, plan, begin)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[memory_guard] backstop recovery failed; aborting as before"
+            )
+            return None
+
+    def _memguard_backstop_recover(
+        self,
+        guard: MemoryGuard,
+        error: Exception,
+        plan: GuardPlan | None,
+        begin: tuple[int, int] | None,
+    ) -> tuple[set[str], list[RequestOutput]]:
+        guard.counts["backstop_fired"] += 1
+        ceiling = self._memguard_ceiling()
+        active_before = begin[0] if begin else self._current_metal_active_bytes()
+        try:
+            peak = int(mx.get_peak_memory())
+        except Exception:  # noqa: BLE001
+            peak = 0
+        try:
+            info = mx.device_info()
+            working_set = int(info.get("max_recommended_working_set_size", 0) or 0)
+        except Exception:  # noqa: BLE001
+            working_set = 0
+        # The failed dispatch needed at least what was left below the
+        # physical working set; record that as an observation so E1 learns.
+        observed = max(peak - active_before, working_set - active_before, 0)
+        logger.error(
+            "[memory_guard] BACKSTOP FIRED -- a Metal OOM got past the guard "
+            "(guard defect signal): %s | shape=%s active_before=%.2fGB "
+            "peak=%.2fGB working_set=%.2fGB ceiling=%.2fGB projected=%.2fGB "
+            "margin=%.2fGB recorded_transient=%.2fGB",
+            str(error)[:200],
+            None
+            if plan is None
+            else f"{plan.shape.batch}x{plan.shape.chunk}x{plan.shape.context}",
+            active_before / 1e9,
+            peak / 1e9,
+            working_set / 1e9,
+            ceiling / 1e9,
+            (plan.projected_transient if plan else 0) / 1e9,
+            (plan.margin if plan else 0) / 1e9,
+            observed / 1e9,
+        )
+        if plan is not None and plan.shape.batch > 0 and observed > 0:
+            guard.observe(plan.shape, observed, source="backstop")
+
+        # Close the batch generator (its state is gone either way), then
+        # give back everything evictable.
+        self._close_batch_generator()
+        self._current_sampler_params = None
+        while self._memguard_prefix_entry_count() > 0:
+            if not self._evict_one_prefix_cache_entry():
+                break
+        mx.clear_cache()
+        self._memguard_apply_budgets()
+
+        chunk = (
+            plan.chunk
+            if plan is not None
+            else int(getattr(self.config, "prefill_step_size", 2048))
+        )
+        aborted: set[str] = set()
+        outputs: list[RequestOutput] = []
+        abort_error = (
+            f"Inference aborted after generation error: {type(error).__name__}: {error}"
+        )
+        requeue: list[Request] = []
+        for request_id, request in list(self.running.items()):
+            if request.num_output_tokens == 0 and not getattr(
+                request, "_memguard_backstop_requeued", False
+            ):
+                request._memguard_backstop_requeued = True
+                request._memguard_chunk_cap = max(1, chunk // 2)
+                floor = int(
+                    getattr(request, "_memguard_chunk_floor", 0) or guard.floor_tokens
+                )
+                request._memguard_chunk_floor = max(1, floor // 2)
+                requeue.append(request)
+                continue
+            self.performance.record_failed_performance(request)
+            request.set_finished(RequestStatus.FINISHED_ABORTED)
+            aborted.add(request_id)
+            self.finished_req_ids.add(request_id)
+            outputs.append(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="abort",
+                    error=abort_error,
+                )
+            )
+        for request in reversed(requeue):
+            request.status = RequestStatus.WAITING
+            request.batch_uid = None
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request._srpf_parked_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            # The prefix entries were evicted: the boundary snapshot must be
+            # retaken, and the supersede rule must not trust the old one.
+            request._boundary_snapshot_taken = False
+            request._cache_snapshot_stored = False
+            self.waiting.appendleft(request)
+            del self.running[request.request_id]
+            guard.counts["backstop_requeued"] += 1
+            logger.error(
+                "[memory_guard] BACKSTOP requeued request %s once "
+                "(chunk cap %d, floor %d)",
+                request.request_id[:12],
+                request._memguard_chunk_cap,
+                request._memguard_chunk_floor,
+            )
+        self.running.clear()
+        self._detokenizer_pool.clear()
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+        mx.clear_cache()
+        return aborted, outputs
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
@@ -6615,6 +7318,69 @@ class Scheduler:
         self._resolve_kv_bytes_per_token()
         return self._kv_fixed_baseline_bytes
 
+    def _kv_footprint_terms(self) -> tuple[int, int, int, int] | None:
+        """``(per_token_growth, fixed_baseline, sliding_slot_bytes,
+        sliding_window)`` of one sequence, or ``None`` when no term resolves.
+
+        One home for the per-sequence KV/state footprint used by the
+        ``max_model_len`` projection and the memory guard: prefer the
+        scheduler's OWN resolved terms (they honor the operator
+        ``metal_cap_kv_bytes_per_token`` override and use
+        ``_pick_structural_config`` to select the right tower on
+        multimodal/hybrid configs); mlx-lm models expose dims on ``.args``,
+        not ``.config``, so the config-only read yields 0 there -- fall back
+        to reading the dims off the model and running the SAME hybrid-aware
+        estimator, preferring the text tower over any decoy outer config
+        (``_read_kv_dims``).
+        """
+        per_tok = self._resolve_kv_bytes_per_token()
+        fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+        sliding_slot_bytes = self._kv_sliding_slot_bytes
+        sliding_window = self._kv_sliding_window
+        if per_tok > 0 or fixed_baseline > 0 or sliding_slot_bytes > 0:
+            return per_tok, fixed_baseline, sliding_slot_bytes, sliding_window
+        dims = _read_kv_dims(self.model)
+        if dims is None:
+            return None
+        num_layers, kv_heads, head_dim, struct_cfg = dims
+        dtype_bytes = self._infer_kv_dtype_bytes(struct_cfg)
+        uniform_per_token = 2 * num_layers * kv_heads * head_dim * dtype_bytes
+        if uniform_per_token <= 0:
+            return None
+        estimate = estimate_kv_footprint(
+            struct_cfg,
+            dtype_bytes=dtype_bytes,
+            uniform_per_token_bytes=uniform_per_token,
+            base_num_layers=num_layers,
+            base_kv_heads=kv_heads,
+            base_head_dim=head_dim,
+        )
+        terms = (
+            estimate.per_token_growth_bytes,
+            estimate.fixed_baseline_bytes,
+            estimate.sliding_slot_bytes,
+            estimate.sliding_window,
+        )
+        if terms[0] <= 0 and terms[1] <= 0 and terms[2] <= 0:
+            return None
+        return terms
+
+    def _kv_footprint_fn(self):
+        """``tokens -> bytes`` of one sequence's KV/state, or ``None``."""
+        terms = self._kv_footprint_terms()
+        if terms is None:
+            return None
+        per_tok, fixed_baseline, sliding_slot_bytes, sliding_window = terms
+
+        def _footprint(tokens: int) -> int:
+            return (
+                fixed_baseline
+                + per_tok * tokens
+                + sliding_slot_bytes * rotating_cache_slots(sliding_window, tokens)
+            )
+
+        return _footprint
+
     def projected_memory_max_context(
         self, native_context: int | None = None
     ) -> int | None:
@@ -6649,47 +7415,9 @@ class Scheduler:
         field absent rather than advertising a fabricated cap.
         """
         try:
-            # Prefer the scheduler's OWN resolved footprint terms so the
-            # advertised ceiling can never diverge from what admission would
-            # actually charge: these honor the operator
-            # ``metal_cap_kv_bytes_per_token`` override and use
-            # ``_pick_structural_config`` to select the right tower on
-            # multimodal/hybrid configs. They are populated whenever the model
-            # exposes a ``.config`` (the admission path's own source).
-            per_tok = self._resolve_kv_bytes_per_token()
-            fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
-            sliding_slot_bytes = self._kv_sliding_slot_bytes
-            sliding_window = self._kv_sliding_window
-            if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
-                # The scheduler could not resolve terms — mlx-lm models expose
-                # dims on ``.args``, not ``.config``, so its config-only read
-                # yields 0 (and the admission cap is likewise a no-op there, so
-                # there is nothing to diverge from). Fall back to reading the
-                # dims off the model and running the SAME hybrid-aware
-                # estimator, preferring the text tower over any decoy outer
-                # config (``_read_kv_dims``).
-                dims = _read_kv_dims(self.model)
-                if dims is None:
-                    return None
-                num_layers, kv_heads, head_dim, struct_cfg = dims
-                dtype_bytes = self._infer_kv_dtype_bytes(struct_cfg)
-                uniform_per_token = 2 * num_layers * kv_heads * head_dim * dtype_bytes
-                if uniform_per_token <= 0:
-                    return None
-                estimate = estimate_kv_footprint(
-                    struct_cfg,
-                    dtype_bytes=dtype_bytes,
-                    uniform_per_token_bytes=uniform_per_token,
-                    base_num_layers=num_layers,
-                    base_kv_heads=kv_heads,
-                    base_head_dim=head_dim,
-                )
-                per_tok = estimate.per_token_growth_bytes
-                fixed_baseline = estimate.fixed_baseline_bytes
-                sliding_slot_bytes = estimate.sliding_slot_bytes
-                sliding_window = estimate.sliding_window
-                if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
-                    return None
+            _footprint = self._kv_footprint_fn()
+            if _footprint is None:
+                return None
 
             if not mx.metal.is_available():
                 return None
@@ -6708,17 +7436,16 @@ class Scheduler:
                 # engine's allocation-side default working-set fraction.
                 util = 0.90
             budget = int(base * util)
-            resident = int(mx.get_active_memory())
+            # The prefix cache yields under pressure (the memory guard evicts
+            # it before it refuses anything), so its bytes are not charged
+            # against the window it would give way to.
+            resident = max(
+                0,
+                int(mx.get_active_memory()) - self._cache_self_pressure_current_bytes(),
+            )
             available = budget - resident
             if available <= 0:
                 return None
-
-            def _footprint(tokens: int) -> int:
-                return (
-                    fixed_baseline
-                    + per_tok * tokens
-                    + sliding_slot_bytes * rotating_cache_slots(sliding_window, tokens)
-                )
 
             # Search up to the native window when known (the field is capped
             # there anyway), else a generous ceiling covering 1M-context models.
@@ -6729,16 +7456,26 @@ class Scheduler:
             )
             if _footprint(upper) <= available:
                 # Memory is not the binding constraint — the native window fits.
-                return upper
-            # Monotonic non-decreasing footprint → binary-search the largest T.
-            lo, hi = 0, upper
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if _footprint(mid) <= available:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            return lo if lo > 0 else None
+                kv_only = upper
+            else:
+                # Monotonic non-decreasing footprint → binary-search the
+                # largest T.
+                lo, hi = 0, upper
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _footprint(mid) <= available:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                kv_only = lo
+            # Memory guard (LeanZero fork): the KV-only figure ignores the
+            # prefill's step peak. The honest window is the largest context
+            # whose live KV/state + floor-chunk step peak + margin fits beside
+            # the weights -- never larger than the KV-only figure.
+            honest = self.memory_guard_max_context(upper)
+            if honest is not None:
+                kv_only = min(kv_only, honest)
+            return kv_only if kv_only > 0 else None
         except Exception:  # noqa: BLE001
             # Never let a memory-probe failure break the models endpoint.
             return None
@@ -7030,7 +7767,6 @@ class Scheduler:
         cap = self._resolve_metal_cap_bytes()
         if cap <= 0:
             return
-        active = self._current_metal_active_bytes()
         projected_kv = self._estimate_request_kv_bytes(request)
         # Codex round 5 BLOCKING #1: count KV reservations of every
         # request already admitted but not yet finished. Without this,
@@ -7038,6 +7774,11 @@ class Scheduler:
         # cap stacks up to BLOW the cap collectively — ``active`` lags
         # the allocator until prefill actually runs.
         reserved_kv = self._sum_in_flight_kv_bytes()
+        # Memory guard E2: the MLX allocator cache counts (it is real GPU
+        # memory), but it is given back before a request is rejected for it.
+        active = self._metal_footprint_bytes(
+            reclaim_over=max(1, cap - reserved_kv - projected_kv)
+        )
         # Reject when ALREADY over cap OR when admitting the request
         # would push the allocator over cap on its own KV grow path
         # OR when the sum of in-flight reservations + this request
@@ -7073,7 +7814,7 @@ class Scheduler:
                         exc_info=True,
                     )
             if freed:
-                active = self._current_metal_active_bytes()
+                active = self._metal_footprint_bytes()
                 reserved_kv = self._sum_in_flight_kv_bytes()
                 if active < cap and (active + reserved_kv + projected_kv) < cap:
                     logger.info(
@@ -7219,7 +7960,7 @@ class Scheduler:
         prefix and paged caches were asked to give memory back first.
         """
         cap = self._resolve_metal_cap_bytes()
-        if cap <= 0 or self._current_metal_active_bytes() < cap:
+        if cap <= 0 or self._metal_footprint_bytes(reclaim_over=cap) < cap:
             return False
         longest = max(
             self.running.values(), key=lambda r: r.num_output_tokens, default=None
@@ -7228,7 +7969,7 @@ class Scheduler:
             return False
         self.evict_prefix_cache_under_pressure()
         self.release_paged_cache_blocks_under_pressure()
-        return self._current_metal_active_bytes() >= cap
+        return self._metal_footprint_bytes(reclaim_over=cap) >= cap
 
     def evict_prefix_cache_under_pressure(self, max_evict: int = 64) -> int:
         """LRU-evict prefix-cache entries while memory pressure persists.
@@ -7289,7 +8030,9 @@ class Scheduler:
         for _ in range(max(0, int(max_evict))):
             should_evict = False
             if metal_threshold > 0:
-                active = self._current_metal_active_bytes()
+                # Memory guard E2: active + allocator cache, the cache given
+                # back first so a full cache never costs a prefix entry.
+                active = self._metal_footprint_bytes(reclaim_over=metal_threshold)
                 if active >= metal_threshold:
                     should_evict = True
                     triggered_metal = True
@@ -7556,7 +8299,7 @@ class Scheduler:
             if cap <= 0:
                 return 0
         threshold = int(cap * self._resolve_pressure_evict_fraction())
-        if self._current_metal_active_bytes() < threshold:
+        if self._metal_footprint_bytes(reclaim_over=threshold) < threshold:
             return 0
         return paged.release_pressure_blocks(max_blocks=max_blocks)
 
@@ -8901,7 +9644,7 @@ class Scheduler:
         prompt = len(candidate.prompt_token_ids or ())
         max_tokens = int(getattr(candidate.sampling_params, "max_tokens", 0) or 0)
         need = live_bytes + fixed + per_token * (prompt + max_tokens + 1)
-        active = self._current_metal_active_bytes()
+        active = self._metal_footprint_bytes(reclaim_over=max(1, cap - int(need)))
         if active + need >= cap:
             self._srpf_refuse(
                 "kv_budget", f"active {active} + need {int(need)} >= cap {cap}"
@@ -10373,8 +11116,13 @@ class Scheduler:
         # spend this and every later tick decoding a ghost slot.
         self._reconcile_orphaned_running_requests()
 
+        guard_plan: GuardPlan | None = None
+        guard_begin: tuple[int, int] | None = None
+        guard_refusals: list[RequestOutput] = []
         for attempt in range(max_retries + 1):
             try:
+                guard_plan = None
+                guard_begin = None
                 # Schedule waiting requests
                 scheduled = self._schedule_waiting()
                 output.scheduled_request_ids = [r.request_id for r in scheduled]
@@ -10402,8 +11150,21 @@ class Scheduler:
                     # Tighten that chunk before dispatch when a long cold or
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
+                    # Memory guard E1: the chunk about to run must fit under
+                    # the ceiling with its projected step peak -- else clear
+                    # the allocator cache, evict prefix entries, halve the
+                    # chunk, and as the last resort refuse the request before
+                    # anything is allocated for it.
+                    guard_plan, refused = self._memguard_before_dispatch()
+                    guard_refusals.extend(refused)
+                    # A refusal can empty the batch; then nothing dispatches.
+                    dispatch = bool(self.running)
+                    if dispatch:
+                        guard_begin = self._memguard_measure_begin(guard_plan)
                     srpf_step = self._srpf_step_begin()
-                    if self._step_timing_enabled:
+                    if not dispatch:
+                        raw_next = ([], [])
+                    elif self._step_timing_enabled:
                         st = getattr(self, "_steptime", None)
                         if st is None:
                             # [next_samples, outside_samples, count, end_stamp]
@@ -10435,6 +11196,7 @@ class Scheduler:
                             st[0], st[1] = [], []
                     else:
                         raw_next = self.batch_generator.next()
+                    self._memguard_measure_end(guard_plan, guard_begin)
                     self._srpf_step_end(srpf_step)
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires
@@ -10540,6 +11302,15 @@ class Scheduler:
                 logger.error(
                     f"Error in batch generation step: {e}\n{traceback.format_exc()}"
                 )
+                # Memory guard E5: a Metal OOM before a request emitted any
+                # token is learned from and that request is requeued once,
+                # transparently; requests with emitted tokens abort as before.
+                backstop = self._memguard_backstop(e, guard_plan, guard_begin)
+                if backstop is not None:
+                    aborted_ids, backstop_outputs = backstop
+                    output.outputs.extend(backstop_outputs)
+                    output.finished_request_ids = set(aborted_ids)
+                    break
                 # Recover from fatal errors (OOM, Metal crash) instead of
                 # re-raising, which would cause infinite loop in engine_core.
                 aborted_ids = self._recover_from_generation_error()
@@ -10558,6 +11329,16 @@ class Scheduler:
                     )
                 output.finished_request_ids = aborted_ids
                 break
+
+        if guard_refusals:
+            # Typed terminal outputs for requests the guard refused before
+            # allocating (``_process_batch_responses`` assigned
+            # ``output.outputs`` above, so these are appended after it).
+            output.outputs.extend(guard_refusals)
+            output.finished_request_ids = set(output.finished_request_ids) | {
+                o.request_id for o in guard_refusals
+            }
+            output.has_work = True
 
         if self._step_timing_enabled and hasattr(self, "_steptime"):
             self._steptime[3] = time.perf_counter()
@@ -11143,7 +11924,16 @@ class Scheduler:
         try:
             if mx.metal.is_available():
                 stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
-                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
+                # The memory guard resets MLX's peak counter per prefill
+                # chunk; it carries the process-lifetime peak itself.
+                stats["metal_peak_memory_gb"] = round(
+                    max(
+                        mx.get_peak_memory(),
+                        getattr(self, "_memguard_process_peak", 0),
+                    )
+                    / 1e9,
+                    2,
+                )
                 stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
         except Exception:
             pass
@@ -11155,6 +11945,17 @@ class Scheduler:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
+        guard = getattr(self, "_memory_guard", None)
+        if guard is not None:
+            stats["memory_guard"] = guard.snapshot()
+            stats["memory_guard"]["idle_base_mb"] = round(
+                getattr(self, "_memguard_idle_base_bytes", 0) / 2**20, 1
+            )
+        else:
+            stats["memory_guard"] = {
+                "enabled": guard_enabled(),
+                "initialized": False,
+            }
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

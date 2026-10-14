@@ -57,7 +57,7 @@ def _engine_for(model_id: str):
     return None
 
 
-def _scheduler_of(engine):
+def _scheduler_of(engine, method: str = "projected_memory_max_context"):
     """Walk the engine backend graph to a ``Scheduler`` exposing
     ``projected_memory_max_context``, or ``None``.
 
@@ -87,7 +87,7 @@ def _scheduler_of(engine):
         if sched is not None:
             candidates.append(sched)
     for candidate in candidates:
-        if callable(getattr(candidate, "projected_memory_max_context", None)):
+        if callable(getattr(candidate, method, None)):
             return candidate
     return None
 

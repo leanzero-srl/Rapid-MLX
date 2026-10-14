@@ -805,31 +805,11 @@ def _resolve_mllm_vision_prefill_token_budget(
     return max(prefill_step_size, mllm_default)
 
 
-def _compute_metal_cache_limit(soft_limit_bytes: int) -> int:
-    """Pick a Metal free-cache size that scales with the device's working set.
-
-    The free cache holds memory that was freed by Python objects but not yet
-    returned to the GPU. A larger cache speeds up subsequent allocations
-    (KV cache churn, prefix cache moves) but caps the budget that inference
-    can grow into under load.
-
-    Old behavior (hardcoded 32 GB) was sized for big machines: comfortable on
-    M3 Ultra 256GB (15% of soft limit), but allowed cache to grow to ~50% of
-    the soft limit on M2 Max 96GB, leaving insufficient room for a 35B model
-    + accumulated prefix cache + transient prefill allocations. Small machines
-    hit memory pressure → macOS paging → catastrophic slowdown.
-
-    Scale to 25% of the soft allocation limit, capped at 32 GiB (no change for
-    big machines), floored at 2 GiB (avoid degenerate cache on small machines).
-    Clamp to soft_limit to preserve MLX's implicit cache ≤ memory invariant on
-    pathologically tiny devices.
-    """
-    cache = max(
-        2 * 1024 * 1024 * 1024,
-        min(32 * 1024 * 1024 * 1024, soft_limit_bytes // 4),
-    )
-    return min(cache, soft_limit_bytes) if soft_limit_bytes > 0 else cache
-
+# The allocator-cache cap rule lives in ``memory_budget`` (one home): the
+# memory guard (E2) lowers the cap below it and never raises it above it.
+from ..memory_budget import (
+    compute_metal_cache_limit as _compute_metal_cache_limit,  # noqa: E402
+)
 
 # Check for guided generation availability
 try:

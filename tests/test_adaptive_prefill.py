@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
 
-def _scheduler(*, prompt_tokens=100_000, active=0, rss=0, cap=100_000):
+def _scheduler(*, prompt_tokens=100_000, active=0, rss=0, cap=100_000, cache=0):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SchedulerConfig(
         prefill_step_size=2048,
@@ -28,6 +28,8 @@ def _scheduler(*, prompt_tokens=100_000, active=0, rss=0, cap=100_000):
     scheduler._resolve_metal_cap_bytes = lambda: cap
     scheduler._current_metal_active_bytes = lambda: active
     scheduler._current_process_resident_bytes = lambda: rss
+    # Memory guard E2: the MLX allocator cache counts beside active memory.
+    scheduler._current_metal_cache_bytes = lambda: cache
     scheduler._last_adaptive_prefill_size = 2048
     scheduler._adaptive_prefill_protected_chunks = 0
     scheduler._adaptive_prefill_reduced_chunks = 0
@@ -45,6 +47,13 @@ def test_long_prefill_tightens_at_pressure_bands():
     assert _scheduler(active=70_000)._select_adaptive_prefill_size() == 1024
     assert _scheduler(active=80_000)._select_adaptive_prefill_size() == 512
     assert _scheduler(active=88_000)._select_adaptive_prefill_size() == 256
+
+
+def test_allocator_cache_counts_beside_active():
+    # 60% active alone keeps the configured chunk; with a 20% allocator cache
+    # the footprint is 80% and the band tightens (memory guard E2).
+    assert _scheduler(active=60_000)._select_adaptive_prefill_size() == 2048
+    assert _scheduler(active=60_000, cache=20_000)._select_adaptive_prefill_size() == 512
 
 
 def test_process_footprint_wins_over_mlx_active():

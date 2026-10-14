@@ -329,9 +329,18 @@ class InferenceAbortedError(RuntimeError):
     handle a retry against a smaller request.
     """
 
-    def __init__(self, message: str, *, error_kind: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_kind: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_kind = error_kind
+        # Structured error object for typed refusals (see
+        # ``RequestOutput.error_detail``).
+        self.detail = detail
 
 
 class ClientRequestError(ValueError):
@@ -414,6 +423,11 @@ class RequestOutput:
     # output and only when at least one MTP verify call ran. Appended last to
     # preserve positional compatibility for downstream RequestOutput callers.
     spec_decode_metrics: dict[str, int | list[int]] | None = None
+    # Structured OpenAI error object for a typed refusal (memory guard:
+    # ``error_kind="context_exceeds_device_memory"``). The route sends it
+    # verbatim -- an HTTP 400 body before the stream starts, an SSE error
+    # chunk after. Appended last for positional compatibility.
+    error_detail: dict[str, Any] | None = None
 
     @property
     def usage(self) -> dict[str, int]:
