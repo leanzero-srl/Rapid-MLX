@@ -347,3 +347,80 @@ def test_metal_oom_text_is_recognised():
         )
     )
     assert not is_metal_oom(RuntimeError("shape mismatch"))
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-10-14: calibration must not ratchet on one noisy observation
+# ---------------------------------------------------------------------------
+
+GOOSE_CEILING = int(50.1e9)  # the 64 GB M3 Max's Metal cap
+GOOSE_BASE = int(30.5e9)  # Q8 27B weights + fixed state
+
+
+def _goose_kv(tokens: int) -> int:
+    return 156_893_184 + 65_536 * tokens
+
+
+def _calibrated_guard(seed: int = 7) -> MemoryGuard:
+    rng = random.Random(seed)
+    guard = MemoryGuard(QWEN35_27B, floor_tokens=256)
+    truth = _truth(a=104.0, k=280_000.0, g=QWEN35_27B.kv_copy_bytes_per_context)
+    for chunk in (2048, 256):
+        for x in range(chunk, 90_000, 2048 if chunk == 2048 else 1536):
+            s = StepShape(1, chunk, x)
+            guard.observe(s, int(truth(s) * rng.uniform(0.97, 1.03)))
+    return guard
+
+
+def _window(guard: MemoryGuard) -> int:
+    return guard.max_context(
+        base=GOOSE_BASE, kv_footprint=_goose_kv, ceiling=GOOSE_CEILING, upper=262_144
+    )
+
+
+@pytest.mark.parametrize(
+    "outlier",
+    [StepShape(1, 2048, 40_000), StepShape(1, 256, 4096), StepShape(1, 256, 60_000)],
+)
+def test_one_1gb_outlier_moves_the_window_by_at_most_5_percent(outlier):
+    """RED on the first guard: the attention coefficient was the MAX pair
+    slope, so one +1 GB observation at a small chunk took it from ~104 to
+    ~2000 B/unit and the honest window from ~147k to ~26k tokens, forever."""
+    guard = _calibrated_guard()
+    before = _window(guard)
+    a_before = guard.model.attention_bytes_per_unit
+    guard.observe(outlier, guard.model.project(outlier) + 1_000_000_000)
+    after = _window(guard)
+    assert abs(after - before) <= 0.05 * before, (before, after)
+    assert guard.model.attention_bytes_per_unit <= 1.10 * a_before
+
+
+def test_the_attention_coefficient_is_capped_at_a_multiple_of_the_prior():
+    guard = MemoryGuard(QWEN35_27B, floor_tokens=256)
+    for x in range(2048, 40_000, 2048):
+        s = StepShape(1, 2048, x)
+        guard.observe(s, int(5000.0 * s.units))  # an absurd device
+    assert (
+        guard.model.attention_bytes_per_unit <= 4 * QWEN35_27B.attention_bytes_per_unit
+    )
+
+
+def test_a_backstop_lower_bound_never_enters_the_fit():
+    """A system-pressure OOM records 'needed >= working set - active' (tens
+    of GB). It becomes a decaying safety margin on that shape, never a slope:
+    RED on the first guard (coefficient -> ~12,864 B/unit, window -> ~4k)."""
+    guard = _calibrated_guard()
+    before = _window(guard)
+    a_before = guard.model.attention_bytes_per_unit
+    shape = StepShape(1, 2048, 30_000)
+    guard.record_backstop(shape, 25_000_000_000)
+    assert guard.model.attention_bytes_per_unit == a_before
+    assert _window(guard) == before
+    # The plan at that shape now carries the extra margin ...
+    t0, _ = guard.need(StepShape(1, 2048, 31_000), GOOSE_CEILING)
+    assert t0 >= guard.model.project(StepShape(1, 2048, 31_000)) + 1e9
+    # ... which decays with successful dispatches.
+    for _ in range(200):
+        guard.note_dispatch_ok(StepShape(1, 2048, 31_000))
+    t1, _ = guard.need(StepShape(1, 2048, 31_000), GOOSE_CEILING)
+    assert t1 == guard.model.project(StepShape(1, 2048, 31_000))

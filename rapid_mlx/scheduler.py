@@ -149,6 +149,10 @@ from .memory_cache import (  # noqa: E402
 )
 from .memory_guard import (  # noqa: E402
     CACHE_LIMIT_FLOOR_RATIO,
+    EVICT_NEEDED,
+    EVICT_REDUNDANT,
+    EVICT_UNUSED,
+    MARGIN_CEILING_RATIO,
     REAPPLY_RATIO,
     GuardPlan,
     GuardProbe,
@@ -5201,6 +5205,8 @@ class Scheduler:
                 )
                 return
 
+            if not self._memguard_room_for_store(request, extracted_cache):
+                return
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
             # evict_prefixes=False: keep mid-prefill boundary entries so
@@ -5512,6 +5518,10 @@ class Scheduler:
             prefix_tokens = list(request.prompt_token_ids[:prefix_boundary])
             _t0 = _time.monotonic()
             stored = False
+            if not self._memguard_room_for_store(request, reconstructed):
+                request._boundary_snapshot_taken = True
+                request._cache_snapshot_stored = False
+                continue
             try:
                 # evict_prefixes=False matches the prompt-cache save
                 # path — keep boundary entries so later turns with the
@@ -6322,6 +6332,11 @@ class Scheduler:
                 or 0
             )
         self._memory_guard = guard
+        if not getattr(self, "running", None):
+            try:
+                self._memguard_apply_budgets()
+            except Exception:  # noqa: BLE001
+                logger.debug("[memory_guard] initial budgets failed", exc_info=True)
         prior = guard.model.prior
         logger.info(
             "[memory_guard] enabled: prior attention=%.1f B/(chunk*context) "
@@ -6458,15 +6473,97 @@ class Scheduler:
             return len(getattr(bac, "_request_tables", ()) or ())
         return 0
 
-    def _memguard_evict_one(self, keep_newest: bool) -> bool:
-        if keep_newest and self._memguard_prefix_entry_count() <= 1:
+    @staticmethod
+    def _memguard_is_prefix(key: tuple, tokens: Any) -> bool:
+        n = len(key)
+        if n == 0 or tokens is None or n > len(tokens):
             return False
-        evicted = self._evict_one_prefix_cache_entry()
+        if tokens[n - 1] != key[-1] or tokens[0] != key[0]:
+            return False
+        return tuple(tokens[:n]) == key
+
+    def _memguard_entry_level(
+        self, key: tuple, live: list[tuple[Any, int]], waiting: list[Any]
+    ) -> int:
+        """Eviction level of one prefix entry (see ``memory_guard.EVICT_*``).
+
+        ``live``: ``(prompt tokens, tokens it fetched)`` of every running
+        request (plus a request being stored). ``waiting``: prompts of queued
+        requests.
+        """
+        level = EVICT_UNUSED
+        for tokens, fetched in live:
+            if self._memguard_is_prefix(key, tokens):
+                if len(key) > fetched:
+                    return EVICT_NEEDED
+                level = EVICT_REDUNDANT
+        for tokens in waiting:
+            if self._memguard_is_prefix(key, tokens):
+                return EVICT_NEEDED
+        return level
+
+    def _memguard_evict_ordered(
+        self,
+        max_level: int,
+        *,
+        keep_last: bool = False,
+        storing: tuple[Any, int] | None = None,
+        reason: str = "memory_guard",
+    ) -> bool:
+        """THE prefix-cache eviction policy (E1, E5, the pressure evictor and
+        store-time room all call it): evict the least-recently-used entry of
+        the LOWEST eviction level present, if that level is <= ``max_level``.
+        ``keep_last`` never takes the last entry. ``storing`` is the
+        ``(tokens, fetched)`` of a request whose entry is being stored (it is
+        live for classification even if it already left ``running``).
+        Non-memory-aware caches fall back to their own LRU."""
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            if keep_last and self._memguard_prefix_entry_count() <= 1:
+                return False
+            if max_level < EVICT_UNUSED:
+                return False
+            evicted = self._evict_one_prefix_cache_entry()
+        else:
+            live: list[tuple[Any, int]] = [
+                (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
+                for r in list(getattr(self, "running", {}).values())
+            ]
+            if storing is not None:
+                live.append(storing)
+            waiting = [r.prompt_token_ids for r in list(getattr(self, "waiting", ()))]
+            with mac._lock:  # noqa: SLF001 — coordinated eviction
+                keys = list(mac._entries)  # noqa: SLF001 — LRU -> MRU
+                if not keys or (keep_last and len(keys) <= 1):
+                    return False
+                best_key, best_level = None, None
+                for key in keys:
+                    level = self._memguard_entry_level(key, live, waiting)
+                    if best_level is None or level < best_level:
+                        best_key, best_level = key, level
+                        if level == EVICT_UNUSED:
+                            break
+                if best_level is None or best_level > max_level:
+                    return False
+                mac._evict_entry_locked(best_key, reason=reason)  # noqa: SLF001
+                mac._stats.current_memory_bytes = mac._current_memory  # noqa: SLF001
+            evicted = True
+            logger.info(
+                "[memory_guard] evicted prefix entry tokens=%d level=%d (%s) "
+                "entries_left=%d",
+                len(best_key),
+                best_level,
+                reason,
+                len(mac._entries),  # noqa: SLF001
+            )
         if evicted:
             self.num_prefix_cache_pressure_evictions = (
                 getattr(self, "num_prefix_cache_pressure_evictions", 0) + 1
             )
         return evicted
+
+    def _memguard_evict_one(self, max_level: int) -> bool:
+        return self._memguard_evict_ordered(max_level, reason="E1")
 
     def _memguard_probe(self) -> GuardProbe:
         return GuardProbe(
@@ -6610,19 +6707,134 @@ class Scheduler:
             if plan.refuse is None:
                 self._memguard_set_chunk(plan.chunk)
                 return plan, refusals
-            refusals.append(self._memguard_refuse(plan))
+            row = plan.refuse
+            others = [rid for rid in self.running if rid != row.request_id]
+            kv_fn = self._kv_footprint_fn()
+            prompt = row.prompt_tokens or (row.offset + row.segment)
+            fits_alone = kv_fn is not None and (
+                guard.single_sequence_need(
+                    prompt,
+                    base=self._memguard_idle_base(),
+                    kv_footprint=kv_fn,
+                    ceiling=ceiling,
+                )
+                <= ceiling
+            )
+            if fits_alone and others:
+                # It fits this Mac once the requests beside it finish: wait,
+                # never context_length_exceeded (the client would compact a
+                # conversation that is not too long).
+                self._memguard_defer(row, plan, others)
+                continue
+            refusals.append(self._memguard_refuse(plan, kv_fn))
         return None, refusals
 
-    def _memguard_refuse(self, plan: GuardPlan) -> RequestOutput:
+    def _memguard_requeue(self, request: Request) -> None:
+        """Put a tokenless running request back at the head of the queue:
+        out of the batch generator, its live cache dropped, and its prefix
+        re-fetched so it resumes from the cache instead of from token 0."""
+        rid = request.request_id
+        uid = self.request_id_to_uid.pop(rid, None)
+        if uid is not None:
+            if self.batch_generator is not None:
+                try:
+                    self.batch_generator.remove([uid])
+                except Exception:  # noqa: BLE001
+                    logger.debug("[memory_guard] bg.remove failed", exc_info=True)
+            self.uid_to_request_id.pop(uid, None)
+            self._hybrid_checkpoints.pop(uid, None)
+            self._forget_uid_grammar(uid)
+            getattr(self, "_admission_prefill_uids", set()).discard(uid)
+        self.running.pop(rid, None)
+        self._memguard_reset_for_requeue(request)
+        self.waiting.appendleft(request)
+
+    def _memguard_reset_for_requeue(self, request: Request) -> None:
+        request.status = RequestStatus.WAITING
+        request.batch_uid = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request._srpf_parked_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        # The boundary snapshot is retaken unless its entry survived (the
+        # supersede rule must not trust an entry that is gone).
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        mac = getattr(self, "memory_aware_cache", None)
+        kept = (
+            mac is not None
+            and boundary > 0
+            and tuple(request.prompt_token_ids[:boundary]) in mac._entries  # noqa: SLF001
+        )
+        if not kept:
+            request._boundary_snapshot_taken = False
+            request._cache_snapshot_stored = False
+        if mac is not None and not _pflash_compressed(request):
+            self._fetch_memory_aware_prefix(request)
+
+    def _memguard_defer(self, row: RowPlan, plan: GuardPlan, others: list[str]) -> None:
+        guard = self._memguard()
+        request = self.running.get(row.request_id)
+        if request is None or guard is None:
+            return
+        guard.counts["deferrals"] += 1
+        request._memguard_wait_for_idle = True
+        self._memguard_requeue(request)
+        logger.warning(
+            "[memory_guard] deferred request %s (prompt %d tokens, needs "
+            "%.2fGB now > ceiling %.2fGB; fits alone): waits until %d running "
+            "request(s) finish",
+            row.request_id[:12],
+            row.prompt_tokens,
+            plan.needed / 1e9,
+            plan.ceiling / 1e9,
+            len(others),
+        )
+
+    def _memguard_refuse(self, plan: GuardPlan, kv_fn: Any) -> RequestOutput:
         """Abort the refused row BEFORE anything is allocated for its chunk
-        and return its terminal output carrying the typed error."""
+        and return its terminal output carrying the typed error. Reached only
+        when the prompt cannot fit this Mac even alone, so ``n_ctx`` (the
+        honest window from the same base) is below the prompt."""
         row = plan.refuse
         assert row is not None
+        guard = self._memguard()
+        prompt = row.prompt_tokens or (row.offset + row.segment)
+        base = self._memguard_idle_base()
+        if guard is not None and kv_fn is not None:
+            alone = guard.single_sequence_need(
+                prompt, base=base, kv_footprint=kv_fn, ceiling=plan.ceiling
+            )
+            if alone <= plan.ceiling:
+                # Alone and it fits by the idle measurement, but not now:
+                # something non-evictable grew since the engine was last idle.
+                # Price the window from what is resident now.
+                base = max(base, plan.footprint - int(kv_fn(row.offset)))
+                alone = guard.single_sequence_need(
+                    prompt, base=base, kv_footprint=kv_fn, ceiling=plan.ceiling
+                )
+            max_ctx = guard.max_context(
+                base=base,
+                kv_footprint=kv_fn,
+                ceiling=plan.ceiling,
+                upper=self._memguard_native_context() or max(prompt, 1),
+            )
+            needed = max(alone, plan.needed)
+        else:
+            max_ctx, needed = 0, plan.needed
+        if guard is not None:
+            guard.counts["refusals"] += 1
         refusal = ContextExceedsDeviceMemoryError(
-            prompt_tokens=row.prompt_tokens or (row.offset + row.segment),
-            needed_bytes=plan.needed,
+            prompt_tokens=prompt,
+            needed_bytes=needed,
             available_bytes=plan.ceiling,
-            max_context=self.memory_guard_max_context() or 0,
+            max_context=min(max_ctx, max(0, prompt - 1)),
         )
         self._do_abort_request(row.request_id)
         request = self.requests.get(row.request_id)
@@ -6642,7 +6854,9 @@ class Scheduler:
             error_detail=refusal.error_object(),
         )
 
-    def _memguard_measure_begin(self, plan: GuardPlan | None) -> tuple[int, int] | None:
+    def _memguard_measure_begin(
+        self, plan: GuardPlan | None
+    ) -> tuple[int, int, int] | None:
         if plan is None or plan.shape.batch <= 0:
             return None
         try:
@@ -6652,15 +6866,21 @@ class Scheduler:
                 getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
             )
             mx.reset_peak_memory()
+            gen = getattr(self.batch_generator, "_generation_batch", None)
+            try:
+                mixed = int(len(gen) > 0) if gen is not None else 0
+            except TypeError:
+                mixed = 0
             return (
                 self._current_metal_active_bytes(),
                 self._cache_self_pressure_current_bytes(),
+                mixed,
             )
         except Exception:  # noqa: BLE001
             return None
 
     def _memguard_measure_end(
-        self, plan: GuardPlan | None, begin: tuple[int, int] | None
+        self, plan: GuardPlan | None, begin: tuple[int, int, int] | None
     ) -> None:
         if plan is None or begin is None:
             return
@@ -6670,7 +6890,7 @@ class Scheduler:
             logger.exception("[memory_guard] observation failed")
 
     def _memguard_observe_dispatch(
-        self, plan: GuardPlan, begin: tuple[int, int]
+        self, plan: GuardPlan, begin: tuple[int, int, int]
     ) -> None:
         try:
             peak = int(mx.get_peak_memory())
@@ -6679,15 +6899,15 @@ class Scheduler:
         self._memguard_process_peak = max(
             getattr(self, "_memguard_process_peak", 0), peak
         )
-        active_before, prefix_before = begin
+        active_before, prefix_before, mixed = begin
         transient = max(0, peak - active_before)
         base = getattr(self, "_memguard_idle_base_bytes", 0)
         live = max(0, active_before - prefix_before - base) if base > 0 else 0
         guard = self._memguard()
-        if guard is not None and guard.observe(
-            plan.shape, transient, live_beyond_base=live
-        ):
-            self._memguard_apply_budgets()
+        if guard is not None:
+            # A step that also decoded other rows carries their transient: it
+            # bounds the residual (safety) but never fits the attention slope.
+            guard.observe(plan.shape, transient, live_beyond_base=live, fit=not mixed)
 
     def _memguard_idle_base(self) -> int:
         """Weights + fixed runtime state: Metal active with nothing running,
@@ -6703,6 +6923,16 @@ class Scheduler:
         if not running:
             self._memguard_idle_base_bytes = base
         return base
+
+    def _memguard_on_idle(self) -> None:
+        """The engine just went idle (step thread): re-measure the idle base
+        and re-derive the budgets when it moved."""
+        if getattr(self, "_memory_guard", None) is None or self.running:
+            return
+        base = self._memguard_idle_base()
+        applied = int(getattr(self, "_memguard_budget_base", 0) or 0)
+        if applied <= 0 or abs(base - applied) > REAPPLY_RATIO * max(1, applied):
+            self._memguard_apply_budgets()
 
     def memory_guard_max_context(self, native_context: int | None = None) -> int | None:
         """The honest largest context one sequence can hold on this device:
@@ -6789,15 +7019,22 @@ class Scheduler:
         return refusal
 
     def _memguard_apply_budgets(self) -> None:
-        """E2 + E3, re-derived whenever the peak model moves.
+        """E2 + E3 from what the IDLE engine holds -- never from live KV.
 
-        Headroom = ceiling - idle base (weights) - worst observed dispatch
-        (that request's live KV/state + its step transient) - margin.
-        E3: the prefix-cache budget is min(configured, headroom); the
-        operator's --cache-memory-percent / --cache-memory-mb are upper
-        bounds only. E2: the MLX allocator cache limit is the same headroom
-        (the Q-127 rule: budget less the plan less its step peak), never
-        above the boot-time 25% cap and never below a small floor.
+        Idle room = pressure fraction (0.9) x ceiling - idle base (weights +
+        fixed state). E3: the prefix budget in force is min(configured, idle
+        room): entries that fit beside the weights while idle are kept, and
+        the operator's --cache-memory-percent / --cache-memory-mb stay upper
+        bounds. During a turn the guard makes room on demand (E1 evicts the
+        entry the turn was fetched from -- duplicated in the live cache --
+        then halves the chunk; the store path makes room before each copy).
+        E2: the MLX allocator cache limit is what the idle room leaves beside
+        that budget (Q-127: budget less the plan), never above the boot-time
+        25% cap, never below a small floor.
+
+        The first guard derived the budget from the worst dispatch's live KV
+        + step peak: it double-counted the session's KV, ratcheted, and
+        turned prefix caching off for long sessions (review 2026-10-14).
         """
         guard = self._memguard()
         if guard is None:
@@ -6806,43 +7043,52 @@ class Scheduler:
         if ceiling <= 0:
             return
         base = self._memguard_idle_base()
-        headroom = max(0, guard.derived_headroom(ceiling=ceiling, base=base))
+        self._memguard_budget_base = base
+        room = max(
+            0,
+            guard.idle_room(
+                ceiling=ceiling,
+                base=base,
+                fraction=self._resolve_pressure_evict_fraction(),
+            ),
+        )
 
         mac = getattr(self, "memory_aware_cache", None)
+        effective = None
         if mac is not None and hasattr(mac, "set_max_memory"):
             configured = int(
                 getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0))
                 or 0
             )
             guard.configured_prefix_budget = configured
-            effective = min(configured, headroom)
+            effective = min(configured, room)
             previous = guard.effective_prefix_budget
             if previous is None or abs(effective - previous) > REAPPLY_RATIO * max(
                 1, previous
             ):
                 evicted = mac.set_max_memory(effective)
                 guard.effective_prefix_budget = effective
-                if previous is None and effective == configured:
-                    pass
-                else:
+                if previous is not None or effective != configured:
                     logger.warning(
                         "[memory_guard] prefix budget %.2fGB -> %.2fGB "
-                        "(configured %.2fGB, ceiling %.2fGB, base %.2fGB, "
-                        "worst step %.2fGB) evicted=%d",
+                        "(configured %.2fGB; idle room %.2fGB = %.2f x ceiling "
+                        "%.2fGB - idle base %.2fGB) evicted=%d",
                         (previous if previous is not None else configured) / 1e9,
                         effective / 1e9,
                         configured / 1e9,
+                        room / 1e9,
+                        self._resolve_pressure_evict_fraction(),
                         ceiling / 1e9,
                         base / 1e9,
-                        guard.worst_step_footprint / 1e9,
                         evicted,
                     )
+            effective = guard.effective_prefix_budget
 
         from .memory_budget import compute_metal_cache_limit
 
         boot_cap = compute_metal_cache_limit(ceiling)
         floor = int(CACHE_LIMIT_FLOOR_RATIO * ceiling)
-        limit = min(boot_cap, max(floor, headroom))
+        limit = min(boot_cap, max(floor, room - int(effective or 0)))
         previous_limit = guard.cache_limit
         if previous_limit is None and limit >= boot_cap:
             guard.cache_limit = boot_cap
@@ -6858,15 +7104,65 @@ class Scheduler:
             guard.cache_limit = limit
             logger.warning(
                 "[memory_guard] allocator cache limit %.2fGB -> %.2fGB "
-                "(boot cap %.2fGB, headroom %.2fGB)",
+                "(boot cap %.2fGB, idle room %.2fGB, prefix budget %.2fGB)",
                 (previous_limit if previous_limit is not None else boot_cap) / 1e9,
                 limit / 1e9,
                 boot_cap / 1e9,
-                headroom / 1e9,
+                room / 1e9,
+                (effective or 0) / 1e9,
             )
 
+    def _memguard_room_for_store(self, request: Request | None, cache: Any) -> bool:
+        """Before a prefix entry is copied in (E3 store-time): the copy must
+        fit beside everything resident now. Make room with the ONE eviction
+        policy up to the redundant level (never an entry a live session still
+        needs); if it still does not fit, skip this store (logged) -- never
+        an OOM in the copy."""
+        guard = getattr(self, "_memory_guard", None)
+        if guard is None or not cache:
+            return True
+        ceiling = self._memguard_ceiling()
+        if ceiling <= 0:
+            return True
+        try:
+            from .memory_cache import estimate_kv_cache_memory
+
+            need = int(estimate_kv_cache_memory(cache))
+        except Exception:  # noqa: BLE001
+            return True
+        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        storing = None
+        if request is not None:
+            storing = (
+                request.prompt_token_ids,
+                int(getattr(request, "cached_tokens", 0) or 0),
+            )
+        footprint = self._metal_footprint_bytes(reclaim_over=ceiling - need - margin)
+        while footprint + need + margin > ceiling:
+            if not self._memguard_evict_ordered(
+                EVICT_REDUNDANT, storing=storing, reason="store-room"
+            ):
+                break
+            mx.clear_cache()
+            footprint = self._metal_footprint_bytes()
+        if footprint + need + margin <= ceiling:
+            return True
+        guard.counts["store_skips"] += 1
+        logger.warning(
+            "[memory_guard] skipped storing a %.2fGB prefix entry: resident "
+            "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB",
+            need / 1e9,
+            footprint / 1e9,
+            margin / 1e9,
+            ceiling / 1e9,
+        )
+        return False
+
     def _memguard_backstop(
-        self, error: Exception, plan: GuardPlan | None, begin: tuple[int, int] | None
+        self,
+        error: Exception,
+        plan: GuardPlan | None,
+        begin: tuple[int, int, int] | None,
     ) -> tuple[set[str], list[RequestOutput]] | None:
         """E5: a Metal OOM got through. Learn from it, then requeue ONCE every
         running request that has emitted no token; abort the rest as today.
@@ -6890,7 +7186,7 @@ class Scheduler:
         guard: MemoryGuard,
         error: Exception,
         plan: GuardPlan | None,
-        begin: tuple[int, int] | None,
+        begin: tuple[int, int, int] | None,
     ) -> tuple[set[str], list[RequestOutput]]:
         guard.counts["backstop_fired"] += 1
         ceiling = self._memguard_ceiling()
@@ -6905,13 +7201,20 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             working_set = 0
         # The failed dispatch needed at least what was left below the
-        # physical working set; record that as an observation so E1 learns.
-        observed = max(peak - active_before, working_set - active_before, 0)
+        # physical working set. That is a LOWER BOUND that can be tens of GB
+        # when other processes hold the GPU, so it never enters the fit: it
+        # becomes a decaying extra margin on this shape (review 2026-10-14:
+        # fitted as a slope it set the coefficient to ~12,864 B/unit and the
+        # honest window to ~4k tokens).
+        lower_bound = max(peak - active_before, working_set - active_before, 0)
+        deficit = 0
+        if plan is not None and plan.shape.batch > 0 and lower_bound > 0:
+            deficit = guard.record_backstop(plan.shape, lower_bound)
         logger.error(
             "[memory_guard] BACKSTOP FIRED -- a Metal OOM got past the guard "
             "(guard defect signal): %s | shape=%s active_before=%.2fGB "
             "peak=%.2fGB working_set=%.2fGB ceiling=%.2fGB projected=%.2fGB "
-            "margin=%.2fGB recorded_transient=%.2fGB",
+            "margin=%.2fGB needed>=%.2fGB recorded_extra_margin=%.2fGB",
             str(error)[:200],
             None
             if plan is None
@@ -6922,20 +7225,15 @@ class Scheduler:
             ceiling / 1e9,
             (plan.projected_transient if plan else 0) / 1e9,
             (plan.margin if plan else 0) / 1e9,
-            observed / 1e9,
+            lower_bound / 1e9,
+            deficit / 1e9,
         )
-        if plan is not None and plan.shape.batch > 0 and observed > 0:
-            guard.observe(plan.shape, observed, source="backstop")
 
-        # Close the batch generator (its state is gone either way), then
-        # give back everything evictable.
+        # The batch generator's state is gone either way.
         self._close_batch_generator()
         self._current_sampler_params = None
-        while self._memguard_prefix_entry_count() > 0:
-            if not self._evict_one_prefix_cache_entry():
-                break
-        mx.clear_cache()
-        self._memguard_apply_budgets()
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
 
         chunk = (
             plan.chunk
@@ -6972,32 +7270,34 @@ class Scheduler:
                     error=abort_error,
                 )
             )
+        self.running.clear()
+        self._detokenizer_pool.clear()
+        mx.clear_cache()
         for request in reversed(requeue):
-            request.status = RequestStatus.WAITING
-            request.batch_uid = None
-            request.prompt_cache = None
-            request.cached_tokens = 0
-            request._srpf_parked_tokens = 0
-            request.remaining_tokens = request.prompt_token_ids
-            # The prefix entries were evicted: the boundary snapshot must be
-            # retaken, and the supersede rule must not trust the old one.
-            request._boundary_snapshot_taken = False
-            request._cache_snapshot_stored = False
+            # Re-fetches its prefix: the entry it will resume from is kept
+            # (a waiting request's path is never evicted below).
+            self._memguard_reset_for_requeue(request)
             self.waiting.appendleft(request)
-            del self.running[request.request_id]
             guard.counts["backstop_requeued"] += 1
             logger.error(
                 "[memory_guard] BACKSTOP requeued request %s once "
-                "(chunk cap %d, floor %d)",
+                "(chunk cap %d, floor %d, resumes from %d cached tokens)",
                 request.request_id[:12],
                 request._memguard_chunk_cap,
                 request._memguard_chunk_floor,
+                request.cached_tokens,
             )
-        self.running.clear()
-        self._detokenizer_pool.clear()
-        self.request_id_to_uid.clear()
-        self.uid_to_request_id.clear()
-        mx.clear_cache()
+        # Give back only what the failed shape needs, with the ONE eviction
+        # policy (never the entries the requeued requests will fetch): the
+        # first guard evicted every entry and zeroed cached_tokens, so the
+        # retry re-prefilled the whole session (the 465 s turns on Gabee).
+        if plan is not None and plan.shape.batch > 0:
+            need = guard.model.project(plan.shape) + guard.backstop_extra(plan.shape)
+            need += guard.margin(need, ceiling)
+            while self._metal_footprint_bytes(reclaim_over=1) + need > ceiling:
+                if not self._memguard_evict_ordered(EVICT_REDUNDANT, reason="E5"):
+                    break
+                mx.clear_cache()
         return aborted, outputs
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
@@ -8064,6 +8364,7 @@ class Scheduler:
         triggered_cache_self = False
         for _ in range(max(0, int(max_evict))):
             should_evict = False
+            hard = False
             if metal_threshold > 0:
                 # Memory guard E2: active + allocator cache, the cache given
                 # back first so a full cache never costs a prefix entry.
@@ -8071,6 +8372,7 @@ class Scheduler:
                 if active >= metal_threshold:
                     should_evict = True
                     triggered_metal = True
+                    hard = active >= metal_cap
             if not should_evict and cache_self_threshold > 0:
                 current_cache = self._cache_self_pressure_current_bytes()
                 if current_cache >= cache_self_threshold:
@@ -8078,7 +8380,17 @@ class Scheduler:
                     triggered_cache_self = True
             if not should_evict:
                 break
-            if not self._evict_one_prefix_cache_entry():
+            # Memory guard: the ONE eviction policy. Below the cap only
+            # entries no live session needs (unused, then those a running
+            # request already copied), and never the last entry; at the cap
+            # the next-turn entries go too. The first guard ran plain LRU
+            # here and twice left 0 entries mid-session on Gabee (61k, 74k),
+            # so the next turn re-prefilled everything (361 s, 465 s).
+            if not self._memguard_evict_ordered(
+                EVICT_NEEDED if hard else EVICT_REDUNDANT,
+                keep_last=not hard,
+                reason="pressure",
+            ):
                 break
             # The entry has been removed from the cache trie — count
             # this as a successful eviction REGARDLESS of whether the
@@ -8416,6 +8728,15 @@ class Scheduler:
         # hosts. Raises ``BackpressureError`` so the existing route
         # plumbing returns 503 + Retry-After instead of marching the
         # allocator past the operator-configured limit.
+        # Memory guard: an admission into an idle engine is the moment to
+        # measure the idle base (weights + fixed state) the budgets and the
+        # honest window are priced from.
+        if not self.running:
+            try:
+                if self._memguard() is not None:
+                    self._memguard_idle_base()
+            except Exception:  # noqa: BLE001
+                logger.debug("[memory_guard] idle base probe failed", exc_info=True)
         self._enforce_metal_cap_at_admission(request)
 
         # Tokenize if needed
@@ -8539,30 +8860,7 @@ class Scheduler:
                 request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
         elif self.memory_aware_cache is not None:
-            # Use memory-aware prefix cache
-            import time as _time
-
-            _fetch_t0 = _time.monotonic()
-            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
-            _fetch_dt = _time.monotonic() - _fetch_t0
-            request.cache_hit_type = self.memory_aware_cache._last_match_type
-            if cache:
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} HIT "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"cached={request.cached_tokens} remaining={len(remaining)} "
-                    f"time={_fetch_dt:.3f}s"
-                )
-            else:
-                request.remaining_tokens = request.prompt_token_ids
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} MISS "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
-                )
+            self._fetch_memory_aware_prefix(request)
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -8608,6 +8906,36 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def _fetch_memory_aware_prefix(self, request: Request) -> None:
+        """Look ``request`` up in the memory-aware prefix cache and set its
+        cache, cached-token count and remaining tokens. One home for the
+        fetch: admission, and the memory guard's requeue paths (a deferred or
+        OOM-requeued request re-fetches instead of re-prefilling everything).
+        """
+        import time as _time
+
+        _fetch_t0 = _time.monotonic()
+        cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+        _fetch_dt = _time.monotonic() - _fetch_t0
+        request.cache_hit_type = self.memory_aware_cache._last_match_type
+        if cache:
+            request.prompt_cache = cache
+            request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
+            request.remaining_tokens = remaining
+            logger.info(
+                f"[cache_fetch] request={request.request_id[:12]} HIT "
+                f"prompt_tokens={len(request.prompt_token_ids)} "
+                f"cached={request.cached_tokens} remaining={len(remaining)} "
+                f"time={_fetch_dt:.3f}s"
+            )
+        else:
+            request.remaining_tokens = request.prompt_token_ids
+            logger.info(
+                f"[cache_fetch] request={request.request_id[:12]} MISS "
+                f"prompt_tokens={len(request.prompt_token_ids)} "
+                f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
+            )
 
     def _commit_request(self, request: Request) -> None:
         """Atomically publish a request to lifecycle truth and the run queue."""
@@ -9888,6 +10216,21 @@ class Scheduler:
                 request = self.waiting.popleft()
                 selection_forced = False
 
+            # Memory guard: a request deferred because it fits this Mac only
+            # alone waits until the batch drains, then runs alone (nothing is
+            # admitted beside it), so it cannot be deferred forever.
+            if getattr(request, "_memguard_wait_for_idle", False) and self.running:
+                if not shortest_tail:
+                    self.waiting.appendleft(request)
+                break
+            if any(
+                getattr(r, "_memguard_wait_for_idle", False)
+                for r in self.running.values()
+            ):
+                if not shortest_tail:
+                    self.waiting.appendleft(request)
+                break
+
             # Ensure we have a batch generator. The False return means
             # the live generator has incompatible stop_tokens / sampler
             # for this request and is still draining — we must NOT admit
@@ -10936,7 +11279,9 @@ class Scheduler:
                             import time as _time
 
                             _store_t0 = _time.monotonic()
-                            stored = self.memory_aware_cache.store(
+                            stored = self._memguard_room_for_store(
+                                request, request._extracted_cache
+                            ) and self.memory_aware_cache.store(
                                 full_token_sequence,
                                 request._extracted_cache,
                                 evict_prefixes=False,
@@ -11152,7 +11497,7 @@ class Scheduler:
         self._reconcile_orphaned_running_requests()
 
         guard_plan: GuardPlan | None = None
-        guard_begin: tuple[int, int] | None = None
+        guard_begin: tuple[int, int, int] | None = None
         guard_refusals: list[RequestOutput] = []
         for attempt in range(max_retries + 1):
             try:
@@ -11364,6 +11709,12 @@ class Scheduler:
                     )
                 output.finished_request_ids = aborted_ids
                 break
+
+        if not self.running and getattr(self, "_memory_guard", None) is not None:
+            try:
+                self._memguard_on_idle()
+            except Exception:  # noqa: BLE001
+                logger.debug("[memory_guard] idle re-derivation failed", exc_info=True)
 
         if guard_refusals:
             # Typed terminal outputs for requests the guard refused before
