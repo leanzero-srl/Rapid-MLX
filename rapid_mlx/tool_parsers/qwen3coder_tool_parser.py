@@ -312,6 +312,19 @@ class Qwen3CoderToolParser(ToolParser):
         # legacy-raw finalizer returns the content after it.
         self._first_call_start: int | None = None
 
+    def flush_held_content(self, full_text: str) -> str:
+        """Text withheld after an opener that never became a call.
+
+        Called by the postprocessor at stream end when no call reached the
+        wire: ``Hmm <tool_call> is the opener.``, a stream cut mid-header, a
+        header followed by a ``{`` that never closed. The buffered parser
+        returns those bytes as content; the stream used to drop them.
+        """
+        start = self._pending_tool_start
+        if start is None or self.header_sent or self._first_call_start is not None:
+            return ""
+        return full_text[start:] if start < len(full_text) else ""
+
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
         in-flight string param value, or "" if nothing new can be flushed.
@@ -585,6 +598,7 @@ class Qwen3CoderToolParser(ToolParser):
                     r"<function=([^>]+)>",
                     self.function_end_token,
                     declared,
+                    wrapper=(self.tool_call_start_token, self.tool_call_end_token),
                 )
             }
         candidates: list[tuple[str, int, int, bool, bool]] = []
