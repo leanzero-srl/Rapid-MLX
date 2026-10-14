@@ -21,6 +21,7 @@ from ..tool_call_scan import (
 from ..tool_call_scan import (
     split_marked_calls,
     split_marked_parameters,
+    warn_undeclared_call,
 )
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
@@ -131,12 +132,7 @@ class NemotronToolParser(ToolParser):
 
         valid_spans = [
             (span_start, span_end)
-            for _name, _body, span_start, span_end in split_marked_calls(
-                text,
-                r"<function=([^>]+)>",
-                "</function>",
-                valid_names=_declared_tool_names(request),
-            )
+            for _name, _body, span_start, span_end in self._scan_calls(text, request)
         ]
         removed = list(valid_spans)
         if valid_spans:
@@ -166,6 +162,37 @@ class NemotronToolParser(ToolParser):
         if cursor < end:
             parts.append(text[cursor:end])
         return "".join(parts)
+
+    @staticmethod
+    def _scan_calls(
+        text: str, request: dict[str, Any] | None
+    ) -> list[tuple[str, str, int, int]]:
+        """The calls in ``text``, by the shared literal-safe scanner.
+
+        Declared names decide nesting. A call to an undeclared name is kept
+        only when it is top-level (outside every declared call's span — the
+        scanner's rule) AND framed by the ``<tool_call>`` wrapper. This format
+        tolerates a missing wrapper for DECLARED calls, but a bare
+        ``<function=example>…</function>`` with a made-up name is just as
+        likely prose documenting the format, so without the wrapper it stays
+        text — the same rule the qwen3_coder_xml parser applies.
+        """
+        declared = _declared_tool_names(request)
+        matches = split_marked_calls(
+            text,
+            r"<function=([^>]+)>",
+            "</function>",
+            valid_names=declared,
+            surface_undeclared=True,
+        )
+        if declared is None:
+            return matches
+        return [
+            match
+            for match in matches
+            if match[0].strip() in declared
+            or text[: match[2]].rstrip().endswith("<tool_call>")
+        ]
 
     @staticmethod
     def _pending_markup_index(text: str) -> int | None:
@@ -211,6 +238,21 @@ class NemotronToolParser(ToolParser):
         """
         Extract tool calls from Nemotron model output.
         """
+        return self._extract(model_output, request, warn_undeclared=True)
+
+    def _extract(
+        self,
+        model_output: str,
+        request: dict[str, Any] | None,
+        *,
+        warn_undeclared: bool,
+    ) -> ExtractedToolCallInformation:
+        """``extract_tool_calls`` with the undeclared-call warning optional.
+
+        The streaming path re-parses the whole accumulated text on every
+        close tag, so it warns only for the calls it newly emits rather than
+        once per re-parse.
+        """
         if "<tool_call>" not in model_output and "<function=" not in model_output:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
@@ -227,17 +269,15 @@ class NemotronToolParser(ToolParser):
         # here because this is a second implementation of the same format.
         # Both now share ``rapid_mlx/tool_call_scan``; the patterns are kept
         # only as the format's documentation.
-        # Declared tool names, same as the ``api/tool_calling`` path. This is
-        # the second implementation of this wire format, so a gate added only
-        # there leaves the other door open: argument text containing
-        # ``</function><function=delete_everything>`` would still fabricate an
-        # executable call here.
-        matches = split_marked_calls(
-            model_output,
-            r"<function=([^>]+)>",
-            "</function>",
-            valid_names=_declared_tool_names(request),
-        )
+        # Declared tool names decide nesting, same as the ``api/tool_calling``
+        # path. This is the second implementation of this wire format, so a
+        # rule applied only there leaves the other door open: argument text
+        # containing ``</function><function=delete_everything>`` would still
+        # fabricate a sibling call here. A well-formed TOP-LEVEL call to an
+        # undeclared name is surfaced, as there, so the client can answer it
+        # with "tool not found" instead of the call silently becoming text.
+        declared = _declared_tool_names(request)
+        matches = self._scan_calls(model_output, request)
         for func_name, content, _span_start, _span_end in matches:
             func_name = func_name.strip()
 
@@ -307,6 +347,10 @@ class NemotronToolParser(ToolParser):
             cleaned_text = self.RESIDUAL_WRAPPER_PATTERN.sub("", cleaned_text).strip()
 
         if tool_calls:
+            if warn_undeclared and declared is not None:
+                for tc in tool_calls:
+                    if tc["name"] not in declared:
+                        warn_undeclared_call(tc["name"], declared, "nemotron")
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
@@ -426,7 +470,7 @@ class NemotronToolParser(ToolParser):
             # omitting it let a name the caller never offered through on the
             # streaming path while the same text was correctly refused when
             # buffered. Agents stream, so the gate was off where it counts.
-            result = self.extract_tool_calls(current_text, request)
+            result = self._extract(current_text, request, warn_undeclared=False)
             safe_end = self._safe_accounting_boundary(current_text)
             unsent_content = self._visible_content_between(
                 current_text, self._content_upto, safe_end, request
@@ -439,6 +483,10 @@ class NemotronToolParser(ToolParser):
                 if total > already_emitted:
                     new_calls = result.tool_calls[already_emitted:]
                     self.current_tool_id = total - 1
+                    declared = _declared_tool_names(request)
+                    for tc in new_calls:
+                        if declared is not None and tc["name"] not in declared:
+                            warn_undeclared_call(tc["name"], declared, "nemotron")
                     out: dict[str, Any] = {
                         "tool_calls": [
                             {
