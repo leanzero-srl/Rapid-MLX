@@ -143,7 +143,8 @@ async def _memguard_stream_outcome(stream, outcome: list | None):
     put its last ``finish_reason`` into the memory guard's outcome holder
     (``SessionHint.outcome``): whether the conversation's turn ended with a
     reply ("stop") or is mid-turn ("tool_calls", "length"). A stream that
-    is cut off (disconnect, error) leaves it empty: unknown = mid-turn."""
+    is cut off (disconnect, error) leaves it empty, which is NOT evidence of
+    a pending tool call: the guard treats it like a reply (review 8)."""
     last = None
     async for chunk in stream:
         if isinstance(chunk, str) and "finish_reason" in chunk:

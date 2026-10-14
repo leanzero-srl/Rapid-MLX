@@ -31,8 +31,9 @@ class _Engine:
     supports_guided_generation = False
     tokenizer = None
 
-    def __init__(self, finish: str):
+    def __init__(self, finish: str, tool_calls: list | None = None):
         self.finish = finish
+        self.tool_calls = tool_calls
         self.holders: list[Any] = []
 
     def build_prompt(self, messages, tools=None, enable_thinking=None):
@@ -48,6 +49,7 @@ class _Engine:
             finished=True,
             finish_reason=self.finish,
             channel=None,
+            tool_calls=self.tool_calls,
         )
 
     async def chat(self, messages, **kwargs):
@@ -189,3 +191,70 @@ def test_responses_api_reports_how_the_response_ended(stream, finish, expected):
         resp.text[-400:],
         engine.holders,
     )
+
+
+TOOLS_ANTHROPIC = [
+    {
+        "name": "read_file",
+        "description": "read a file",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }
+]
+TOOLS_RESPONSES = [
+    {
+        "type": "function",
+        "name": "read_file",
+        "description": "read a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }
+]
+CALL = [{"name": "read_file", "arguments": '{"path": "a.txt"}'}]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_messages_report_a_tool_call(stream):
+    """A tool_use response is the evidence the guard keeps a conversation
+    for: the client runs the tool and comes back."""
+    engine = _Engine("stop", tool_calls=CALL)
+    body = {
+        "model": "test-model",
+        "max_tokens": 64,
+        "stream": stream,
+        "tools": TOOLS_ANTHROPIC,
+        "messages": [{"role": "user", "content": "read a.txt"}],
+    }
+    resp = _client(engine).post("/v1/messages", json=body)
+    assert resp.status_code == 200, resp.text
+    resp.read()
+    assert "tool_use" in resp.text, resp.text[-600:]
+    assert engine.holders[0] == ["tool_calls"], (resp.text[-400:], engine.holders)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_api_reports_a_tool_call(stream):
+    from rapid_mlx.routes.responses import router
+
+    engine = _Engine("stop", tool_calls=CALL)
+    cfg = reset_config()
+    cfg.engine = engine
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    cfg.no_thinking = True
+    cfg.reasoning_parser = None
+    cfg.tool_parser = None
+    app = FastAPI()
+    app.include_router(router)
+    resp = TestClient(app).post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "read a.txt",
+            "stream": stream,
+            "tools": TOOLS_RESPONSES,
+            "max_output_tokens": 64,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    resp.read()
+    assert "function_call" in resp.text, resp.text[-600:]
+    assert engine.holders[0] == ["tool_calls"], (resp.text[-400:], engine.holders)
