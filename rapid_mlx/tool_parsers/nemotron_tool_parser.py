@@ -194,6 +194,7 @@ class NemotronToolParser(ToolParser):
             valid_names=declared,
             surface_undeclared=True,
             wrapper="<tool_call>",
+            wrapper_pair=("<tool_call>", "</tool_call>"),
         )
 
     @staticmethod
@@ -405,7 +406,20 @@ class NemotronToolParser(ToolParser):
             # or a JSON body; anything else (``use <function=shell> to …``)
             # is prose naming the format, never a call — sending its header
             # made a turn end in a phantom ``shell`` (review of 7a1d93272).
-            if not rest.startswith(("<parameter=", "</function>", "{")):
+            if rest.startswith("{"):
+                # A JSON body is a call only once it is a whole object followed
+                # by ``</function>``; ``<function=shell>{"command": …} only if
+                # asked`` is prose quoting the format (review of 975a84f7b).
+                try:
+                    _body, body_end = json.JSONDecoder().raw_decode(text, after)
+                except ValueError:
+                    return None  # unfinished (or not JSON): wait, never guess
+                tail = text[body_end : body_end + 64].lstrip()
+                if not tail.startswith("</function>"):
+                    if not tail or "</function>".startswith(tail):
+                        return None
+                    continue
+            elif not rest.startswith(("<parameter=", "</function>")):
                 if not rest or any(
                     marker.startswith(rest) for marker in ("<parameter=", "</function>")
                 ):

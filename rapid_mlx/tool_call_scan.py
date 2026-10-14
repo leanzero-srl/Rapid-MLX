@@ -375,12 +375,12 @@ def call_shape(
             gap = text[j:next_close]
             if not saw_param and gap.strip():
                 free = True
-            if param_close in gap:
+            if _stray_close(gap, param_close, saw_param):
                 stray = True
             return CallShape(
                 next_close + len(closer), free, canonical, consistent, stray
             )
-        if param_close in text[j:next_param]:
+        if _stray_close(text[j:next_param], param_close, saw_param):
             stray = True
         saw_param = True
         name_end = text.find(">", next_param + len(param_open))
@@ -405,6 +405,17 @@ def call_shape(
                     else:
                         close = grid
         j = close + len(param_close)
+
+
+def _stray_close(gap: str, param_close: str, saw_param: bool) -> bool:
+    """A ``param_close`` outside every value that only an ENCLOSING value
+    accounts for: in a body with no parameter at all, or on the template's
+    grid (line start). A compact value that quotes the marker mid-line
+    (``grep "</parameter>" x</parameter>``) leaves one mid-line after its
+    first close — that is its own text, not a stray (review of 975a84f7b)."""
+    if param_close not in gap:
+        return False
+    return not saw_param or ("\n" + param_close) in gap
 
 
 def _grid_close(
@@ -507,6 +518,7 @@ def split_marked_calls(
     wrapper: str | None = None,
     param_open: str = PARAMETER_OPEN,
     param_close: str = PARAMETER_CLOSE,
+    wrapper_pair: tuple[str, str] | None = None,
 ) -> list[tuple[str, str, int, int]]:
     """``(name, body, span_start, span_end)`` for each call in ``text``.
 
@@ -564,6 +576,7 @@ def split_marked_calls(
         valid_names,
         param_open=param_open,
         param_close=param_close,
+        wrapper=wrapper_pair,
     )
     if header is None:
         span_starts: dict[int, int] = {top.body_start: top.start for top in tops}
@@ -652,6 +665,7 @@ def top_level_calls(
     *,
     param_open: str = PARAMETER_OPEN,
     param_close: str = PARAMETER_CLOSE,
+    wrapper: tuple[str, str] | None = None,
 ) -> list[TopCall]:
     """The calls that are top-level in ``text``, by STRUCTURE, in text order.
 
@@ -699,7 +713,30 @@ def top_level_calls(
     names = [unit.group(1).strip() for unit in units]
     declared = [name in valid_names for name in names]
     orphan = _end_of_parameters(param_close, closer)
+    # The close a running value leaves behind is its call's REAL close: for a
+    # call framed by ``wrapper`` that is ``</parameter></function></tool_call>``.
+    # Prose after real calls that merely quotes ``</parameter></function>``
+    # ("values end with …") is not one — read as one, it merged a real
+    # parallel call into the call before it (review of 975a84f7b).
+    wrapped_orphan = (
+        re.compile(
+            re.escape(param_close)
+            + r"\s*"
+            + re.escape(closer)
+            + r"\s*"
+            + re.escape(wrapper[1])
+        )
+        if wrapper
+        else None
+    )
     starts = [unit.start() for unit in units]
+
+    def orphan_for(k: int) -> re.Pattern[str]:
+        if wrapped_orphan is not None and text[: starts[k]].rstrip().endswith(
+            wrapper[0]
+        ):
+            return wrapped_orphan
+        return orphan
 
     def first_unit_at(pos: int) -> int:
         return bisect.bisect_left(starts, pos)
@@ -725,7 +762,7 @@ def top_level_calls(
                     return False
                 nxt = first_unit_at(k_shape.end)
                 limit = starts[nxt] if nxt < len(starts) else len(text)
-                if orphan.search(text, k_shape.end, limit):
+                if orphan_for(cur).search(text, k_shape.end, limit):
                     return False
         return True
 
@@ -753,25 +790,27 @@ def top_level_calls(
             if isinstance(k_shape, CallShape):
                 skip_until = max(skip_until, k_shape.end)
 
-    def body_end_of(index: int) -> tuple[int, bool]:
-        """``(body_end, runs_on)`` of ``picked[index]`` in its region."""
+    def body_end_of(index: int, owner: int | None = None) -> tuple[int, bool]:
+        """``(body_end, runs_on)`` of ``picked[index]`` in its region; the
+        value runs on when the close of ``owner`` (default: the call itself)
+        is left over after its structural end."""
         k = picked[index]
         unit = units[k]
         region_end = starts[picked[index + 1]] if index + 1 < len(picked) else len(text)
         shape = shape_of(k)
         if not isinstance(shape, CallShape):
             return text.rfind(closer, unit.end(), region_end), False
-        payload = first_unit_at(shape.end)
-        runs_on = bool(
-            orphan.search(text, shape.end, region_end)
-            or (payload < len(starts) and starts[payload] < region_end)
-        )
+        # Only a leftover CLOSE says a value runs on. A header in the region
+        # (a cut-off call, prose naming the format) does not: counting it
+        # merged real parallel calls into one (review of 975a84f7b).
+        pattern = orphan_for(k if owner is None else owner)
+        runs_on = bool(pattern.search(text, shape.end, region_end))
         if runs_on:
             return text.rfind(closer, unit.end(), region_end), True
         return shape.end - len(closer), False
 
-    # A later call whose value runs on (an orphan close, or a header inside
-    # its region) shows that SOME value runs over it; read on its own it
+    # A later call whose value runs on (the earlier call's close is left
+    # over after it) shows that SOME value runs over it; read on its own it
     # would hand the bytes after it to a call. The safer reading attributes
     # them to the earlier free call: merge, and look again. The sibling test
     # above sees only up to the next header, so two calls quoted back to back
@@ -780,7 +819,10 @@ def top_level_calls(
     while merged:
         merged = False
         for index in range(1, len(picked)):
-            if free(picked[index - 1]) and body_end_of(index)[1]:
+            if (
+                free(picked[index - 1])
+                and body_end_of(index, owner=picked[index - 1])[1]
+            ):
                 del picked[index]
                 merged = True
                 break
@@ -921,8 +963,11 @@ def _nested_call_spans(
       one.
 
     Each span runs from that header to the nested call's own ``call_close``
-    (or the end of the body when it never closes), so a real parameter of
-    this call AFTER a quoted, closed example still counts.
+    when the body holds one. One that never closes runs to the end of the
+    body when it followed a call's end (the rest IS that call), and otherwise
+    ends at the first ``closer`` after its header (the value holding it), so
+    a real parameter of THIS call after a quoted example still counts — ``s = '<function=x><parameter=y>'`` then ``path`` used to
+    lose ``path`` into the value (review of 975a84f7b).
     """
     shaped = (
         re.compile(re.escape(call_header) + r"[^>\n]*>\s*" + re.escape(param_open))
@@ -933,21 +978,29 @@ def _nested_call_spans(
     spans: list[tuple[int, int]] = []
     pos = value_start
     while pos < len(block):
-        found: list[int] = []
+        found: list[tuple[int, bool]] = []  # (header start, after a call end)
         end = end_of_params.search(block, pos)
         if end is not None:
             start = block.find(call_header, end.end())
             if start != -1:
-                found.append(start)
+                found.append((start, True))
         if shaped is not None:
             header = shaped.search(block, pos)
             if header is not None:
-                found.append(header.start())
+                found.append((header.start(), False))
         if not found:
             break
-        start = min(found)
+        start, after_call_end = min(found)
         close = block.find(call_close, start)
-        stop = close + len(call_close) if close != -1 else len(block)
+        if close != -1:
+            stop = close + len(call_close)
+        elif after_call_end:
+            # ``…</parameter></function>…<function=other>`` that never closes:
+            # the rest of the body is that call's text.
+            stop = len(block)
+        else:
+            value_close = block.find(closer, start)
+            stop = value_close + len(closer) if value_close != -1 else len(block)
         spans.append((start, stop))
         pos = stop
     return spans
