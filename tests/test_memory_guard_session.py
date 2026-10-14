@@ -654,6 +654,10 @@ def test_the_main_session_keeps_hitting_with_a_side_request_every_turn(
     assert guard.counts["decode_over_ceiling"] == 0
     assert device.ooms == 0
     assert device.max_seen <= device.ceiling, (device.max_seen, device.ceiling)
+    # The engine's own per-step peak, as /v1/status reports it.
+    status = scheduler.get_stats()["memory_guard"]
+    assert status["steps_over_ceiling"] == 0
+    assert 0 < status["max_step_peak_mb"] <= device.ceiling / 2**20
 
 
 def test_a_refusal_carries_the_advertised_window_as_n_ctx(llama, monkeypatch):

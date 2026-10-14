@@ -7481,6 +7481,34 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             return None
 
+    def _memguard_step_peak_reset(self) -> None:
+        """Every dispatched step (prefill, decode, mixed) is measured: the
+        allocator's peak since this reset is the step's real peak."""
+        if getattr(self, "_memory_guard", None) is None:
+            return
+        try:
+            self._memguard_process_peak = max(
+                getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
+            )
+            mx.reset_peak_memory()
+        except Exception:  # noqa: BLE001
+            return
+
+    def _memguard_step_peak_record(self) -> None:
+        """``/v1/status`` memory_guard.last_step_peak_mb / max_step_peak_mb:
+        the engine's own per-step peak (mx.get_peak_memory between resets),
+        so an acceptance test reads the real peak, not a 2 s sample of
+        active memory. ``steps_over_ceiling`` counts steps whose peak crossed
+        the guard's own ceiling (expected 0)."""
+        guard = getattr(self, "_memory_guard", None)
+        if guard is None:
+            return
+        try:
+            guard.record_step_peak(int(mx.get_peak_memory()), self._memguard_ceiling())
+        except Exception:  # noqa: BLE001
+            # Reporting only: never take the step down.
+            logger.debug("[memory_guard] step peak unreadable", exc_info=True)
+
     def _memguard_measure_end(
         self, plan: GuardPlan | None, begin: tuple[int, int, int] | None
     ) -> None:
@@ -12311,14 +12339,15 @@ class Scheduler:
                     self._apply_adaptive_prefill_size()
                     # Memory guard E1: the chunk about to run must fit under
                     # the ceiling with its projected step peak -- else clear
-                    # the allocator cache, evict prefix entries, halve the
-                    # chunk, and as the last resort refuse the request before
-                    # anything is allocated for it.
+                    # the allocator cache, evict prefix entries, take the
+                    # largest chunk that fits, and as the last resort defer
+                    # or refuse the request before anything is allocated.
                     guard_plan, refused = self._memguard_before_dispatch()
                     guard_refusals.extend(refused)
                     # A refusal can empty the batch; then nothing dispatches.
                     dispatch = bool(self.running)
                     if dispatch:
+                        self._memguard_step_peak_reset()
                         guard_begin = self._memguard_measure_begin(guard_plan)
                     srpf_step = self._srpf_step_begin()
                     if not dispatch:
@@ -12356,6 +12385,8 @@ class Scheduler:
                     else:
                         raw_next = self.batch_generator.next()
                     self._memguard_measure_end(guard_plan, guard_begin)
+                    if dispatch:
+                        self._memguard_step_peak_record()
                     self._srpf_step_end(srpf_step)
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires

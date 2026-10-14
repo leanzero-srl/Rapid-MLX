@@ -615,6 +615,11 @@ class MemoryGuard:
         # prefix budget from the worst of these, which double-counted the live
         # KV and ratcheted prefix caching off for long sessions).
         self.last_step_footprint = 0
+        # The engine's own per-step peak (every dispatched step), and how
+        # many steps crossed the ceiling.
+        self.last_step_peak = 0
+        self.max_step_peak = 0
+        self.steps_over_ceiling = 0
         # The advertised window and a pending (candidate, model version).
         self._published_window: int | None = None
         self._published_calibrated = False
@@ -644,6 +649,12 @@ class MemoryGuard:
         if backstop:
             transient += self.backstop_extra(shape)
         return transient, self.margin(transient, ceiling)
+
+    def record_step_peak(self, peak: int, ceiling: int) -> None:
+        self.last_step_peak = max(0, int(peak))
+        self.max_step_peak = max(self.max_step_peak, self.last_step_peak)
+        if ceiling > 0 and self.last_step_peak > ceiling:
+            self.steps_over_ceiling += 1
 
     def plan_transient(self, shape: StepShape, *, admit_bytes: int = 0) -> int:
         """The projected transient of one dispatch: the peak model, any live
@@ -1097,6 +1108,9 @@ class MemoryGuard:
             "last_chunk_tokens": self.last_chunk,
             "peak_model": self.model.snapshot(),
             "last_step_footprint_mb": round(self.last_step_footprint / 2**20, 1),
+            "last_step_peak_mb": round(self.last_step_peak / 2**20, 1),
+            "max_step_peak_mb": round(self.max_step_peak / 2**20, 1),
+            "steps_over_ceiling": self.steps_over_ceiling,
             "backstop_margins": [
                 {"from_context": int(t), "extra_mb": round(v / 2**20, 1)}
                 for t, v, _o in self._backstop
