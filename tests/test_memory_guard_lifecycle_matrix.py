@@ -51,6 +51,7 @@ ARMS = {
 FRAME = 48  # the rendered system/tools frame of each conversation
 MAIN = 5  # goose's main-agent frame (system prompt + tools)
 SUBAGENT = 6  # a subagent's frame (its own system prompt)
+OTHER = 9  # another agent's frame (an async delegate, another tool set)
 HELPER_FRAME = 40
 
 
@@ -404,6 +405,26 @@ def sc_concurrent_same_kind_workers(w, header, mid):
     w.flush(header)
 
 
+def sc_younger_waits_on_its_tool(w, header, kind):
+    """Review 9: two conversations side by side (swarm workers, goose async
+    delegates, two windows); the YOUNGER one waits on its own long tool
+    while the older one keeps going with tool rounds. The waiter keeps its
+    head and hits when its result arrives (of the same kind or not)."""
+    w.chat("W1", size=1500, header=header)
+    w.chat("W2", size=2500, header=header, kind=MAIN if kind == "same" else OTHER)
+    w.turn("W1", outcome="tool_calls")
+    w.turn("W1", user=False, outcome="tool_calls")
+    w.turn("W2", outcome="tool_calls")
+    w.turn("W2", user=False, outcome="tool_calls")  # W2 waits on a long tool
+    before = len(w.convs["W2"].tokens)
+    for _t in range(6):
+        w.turn("W1", user=False, add=600, outcome="tool_calls")
+        w.protected("W2", "an older conversation's tool rounds")
+    cached, length = w.turn("W2", user=False, outcome="stop")
+    assert _hit(cached, length, before), (cached, before)
+    w.flush(header)
+
+
 def sc_two_chats_alternating(w, header, end):
     """The user alternates between two chats: each one being used is
     protected and hits; the other is evictable under duress only."""
@@ -479,6 +500,10 @@ for header in (True, False):
     for mid in MID_STATES:
         SCENARIOS.append(
             (f"concurrent-{mid}-{tag}", sc_concurrent_same_kind_workers, header, mid)
+        )
+    for kind in ("same", "other"):
+        SCENARIOS.append(
+            (f"youngerwaits-{kind}-{tag}", sc_younger_waits_on_its_tool, header, kind)
         )
     SCENARIOS.append((f"alternating-{tag}", sc_two_chats_alternating, header, "stop"))
 SCENARIOS.append(("twins", sc_twins, False, "stop"))

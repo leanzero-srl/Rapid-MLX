@@ -6718,8 +6718,10 @@ class Scheduler:
         a running or queued request is LIVE and never abandoned. Otherwise:
 
         * an OLDER conversation (one whose requests continue each other) ran
-          after this one's latest activity: a finished subagent (its main
-          took the result);
+          after this one's latest activity -- for a PENDING one, started a
+          user turn: a finished subagent (its main took the result and went
+          on); a younger conversation waiting on its own tool is not
+          released by an older one's tool rounds;
         * IDLE, and a YOUNGER conversation started a user turn after it --
           one of the same kind, or one whose requests continue each other:
           the user left the chat (or the next benchmark task began). A
@@ -6787,6 +6789,12 @@ class Scheduler:
                 ost["first"] < st["first"]
                 and ost["last"] > st["last"]
                 and ost["continues"]
+                # a PENDING one is waiting on its own tool: an older
+                # conversation's tool rounds say nothing about it, only that
+                # one's next user turn does (review 9: a younger swarm worker,
+                # an async delegate, a newer chat mid-build re-prefilled
+                # 2,308 of 2,356 tokens on the 64 GB arm)
+                and (not st["pending"] or ost["turn"] > st["last"])
                 for _o, ost in others
             ):
                 gone.add(line)
