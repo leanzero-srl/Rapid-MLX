@@ -389,7 +389,15 @@ class PeakModel:
         a_cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
         whole = self.prior.kv_bytes_per_token or MAX_PRIOR_MULTIPLE * g
         b_cap = max(g, whole)
-        groups = self._group_slopes()
+        # A group whose slope is below one layer's growth copy did not pay
+        # the copy on every chunk (a chunk inside the KV buffer's
+        # KVCache.step slack writes in place): its slope is not
+        # ``a*u + g`` and it says nothing about ``a``. Clipped to 0 it
+        # VOTED 0 -- Gabee Q8 (b06acd8ea, 19:29Z): the 13-48-token tails of
+        # each turn (slopes 0.5-3 kB < 4 kB) took ``a`` from ~46 to 21.6 and
+        # a 1567 x 111,179 step was planned 2.01 GB short, over the ceiling.
+        # Its observations still bound its own size (the residual window).
+        groups = [(u, sl) for u, sl in self._group_slopes() if sl >= g]
         if not groups:
             return None
         sizes = {u for u, _s in groups}
