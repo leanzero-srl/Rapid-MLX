@@ -26,6 +26,8 @@ which is why these cases pass ``request=None`` — a plain chat turn must
 not be able to lose text to the tool layer.
 """
 
+import json
+
 import pytest
 
 from rapid_mlx.api.models import ToolDefinition
@@ -305,14 +307,18 @@ class TestOnlyDeclaredToolsBecomeCalls:
             '{"path": "a.md", "content": "hi"}'
         )
 
-        streaming = _qwen3coder().extract_tool_calls_streaming(
+        parser = _qwen3coder()
+        streaming = parser.extract_tool_calls_streaming(
             "", wire, wire, request={"tools": [tool]}
         )
         assert streaming is not None
-        assert streaming["tool_calls"][0]["function"] == {
-            "name": "write_file",
-            "arguments": '{"path": "a.md", "content": "hi"}',
-        }
+        assert streaming["tool_calls"][0]["function"]["name"] == "write_file"
+        # Raw values: the arguments come from the end-of-stream parse.
+        final = parser.finalize_legacy_raw_stream(wire, request={"tools": [tool]})
+        arguments = streaming["tool_calls"][0]["function"]["arguments"] + "".join(
+            tc["function"]["arguments"] for tc in final["tool_calls"]
+        )
+        assert json.loads(arguments) == {"path": "a.md", "content": "hi"}
 
     def test_rejected_prose_does_not_hide_a_later_declared_call(self):
         text = (
