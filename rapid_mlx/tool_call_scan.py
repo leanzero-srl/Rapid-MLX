@@ -29,6 +29,15 @@ the cycle closes.
 Before this existed the rule was reimplemented per format, which is how
 the same defect could be fixed in ``tool_calling.py`` and still be live in
 ``nemotron_tool_parser.py``.
+
+Which call a ``<function=…>`` header belongs to is STRUCTURE, read once here
+(``call_shape`` / ``top_level_calls``) for qwen3_coder_xml, nemotron and the
+scanner fallback alike: each value is skipped by its own close (a JSON
+string by its closing quote; a raw value that opened on the template's grid
+by its first line-start close), and a header after the call's close is a
+sibling unless the bytes say the value may still be running. Where the text
+format genuinely cannot tell, the safer reading wins — one call keeps the
+bytes as its value, and no extra call is made.
 """
 
 from __future__ import annotations
@@ -39,8 +48,18 @@ from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
-    "segment_by_next_opener",
+    "CallShape",
+    "TopCall",
+    "top_level_calls",
+    "HEADER_FIRST",
+    "call_shape",
     "declared_tool_names",
+    "find_value_close",
+    "inside_code",
+    "may_surface_undeclared",
+    "named_tool_choice",
+    "scan_marked_parameters",
+    "segment_by_next_opener",
     "split_marked_calls",
     "split_marked_parameters",
     "trim_wrapping_newlines",
@@ -208,6 +227,246 @@ def segment_by_next_opener(
     return body[:cut], openers[index].end() + cut + len(closer)
 
 
+# ---------------------------------------------------------------------------
+# Structure: where a call ends, and whether a later opener is its sibling.
+# ---------------------------------------------------------------------------
+
+PARAMETER_OPEN = "<parameter="
+PARAMETER_CLOSE = "</parameter>"
+
+
+def _json_string_end(text: str, quote: int) -> int:
+    """Offset just past the JSON string opened at ``text[quote]``, or -1."""
+    i = quote + 1
+    escaped = False
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return i + 1
+        i += 1
+    return -1
+
+
+def find_value_close(
+    text: str, value_start: int, close: str = PARAMETER_CLOSE
+) -> tuple[int, bool]:
+    """``(offset of the close marker that ends this value, or -1; quoted)``.
+
+    The structural rule both XML function-call families share (it began as
+    ``Qwen3CoderToolParser._find_parameter_close``). A grammar-constrained
+    value is a JSON string (#1542), so marker text inside its quotes is data
+    and the close is the first marker after the closing quote. A raw value
+    has no escaping at all; structurally it closes at its FIRST close
+    marker, and whether that close can be trusted is a separate question
+    (``CallShape.canonical`` / ``CallShape.consistent``). -1 when the value
+    has not closed — including a JSON string still open, which on a stream
+    means "wait", never "fall back to the raw rule".
+    """
+    i = value_start
+    n = len(text)
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n or text[i] != '"':
+        return text.find(close, i), False
+    end = _json_string_end(text, i)
+    if end == -1:
+        return -1, True
+    return text.find(close, end), True
+
+
+class CallShape:
+    """How one call reads STRUCTURALLY: its values skipped by their own close.
+
+    ``end``         offset just past the call's first top-level closer.
+    ``free``        some value is raw text (or the body is not parameters at
+                    all), so its bytes could legitimately run past ``end``.
+    ``canonical``   every raw value closed at a line start, as the template
+                    writes it (``VALUE\\n</parameter>``). A mid-line close may
+                    be a value quoting the marker.
+    ``consistent``  every raw value that OPENED on the template's grid
+                    (``<parameter=K>\\n``) also closed on it. Such a value
+                    closes at its first LINE-START ``</parameter>`` — the
+                    template writes every close so, and
+                    ``xml_tool_close_guard`` holds the model to it — so a
+                    marker it quotes mid-line (``grep "</parameter>" f``) is
+                    payload. Only when another line-start marker comes first
+                    does the read fall back to the first close, and the call
+                    is then inconsistent: the value may still be running.
+    """
+
+    __slots__ = ("end", "free", "canonical", "consistent")
+
+    def __init__(self, end: int, free: bool, canonical: bool, consistent: bool):
+        self.end = end
+        self.free = free
+        self.canonical = canonical
+        self.consistent = consistent
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"CallShape(end={self.end}, free={self.free}, "
+            f"canonical={self.canonical}, consistent={self.consistent})"
+        )
+
+
+# A header that meets ANOTHER header before any parameter or close of its own
+# (``use <function=NAME> to …`` in prose ahead of a real call) is not a call.
+HEADER_FIRST = "header-first"
+
+
+def call_shape(
+    text: str,
+    body_start: int,
+    closer: str,
+    *,
+    header: str | None = None,
+    param_open: str = PARAMETER_OPEN,
+    param_close: str = PARAMETER_CLOSE,
+) -> CallShape | str | None:
+    """Read the call whose header ends at ``body_start`` structurally.
+
+    Returns a ``CallShape``, ``HEADER_FIRST`` when another ``header`` arrives
+    before this call has a parameter or a close, or ``None`` when it never
+    closes in ``text``.
+    """
+    j = body_start
+    free = False
+    canonical = True
+    consistent = True
+    saw_param = False
+    while True:
+        next_close = text.find(closer, j)
+        next_param = text.find(param_open, j)
+        if header is not None:
+            next_header = text.find(header, j)
+            if next_header != -1 and all(
+                pos == -1 or next_header < pos for pos in (next_close, next_param)
+            ):
+                return HEADER_FIRST
+        if next_close == -1:
+            return None
+        if next_param == -1 or next_param > next_close:
+            if not saw_param and text[j:next_close].strip():
+                free = True
+            return CallShape(next_close + len(closer), free, canonical, consistent)
+        saw_param = True
+        name_end = text.find(">", next_param + len(param_open))
+        if name_end == -1:
+            return None
+        value_start = name_end + 1
+        close, quoted = find_value_close(text, value_start, param_close)
+        if close == -1:
+            return None
+        if not quoted:
+            free = True
+            if not (close > 0 and text[close - 1] == "\n"):
+                # qwen3_coder_xml's ``_closes_canonically``: the FIRST close
+                # was mid-line, so a call after this one may be its text.
+                canonical = False
+                if text.startswith("\n", value_start):
+                    grid = _grid_close(
+                        text, value_start, param_close, (param_open, closer, header)
+                    )
+                    if grid is None:
+                        consistent = False
+                    else:
+                        close = grid
+        j = close + len(param_close)
+
+
+def _grid_close(
+    text: str, value_start: int, param_close: str, stops: tuple[str | None, ...]
+) -> int | None:
+    """The first LINE-START ``param_close`` of a value that opened on the
+    grid, unless another line-start marker of the wire comes first."""
+    close = text.find("\n" + param_close, value_start)
+    if close == -1:
+        return None
+    for stop in stops:
+        if stop and -1 < text.find("\n" + stop, value_start, close) < close:
+            return None
+    return close + 1
+
+
+_FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$", re.MULTILINE)
+
+
+def inside_code(text: str, pos: int) -> bool:
+    """Whether ``pos`` sits inside markdown code: an open fence, or inline.
+
+    A model that SHOWS the wire format — "the call looks like this:" — puts
+    it in a code block, and examples use made-up names. A call is never
+    quoted that way. Fences follow CommonMark's shape (up to three spaces of
+    indent, three or more backticks or tildes; a closing fence uses the same
+    character, is at least as long and carries no info string). Inline code
+    is an odd number of backticks earlier on the same line.
+    """
+    fence: str | None = None
+    for match in _FENCE.finditer(text, 0, pos):
+        run = match.group(1)
+        if fence is None:
+            fence = run
+        elif (
+            run[0] == fence[0] and len(run) >= len(fence) and not match.group(2).strip()
+        ):
+            fence = None
+    if fence is not None:
+        return True
+    line_start = text.rfind("\n", 0, pos) + 1
+    return text.count("`", line_start, pos) % 2 == 1
+
+
+def _field(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def named_tool_choice(request: Any) -> str | None:
+    """The one function a named ``tool_choice`` forces, or ``None``."""
+    choice = _field(request, "tool_choice") if request is not None else None
+    if choice is None or isinstance(choice, str):
+        return None
+    function = _field(choice, "function")
+    selected = _field(function, "name") if function is not None else None
+    selected = selected or _field(choice, "name")
+    return selected if isinstance(selected, str) and selected else None
+
+
+def may_surface_undeclared(request: Any) -> bool:
+    """Whether a call to a name the request did not offer may reach the client.
+
+    The model calling a tool it was not given is ITS mistake, and the client
+    is the one that answers it ("tool not found") so the model can recover;
+    a cloud API or vLLM passes such a call through. Two cases keep the
+    refusal, because they are contracts about WHICH call may appear rather
+    than a tool list: ``tool_choice="none"`` and a NAMED ``tool_choice``. A
+    request with no tools at all has nothing to answer the call with.
+    """
+    if request is None or _field(request, "tool_choice") == "none":
+        return False
+    if named_tool_choice(request) is not None:
+        return False
+    tools = _field(request, "tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        function = _field(tool, "function")
+        name = _field(function, "name") if function is not None else None
+        if isinstance(name or _field(tool, "name"), str):
+            return True
+    return False
+
+
+def _end_of_parameters(param_close: str, closer: str) -> re.Pattern[str]:
+    return re.compile(re.escape(param_close) + r"\s*" + re.escape(closer))
+
+
 def split_marked_calls(
     text: str,
     opener: str,
@@ -216,6 +475,10 @@ def split_marked_calls(
     valid_names: frozenset[str] | set[str] | None = None,
     *,
     surface_undeclared: bool = False,
+    header: str | None = None,
+    wrapper: str | None = None,
+    param_open: str = PARAMETER_OPEN,
+    param_close: str = PARAMETER_CLOSE,
 ) -> list[tuple[str, str, int, int]]:
     """``(name, body, span_start, span_end)`` for each call in ``text``.
 
@@ -226,78 +489,257 @@ def split_marked_calls(
     truncating regex pass over the same text is how tag fragments leak into
     user-visible content.
 
-    ``surface_undeclared`` (only meaningful with ``valid_names``) also
-    returns well-formed calls to names the request did NOT declare, provided
-    they sit OUTSIDE every declared call's span. Declared names are resolved
-    first and exactly as without the flag, so they still decide nesting: an
-    undeclared opener inside a declared call's value stays part of that value
-    and never becomes a sibling. What changes is only the top level — a call
-    the model really made to a tool it was not offered reaches the client,
-    which answers it with "tool not found", instead of being folded into the
-    answer text where it silently ends the agent's turn. The result is in
-    text order; callers can tell the undeclared entries by their name.
+    Without ``valid_names`` the position-only rules apply (nothing declared,
+    nothing can execute). With them, STRUCTURE decides nesting, read the way
+    ``qwen3_coder_xml`` reads it (``call_shape``): an opener inside another
+    call's values is that value; an opener after the call's structural close
+    is a sibling, unless the bytes say the value may still be running —
+
+    * the call has a raw value that opened on the template's grid and closed
+      mid-line (``CallShape.consistent``), or
+    * the candidate's own reading leaves an orphan ``</parameter>…</function>``
+      behind it, a close that only a value running over the candidate can
+      account for.
+
+    In both the safer reading wins: ONE call keeps the bytes as its value and
+    no extra call is made. Before this, declared names alone decided nesting,
+    so a declared value ran to the last ``</function>`` and swallowed a
+    following call to an undeclared name — and that call's parameters landed
+    in the declared one (``shell {"command": "rm -rf ~"}``, review of
+    26452cbe3).
+
+    ``header`` (a regex capturing the name) names the structural unit when
+    ``opener`` is narrower — ``<tool_call>\\s*<function=…>`` for the scanner
+    fallback, which must still see a bare ``<function=…>`` as a boundary even
+    though it never emits one.
+
+    ``surface_undeclared`` also returns TOP-LEVEL calls to names the request
+    did not declare, when they are closed, framed by ``wrapper`` (if given),
+    outside markdown code (``inside_code``), and not right after a declared
+    raw value that closed mid-line (those bytes may be that value). The
+    result is in text order.
     """
-    resolved = _split_declared_calls(text, opener, closer, outer, valid_names)
-    found = [call for call, _region in resolved if call is not None]
-    if not surface_undeclared or valid_names is None:
-        return found
-    regions = [region for _call, region in resolved]
-    found.extend(
-        _split_undeclared_calls(text, opener, closer, outer, valid_names, regions)
+    if valid_names is None:
+        return [
+            call
+            for call, _region in _split_declared_calls(
+                text, opener, closer, outer, valid_names
+            )
+            if call is not None
+        ]
+
+    unit_pattern = header or opener
+    tops = top_level_calls(
+        text,
+        unit_pattern,
+        closer,
+        valid_names,
+        param_open=param_open,
+        param_close=param_close,
     )
-    found.sort(key=lambda call: call[2])
-    return found
+    if header is None:
+        span_starts: dict[int, int] = {top.body_start: top.start for top in tops}
+    else:
+        span_starts = {
+            match.end(): match.start() for match in re.finditer(opener, text, re.DOTALL)
+        }
+
+    calls: list[tuple[str, str, int, int]] = []
+    last_declared: TopCall | None = None
+    for index, top in enumerate(tops):
+        span_start = span_starts.get(top.body_start)
+        if index + 1 < len(tops):
+            nxt = tops[index + 1]
+            region_end = span_starts.get(nxt.body_start, nxt.start)
+        else:
+            region_end = len(text)
+        after_declared = last_declared
+        if top.declared:
+            last_declared = top
+        if span_start is None or top.body_end < 0:
+            continue
+        span_end = top.body_end + len(closer)
+        if outer:
+            tail = re.match(r"\s*" + re.escape(outer), text[span_end:region_end])
+            if not tail:
+                continue
+            span_end += tail.end()
+        if not top.declared:
+            if not surface_undeclared or not isinstance(top.shape, CallShape):
+                continue
+            if wrapper is not None and not text[:span_start].rstrip().endswith(wrapper):
+                continue
+            if inside_code(text, span_start):
+                continue
+            if after_declared is not None and not after_declared.canonical:
+                _logger.warning(
+                    "[TOOL-CALL-UNDECLARED] %r follows a declared call whose "
+                    "raw value closed mid-line, so it may be that value's "
+                    "text; kept as text",
+                    top.name,
+                )
+                continue
+        calls.append(
+            (top.name, text[top.body_start : top.body_end], span_start, span_end)
+        )
+    return calls
 
 
-def _split_undeclared_calls(
-    text: str,
-    opener: str,
-    closer: str,
-    outer: str | None,
-    valid_names: frozenset[str] | set[str],
-    regions: list[tuple[int, int]],
-) -> list[tuple[str, str, int, int]]:
-    """Well-formed calls to undeclared names that no declared call encloses.
+class TopCall:
+    """One top-level call as ``top_level_calls`` reads it.
 
-    ``regions`` are the byte ranges the declared pass assigned to declared
-    openers (their whole span, or up to their next sibling when they never
-    closed). An undeclared opener inside one is payload of that call, full
-    stop. Outside them, the position-only rules apply among the undeclared
-    openers, bounded by the next declared region so an undeclared call can
-    never absorb a declared one.
+    ``start``/``body_start``  the header's span (the body follows it).
+    ``body_end``  where the body ends (the offset of its closer), or -1 when
+                  it never closes. The structural close, unless the value runs
+                  on (see ``top_level_calls``) — then the LAST closer before
+                  the next top-level call, which keeps a value that quotes a
+                  closer whole (jundot/omlx#2507).
+    ``shape``     its ``CallShape`` (``None`` when unclosed).
     """
 
-    def _enclosed(pos: int) -> bool:
-        return any(start <= pos < end for start, end in regions)
+    __slots__ = ("start", "body_start", "body_end", "name", "declared", "shape")
 
-    free = [
-        match
-        for match in re.finditer(opener, text, re.DOTALL)
-        if match.group(1).strip() not in valid_names and not _enclosed(match.start())
+    def __init__(self, start, body_start, body_end, name, declared, shape):
+        self.start = start
+        self.body_start = body_start
+        self.body_end = body_end
+        self.name = name
+        self.declared = declared
+        self.shape = shape
+
+    @property
+    def canonical(self) -> bool:
+        """Closed on the template's grid (False for an unclosed call)."""
+        return isinstance(self.shape, CallShape) and self.shape.canonical
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"TopCall({self.name!r}, {self.start}, {self.body_end}, {self.shape})"
+
+
+def top_level_calls(
+    text: str,
+    header: str,
+    closer: str,
+    valid_names: frozenset[str] | set[str],
+    *,
+    param_open: str = PARAMETER_OPEN,
+    param_close: str = PARAMETER_CLOSE,
+) -> list[TopCall]:
+    """The calls that are top-level in ``text``, by STRUCTURE, in text order.
+
+    ``header`` is a regex capturing the call name (``<function=([^>]+)>``).
+    Each header is read with ``call_shape``. A header inside a call's values
+    is that value. A header after the call's structural close is a sibling,
+    unless the bytes say the call's value may still be running:
+
+    * a raw value of the call opened on the template's grid and closed
+      mid-line (``CallShape.consistent``), or
+    * the candidate, read on its own, leaves an orphan
+      ``</parameter>…</function>`` behind it before the next header — a close
+      that only a value running over the candidate accounts for.
+
+    In both cases the safer reading wins: the candidate is the call's text,
+    and no extra call exists. A declared call that never closes keeps the
+    position-only rule (a later DECLARED header after a closer is a sibling).
+    A header that meets another header first is prose (``HEADER_FIRST``).
+    An undeclared header that never closes is not a call at all.
+
+    Names do not decide nesting here — before this, they alone did, and a
+    declared value ran to the last ``</function>`` and took the parameters of
+    the call after it (review of 26452cbe3).
+    """
+    units = list(re.finditer(header, text, re.DOTALL))
+    if not units:
+        return []
+    header_literal = _header_literal(header)
+    shapes = [
+        call_shape(
+            text,
+            unit.end(),
+            closer,
+            header=header_literal,
+            param_open=param_open,
+            param_close=param_close,
+        )
+        for unit in units
     ]
-    calls: list[tuple[str, str, int, int]] = []
-    k = 0
-    while k < len(free):
-        start = free[k].start()
-        limit = min((s for s, _e in regions if s > start), default=len(text))
-        bounded = text[:limit]
-        group = [match for match in free[k:] if match.start() < limit]
-        segmented = segment_by_next_opener(bounded, group, 0, closer)
-        sibling = _next_sibling(bounded, group, 0, closer)
-        if segmented is not None:
-            body, span_end = segmented
-            emit = True
-            if outer:
-                tail_limit = group[sibling].start() if sibling < len(group) else limit
-                tail = re.match(r"\s*" + re.escape(outer), text[span_end:tail_limit])
-                if tail:
-                    span_end += tail.end()
-                else:
-                    emit = False
-            if emit:
-                calls.append((group[0].group(1).strip(), body, start, span_end))
-        k += sibling if sibling > 0 else 1
-    return calls
+    names = [unit.group(1).strip() for unit in units]
+    declared = [name in valid_names for name in names]
+    orphan = _end_of_parameters(param_close, closer)
+    starts = [unit.start() for unit in units]
+
+    def next_unit_start(pos: int) -> int:
+        for start in starts:
+            if start >= pos:
+                return start
+        return len(text)
+
+    def sibling(cur: int, k: int) -> bool:
+        cur_shape = shapes[cur]
+        if not isinstance(cur_shape, CallShape):
+            return declared[k] and closer in text[units[cur].end() : starts[k]]
+        if starts[k] < cur_shape.end:
+            return False
+        k_shape = shapes[k]
+        if not isinstance(k_shape, CallShape) and not declared[k]:
+            return False
+        if cur_shape.free:
+            if not cur_shape.consistent:
+                return False
+            if isinstance(k_shape, CallShape) and orphan.search(
+                text, k_shape.end, next_unit_start(k_shape.end)
+            ):
+                return False
+        return True
+
+    picked: list[int] = []
+    for k in range(len(units)):
+        if shapes[k] == HEADER_FIRST:
+            continue
+        if not picked:
+            if declared[k] or isinstance(shapes[k], CallShape):
+                picked.append(k)
+            continue
+        if sibling(picked[-1], k):
+            picked.append(k)
+
+    tops: list[TopCall] = []
+    for index, k in enumerate(picked):
+        unit = units[k]
+        region_end = starts[picked[index + 1]] if index + 1 < len(picked) else len(text)
+        shape = shapes[k]
+        if isinstance(shape, CallShape):
+            runs_on = orphan.search(text, shape.end, region_end) or any(
+                shape.end <= start < region_end for start in starts
+            )
+            body_end = (
+                text.rfind(closer, unit.end(), region_end)
+                if runs_on
+                else shape.end - len(closer)
+            )
+        else:
+            body_end = text.rfind(closer, unit.end(), region_end)
+        tops.append(
+            TopCall(
+                unit.start(),
+                unit.end(),
+                body_end,
+                names[k],
+                declared[k],
+                shape if isinstance(shape, CallShape) else None,
+            )
+        )
+    return tops
+
+
+def _header_literal(pattern: str) -> str | None:
+    """The literal prefix of a header regex (``<function=`` of
+    ``<function=([^>]+)>``), used to spot a second header structurally."""
+    literal = re.match(r"[^\\()\[\]{}.*+?^$|]+", pattern.split("(", 1)[0])
+    if literal is None:
+        return None
+    prefix = literal.group(0)
+    return prefix if prefix.startswith("<") and len(prefix) > 2 else None
 
 
 def _split_declared_calls(
@@ -307,11 +749,11 @@ def _split_declared_calls(
     outer: str | None,
     valid_names: frozenset[str] | set[str] | None,
 ) -> list[tuple[tuple[str, str, int, int] | None, tuple[int, int]]]:
-    """The declared-name pass: ``(call or None, region)`` per opener it owns.
+    """The position-only pass: ``(call or None, region)`` per opener it owns.
 
-    ``call`` is ``None`` for an opener that was resolved but not emitted (no
-    closer, or a missing required ``outer``); its region still encloses
-    whatever follows it, so nothing inside can surface as an undeclared call.
+    Used when the request declared no tools. ``call`` is ``None`` for an
+    opener that was resolved but not emitted (no closer, or a missing
+    required ``outer``).
     """
     openers = list(re.finditer(opener, text, re.DOTALL))
     calls: list[tuple[tuple[str, str, int, int] | None, tuple[int, int]]] = []
@@ -323,12 +765,6 @@ def _split_declared_calls(
         # turn is ordinary agent behaviour — read_file /a then read_file /b —
         # and suppressing the second opener merges both into one body and
         # silently drops a call the model asked for.
-        # This pass resolves DECLARED openers only — the opener being emitted
-        # as well as the search for the next sibling. Undeclared openers are
-        # never siblings here, so marker text inside a declared value cannot
-        # split it. Whether a top-level undeclared call is returned at all is
-        # decided afterwards, outside every region this pass assigns
-        # (``surface_undeclared``); without that flag it is not returned.
         if valid_names is not None and openers[i].group(1).strip() not in valid_names:
             i += 1
             continue
@@ -362,6 +798,53 @@ def _split_declared_calls(
     return calls
 
 
+def _exact_quoted_value(
+    block: str, value_start: int, closer: str
+) -> tuple[int, int] | None:
+    """``(value_end, close_end)`` when the value is one JSON string, else None.
+
+    A grammar-constrained value is a JSON string followed by its close
+    (#1542). Its bytes are exact: a ``<parameter=…>`` or ``</parameter>`` in
+    the quotes is data, never a sibling. Required: a terminated string, then
+    only whitespace, then the close marker — anything else is a raw value
+    that merely starts with a quote.
+    """
+    i = value_start
+    n = len(block)
+    while i < n and block[i].isspace():
+        i += 1
+    if i >= n or block[i] != '"':
+        return None
+    end = _json_string_end(block, i)
+    if end == -1:
+        return None
+    k = end
+    while k < n and block[k].isspace():
+        k += 1
+    if not block.startswith(closer, k):
+        return None
+    return k, k + len(closer)
+
+
+def _second_call_start(
+    block: str, value_start: int, closer: str, call_close: str, call_header: str
+) -> int | None:
+    """Where a SECOND call begins inside a body, if one does.
+
+    ``…</parameter></function>…<function=other>`` inside a call's body means
+    a value ran over a whole call's markup: the body was read as one call
+    (the safer reading), so whatever follows that header is that value's
+    text. Its ``<parameter=…>`` openers must never become parameters of
+    this call — that is how ``rm -rf ~`` from a following call overwrote
+    ``shell``'s ``command`` (review of 26452cbe3).
+    """
+    end = _end_of_parameters(closer, call_close).search(block, value_start)
+    if end is None:
+        return None
+    start = block.find(call_header, end.end())
+    return start if start != -1 else None
+
+
 def split_marked_parameters(
     block: str,
     opener: str,
@@ -369,6 +852,8 @@ def split_marked_parameters(
     valid_names: frozenset[str] | set[str] | None = None,
     *,
     reject_undeclared_siblings: bool = False,
+    call_close: str | None = None,
+    call_header: str | None = None,
 ) -> list[tuple[str, str]] | None:
     """``(name, value)`` for each parameter in ``block``.
 
@@ -376,14 +861,67 @@ def split_marked_parameters(
     every byte it was sent except the one wrapping newline per side that the
     wire format adds -- see ``trim_wrapping_newlines``. Parameter *names* are
     still stripped: those are identifiers, not payload.
+
+    A JSON-quoted value is exact (``_exact_quoted_value``). With
+    ``call_close``/``call_header`` given, parameter openers after a second
+    call inside the body are that value's text (``_second_call_start``).
     """
+    scanned = scan_marked_parameters(
+        block,
+        opener,
+        closer,
+        valid_names,
+        reject_undeclared_siblings=reject_undeclared_siblings,
+        call_close=call_close,
+        call_header=call_header,
+    )
+    return None if scanned is None else scanned[0]
+
+
+def scan_marked_parameters(
+    block: str,
+    opener: str,
+    closer: str,
+    valid_names: frozenset[str] | set[str] | None = None,
+    *,
+    reject_undeclared_siblings: bool = False,
+    call_close: str | None = None,
+    call_header: str | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[int, int]]] | None:
+    """``split_marked_parameters`` plus the spans no parameter opener may
+    come from: exact (JSON-quoted) values and the text after a second call
+    (see ``_second_call_start``). A recovery pass that re-reads the block
+    with a looser rule must skip openers inside those spans."""
     openers = list(re.finditer(opener, block))
     out: list[tuple[str, str]] = []
+    protected: list[tuple[int, int]] = []
     i = 0
     while i < len(openers):
+        exact = _exact_quoted_value(block, openers[i].end(), closer)
+        if exact is not None:
+            value_end, close_end = exact
+            out.append(
+                (
+                    openers[i].group(1).strip(),
+                    trim_wrapping_newlines(block[openers[i].end() : value_end]),
+                )
+            )
+            protected.append((openers[i].end(), close_end))
+            i += 1
+            while i < len(openers) and openers[i].start() < close_end:
+                i += 1
+            continue
+        live = openers
+        dead: int | None = None
+        if call_close and call_header:
+            dead = _second_call_start(
+                block, openers[i].end(), closer, call_close, call_header
+            )
+            if dead is not None:
+                live = [match for match in openers if match.start() < dead]
         if reject_undeclared_siblings and valid_names is not None:
-            current_end = openers[i].end()
-            for candidate in openers[i + 1 :]:
+            current_end = live[i].end()
+            for candidate in live[i + 1 :]:
                 if candidate.group(1).strip() in valid_names:
                     continue
                 if closer in block[current_end : candidate.start()]:
@@ -393,15 +931,17 @@ def split_marked_parameters(
                     # value (#1541).  Refuse the call rather than execute a
                     # silently rewritten argument.
                     return None
-        segmented = segment_by_next_opener(block, openers, i, closer, valid_names)
-        sibling = _next_sibling(block, openers, i, closer, valid_names)
+        segmented = segment_by_next_opener(block, live, i, closer, valid_names)
+        sibling = _next_sibling(block, live, i, closer, valid_names)
         if segmented is not None:
-            out.append(
-                (openers[i].group(1).strip(), trim_wrapping_newlines(segmented[0]))
-            )
+            out.append((live[i].group(1).strip(), trim_wrapping_newlines(segmented[0])))
+        if sibling >= len(live):
+            if dead is not None:
+                protected.append((dead, len(block)))
+            break
         # Jump to the sibling, not i+1: the openers in between are literal
         # text inside the value just consumed. Advancing one at a time is
         # what turns a value containing "<parameter=x>" into a phantom
         # parameter named x, passed to the tool as if the model sent it.
         i = sibling if sibling > i else i + 1
-    return out
+    return out, protected

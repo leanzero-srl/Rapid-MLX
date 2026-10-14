@@ -33,7 +33,11 @@ from typing import Any
 
 from ..api.tool_calling import _decode_json_like, _schema_type
 from ..tool_call_scan import (
-    split_marked_parameters,
+    CallShape,
+    find_value_close,
+    inside_code,
+    scan_marked_parameters,
+    top_level_calls,
     trim_wrapping_newlines,
     warn_undeclared_call,
 )
@@ -303,38 +307,10 @@ class Qwen3CoderToolParser(ToolParser):
         self.in_param_name: str | None = None
         self._legacy_raw_stream = False
         self._legacy_raw_param_count = 0
-        # Where a call to an undeclared name that is being HELD began. Such a
-        # call is never emitted incrementally: it is withheld until its own
-        # ``</function>`` arrives and then emitted whole, so a fragment that
-        # never completes (prose quoting the wire, a max_tokens cut) cannot
-        # become a half-built call. ``flush_held_content`` releases the held
-        # bytes as text if the stream ends first.
-        self._undeclared_hold_start: int | None = None
-
-    def flush_held_content(self, full_text: str) -> str:
-        """Release a held, never-closed call to an undeclared name as text.
-
-        Called by the postprocessor at stream end when no call reached the
-        wire. Bounded by the postprocessor's suppression budget: past it, the
-        postprocessor has already released those bytes itself (#1359) and
-        returning them again would duplicate them.
-        """
-        start = self._undeclared_hold_start
-        if start is None or self.header_sent or start >= len(full_text):
-            return ""
-        from ..service.postprocessor import _MAX_TOOL_SUPPRESSION_BYTES
-
-        held = full_text[start:]
-        if len(held) > _MAX_TOOL_SUPPRESSION_BYTES:
-            return ""
-        logger.warning(
-            "[TOOL-CALL-UNDECLARED] qwen3_coder_xml: a call to an undeclared "
-            "name never closed before the stream ended; released as text "
-            "(%d chars)",
-            len(held),
-        )
-        self._undeclared_hold_start = None
-        return held
+        # Where the first call this stream emitted began (its wrapper
+        # included). Everything before it already streamed as content; the
+        # legacy-raw finalizer returns the content after it.
+        self._first_call_start: int | None = None
 
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
@@ -498,7 +474,18 @@ class Qwen3CoderToolParser(ToolParser):
                     },
                 }
             )
-        return {"tool_calls": tool_calls}
+        out: dict[str, Any] = {"tool_calls": tool_calls}
+        # Text after the first call that is not a call (a span kept as text,
+        # prose between calls) was deferred with everything else; it belongs
+        # on the wire as content, exactly as the buffered parser returns it.
+        start = self._first_call_start
+        if start is not None and result.content:
+            already = model_output[:start]
+            if result.content.startswith(already):
+                tail = result.content[len(already) :]
+                if tail.strip():
+                    out["content"] = tail
+        return out
 
     def _parse_xml_function_call(
         self, function_call_str: str, tools: list[Any] | None
@@ -512,15 +499,18 @@ class Qwen3CoderToolParser(ToolParser):
         param_config = _get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
-        parsed = (
-            split_marked_parameters(
-                parameters,
-                r"<parameter=([^>]+)>",
-                self.parameter_end_token,
-                valid_names=set(param_config) or None,
-            )
-            or []
+        # JSON-quoted values are exact and a second call's markup inside the
+        # body is that value's text (``scan_marked_parameters``): neither can
+        # contribute a parameter, here or in the recovery pass below.
+        scanned = scan_marked_parameters(
+            parameters,
+            r"<parameter=([^>]+)>",
+            self.parameter_end_token,
+            valid_names=set(param_config) or None,
+            call_close=self.function_end_token,
+            call_header=self.tool_call_prefix,
         )
+        parsed, protected = scanned if scanned is not None else ([], [])
         for p_name, p_value in parsed:
             if f"{self.parameter_end_token}\n" in p_value:
                 # Kept as sent (the wire cannot tell payload from residue), but
@@ -542,7 +532,10 @@ class Qwen3CoderToolParser(ToolParser):
         # protects complete JSON-string payloads, while this fallback recovers
         # later declared parameters that would otherwise be swallowed by the
         # unterminated predecessor. Never overwrite a value the safe scan found.
-        for match_text in self.tool_call_parameter_regex.findall(parameters):
+        for match in self.tool_call_parameter_regex.finditer(parameters):
+            if any(lo <= match.start() < hi for lo, hi in protected):
+                continue
+            match_text = match.group(1)
             try:
                 idx = match_text.index(">")
             except ValueError:
@@ -566,18 +559,48 @@ class Qwen3CoderToolParser(ToolParser):
         ]
 
     def _function_call_candidates(
-        self, model_output: str
+        self, model_output: str, declared: set[str] | None = None
     ) -> list[tuple[str, int, int, bool, bool]]:
         """Return ``(body, span_start, span_end, is_wrapped, is_closed)``.
 
         ``is_closed`` is True only when the function's own top-level
         ``</function>`` was found — not for the EOS recoveries below that
         accept a call missing its inner closes.
+
+        With ``declared`` given, nesting is decided by the shared structural
+        reading (``tool_call_scan.top_level_calls``), the same one the
+        nemotron parser and the scanner fallback use: a ``<function=`` that
+        the reading puts inside an earlier call's value is not a candidate,
+        and that earlier call's body runs to its last close. Before, this
+        parser took every header after a first-close as a call, so a value
+        that quoted ``</parameter></function>…<function=shell>…`` produced a
+        DECLARED ``shell`` (review of 26452cbe3, items 5b/5c).
         """
+        tops = None
+        if declared is not None:
+            tops = {
+                top.start: top
+                for top in top_level_calls(
+                    model_output,
+                    r"<function=([^>]+)>",
+                    self.function_end_token,
+                    declared,
+                )
+            }
         candidates: list[tuple[str, int, int, bool, bool]] = []
         for start in self._function_start_positions(model_output):
             close = self._top_level_function_close(model_output, start)
             body_start = start + len(self.tool_call_prefix)
+            if tops is not None:
+                top = tops.get(start)
+                if top is None:
+                    continue
+                if isinstance(top.shape, CallShape) and top.body_end >= 0:
+                    # The shared reading's end: the structural close, read on
+                    # the template's grid (a value that quotes a closer
+                    # mid-line keeps it), or the last close before the next
+                    # real call when the value runs on.
+                    close = top.body_end
             if close == -1:
                 body = model_output[body_start:]
                 complete_params = (
@@ -866,14 +889,14 @@ class Qwen3CoderToolParser(ToolParser):
             )
 
         try:
-            candidates = self._function_call_candidates(model_output)
+            declared = self._declared_tool_names(request)
+            candidates = self._function_call_candidates(model_output, declared)
             if not candidates:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
             tools = request.get("tools") if isinstance(request, dict) else None
-            declared = self._declared_tool_names(request)
             selected = self._named_tool_choice(request)
             surface_undeclared = self._may_surface_undeclared(request)
 
@@ -916,6 +939,10 @@ class Qwen3CoderToolParser(ToolParser):
                     # tool_choice="none" or a named tool_choice it stays text
                     # too (see ``_may_surface_undeclared``).
                     if not (surface_undeclared and is_closed and is_wrapped):
+                        continue
+                    if inside_code(model_output, span_start):
+                        # A wrapped example inside a markdown code fence (or
+                        # inline code) is the model SHOWING the format.
                         continue
                     if self._undeclared_after_ambiguous_close(
                         model_output, previous_starts, declared
@@ -1045,22 +1072,9 @@ class Qwen3CoderToolParser(ToolParser):
         # expose the whitespace one delta before the opening quote; failing to
         # skip it makes the incremental path escape both JSON wrapper quotes
         # into the user value (``/tmp/x`` becomes ``\"/tmp/x\"``).
-        while i < len(text) and text[i].isspace():
-            i += 1
-        if i >= len(text) or text[i] != '"':
-            return text.find(self.parameter_end_token, i)
-        i += 1
-        escaped = False
-        while i < len(text):
-            char = text[i]
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                return text.find(self.parameter_end_token, i + 1)
-            i += 1
-        return -1
+        # The rule lives in ``tool_call_scan.find_value_close`` so every XML
+        # function-call path reads a value's end the same way.
+        return find_value_close(text, i, self.parameter_end_token)[0]
 
     def _top_level_function_close_count(
         self, text: str, top_level_starts: list[int]
@@ -1221,6 +1235,7 @@ class Qwen3CoderToolParser(ToolParser):
                                 if request is not None
                                 else self._streaming_request
                             )
+                            and not inside_code(current_text, self._pending_tool_start)
                         ):
                             saved_request = self._streaming_request
                             self._reset_streaming_state()
@@ -1290,6 +1305,10 @@ class Qwen3CoderToolParser(ToolParser):
                         and self._may_surface_undeclared(
                             request if request is not None else self._streaming_request
                         )
+                        and not inside_code(
+                            current_text,
+                            self._call_framing_start(current_text, tool_start_idx),
+                        )
                         and not self._undeclared_after_ambiguous_close(
                             current_text,
                             function_starts[: self.current_tool_index],
@@ -1304,26 +1323,24 @@ class Qwen3CoderToolParser(ToolParser):
                         self._reset_streaming_state()
                         self._streaming_request = saved_request
                         return {"content": rejected}
-                    if undeclared and func_close_idx == -1:
-                        # A call to a name the request did not offer: hold it
-                        # until its own ``</function>`` arrives, then emit it
-                        # whole (below), exactly as the non-streaming parser
-                        # admits only CLOSED undeclared calls. Emitting the
-                        # header now would be irreversible for a fragment
-                        # that never completes. This opener is top-level by
-                        # construction (``_function_start_positions`` skips
-                        # openers inside parameter values), so marker text in
-                        # another call's argument never reaches here.
-                        if self._undeclared_hold_start is None:
-                            self._undeclared_hold_start = (
-                                self._pending_tool_start
-                                if self.current_tool_index == 0
-                                and self._pending_tool_start is not None
-                                else self._call_framing_start(
-                                    current_text, tool_start_idx
-                                )
-                            )
-                        return None
+                    if undeclared:
+                        # A wrapped, top-level call to a name the request did
+                        # not offer streams exactly like a declared one: its
+                        # header now, its raw values deferred to the
+                        # end-of-stream parse (``_legacy_raw_stream``). It
+                        # used to be HELD until its ``</function>``, which
+                        # left nothing on the wire, so the postprocessor's
+                        # #1359 budget released any call over 64 KB as text
+                        # (review of 26452cbe3, item 2) — the budget decided
+                        # correctness. Cut off mid-call it is now a call with
+                        # broken arguments, the same as a cut-off declared
+                        # call: the client answers it with a tool error and
+                        # the agent goes on, where text ended its turn.
+                        warn_undeclared_call(
+                            self.current_function_name,
+                            declared,
+                            "qwen3_coder_xml stream",
+                        )
                     if (
                         not self._pending_tool_wrapped
                         and self.parameter_prefix not in tool_text
@@ -1370,6 +1387,10 @@ class Qwen3CoderToolParser(ToolParser):
                     self._current_tool_id = _generate_tool_id()
                     self.header_sent = True
                     self.in_function = True
+                    if self._first_call_start is None:
+                        self._first_call_start = self._call_framing_start(
+                            current_text, tool_start_idx
+                        )
 
                     # If the function body is already complete, emit the full
                     # tool call in one chunk to prevent header-only output
@@ -1382,13 +1403,6 @@ class Qwen3CoderToolParser(ToolParser):
                         fc = tool_text[func_start : -len(self.function_end_token)]
                         parsed = self._parse_xml_function_call(fc, tools)
                         args = parsed["arguments"] if parsed else "{}"
-                        if undeclared:
-                            warn_undeclared_call(
-                                self.current_function_name,
-                                declared,
-                                "qwen3_coder_xml stream",
-                            )
-                        self._undeclared_hold_start = None
                         self.json_started = True
                         self.json_closed = True
                         self.in_function = False
@@ -1442,7 +1456,12 @@ class Qwen3CoderToolParser(ToolParser):
                     ]
                 }
 
-            # Find all parameter start positions
+            # Parameter start positions, found STRUCTURALLY: each value is
+            # skipped by its own close (``_find_parameter_close``, JSON-string
+            # aware), so a ``<parameter=`` inside a quoted value is that
+            # value's text. A plain ``find()`` counted it as a parameter and
+            # the streamed arguments ended ``... end, }`` — invalid JSON for
+            # a value the buffered parser reads exactly.
             param_starts = []
             si = 0
             while True:
@@ -1450,7 +1469,13 @@ class Qwen3CoderToolParser(ToolParser):
                 if si == -1:
                     break
                 param_starts.append(si)
-                si += len(self.parameter_prefix)
+                name_end = tool_text.find(">", si + len(self.parameter_prefix))
+                if name_end == -1:
+                    break
+                value_close = self._find_parameter_close(tool_text, name_end + 1)
+                if value_close == -1:
+                    break
+                si = value_close + len(self.parameter_end_token)
 
             tools = None
             if self._streaming_request:
