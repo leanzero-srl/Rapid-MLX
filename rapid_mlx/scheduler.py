@@ -6379,10 +6379,7 @@ class Scheduler:
         guard = MemoryGuard(self._memguard_prior(), floor_tokens=floor)
         mac = getattr(self, "memory_aware_cache", None)
         if mac is not None:
-            guard.configured_prefix_budget = int(
-                getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0))
-                or 0
-            )
+            guard.configured_prefix_budget = self._memguard_operator_budget(mac)
         self._memory_guard = guard
         if not getattr(self, "running", None):
             try:
@@ -7457,6 +7454,30 @@ class Scheduler:
         )
         return refusal
 
+    def _memguard_operator_budget(self, mac: Any) -> int | None:
+        """The prefix budget the OPERATOR chose (``--cache-memory-mb``, a
+        ``--cache-memory-percent`` other than the default, or
+        ``RAPID_MLX_PREFIX_CACHE_MAX_BYTES``), in bytes; ``None`` when they
+        chose none (the same rule the MLLM lane uses for its snapshot cap)."""
+        from .memory_cache import (
+            _DEFAULT_MEMORY_PERCENT,
+            _resolve_env_cache_max_bytes,
+        )
+
+        config = getattr(self, "config", None)
+        mb = getattr(config, "cache_memory_mb", None)
+        percent = getattr(config, "cache_memory_percent", None)
+        chosen = (
+            _resolve_env_cache_max_bytes() > 0
+            or mb is not None
+            or (percent is not None and percent != _DEFAULT_MEMORY_PERCENT)
+        )
+        if not chosen:
+            return None
+        return int(
+            getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0)) or 0
+        )
+
     def _memguard_apply_budgets(self) -> None:
         """E2 + E3 from what the IDLE engine holds -- never from live KV.
 
@@ -7496,11 +7517,13 @@ class Scheduler:
         mac = getattr(self, "memory_aware_cache", None)
         effective = None
         if mac is not None and hasattr(mac, "set_max_memory"):
-            configured = int(
-                getattr(mac, "_configured_max_memory", getattr(mac, "_max_memory", 0))
-                or 0
-            )
-            guard.configured_prefix_budget = configured
+            # The operator's budget is an upper bound only when the operator
+            # CHOSE one; otherwise the guard's idle room IS the budget (the
+            # 20%-of-RAM heuristic the cache starts from capped a session's
+            # entry below the window the guard itself admits).
+            operator = self._memguard_operator_budget(mac)
+            configured = room if operator is None else operator
+            guard.configured_prefix_budget = operator
             effective = min(configured, room)
             # Never below the newest entry: the session's next-turn base must
             # stay storable (it fits by construction at idle; a budget
@@ -7508,21 +7531,24 @@ class Scheduler:
             with mac._lock:  # noqa: SLF001
                 newest = next(reversed(mac._entries.values()), None)  # noqa: SLF001
             if newest is not None:
-                effective = max(effective, min(configured, int(newest.memory_bytes)))
+                ceiling_entry = int(newest.memory_bytes)
+                if operator is not None:
+                    ceiling_entry = min(operator, ceiling_entry)
+                effective = max(effective, ceiling_entry)
             previous = guard.effective_prefix_budget
             if previous is None or abs(effective - previous) > REAPPLY_RATIO * max(
                 1, previous
             ):
-                evicted = mac.set_max_memory(effective)
+                evicted = mac.set_max_memory(effective, bounded=operator is not None)
                 guard.effective_prefix_budget = effective
                 if previous is not None or effective != configured:
                     logger.warning(
                         "[memory_guard] prefix budget %.2fGB -> %.2fGB "
-                        "(configured %.2fGB; idle room %.2fGB = %.2f x ceiling "
+                        "(operator budget %s; idle room %.2fGB = %.2f x ceiling "
                         "%.2fGB - idle base %.2fGB) evicted=%d",
                         (previous if previous is not None else configured) / 1e9,
                         effective / 1e9,
-                        configured / 1e9,
+                        "none" if operator is None else f"{operator / 1e9:.2f}GB",
                         room / 1e9,
                         self._memguard_pressure_fraction(),
                         ceiling / 1e9,

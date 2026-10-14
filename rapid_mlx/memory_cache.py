@@ -2947,13 +2947,18 @@ class MemoryAwarePrefixCache:
             non_trimmable_skips=self._stats.non_trimmable_skips,
         )
 
-    def set_max_memory(self, max_bytes: int) -> int:
+    def set_max_memory(self, max_bytes: int, *, bounded: bool = True) -> int:
         """Set the budget in force (memory guard E3) and LRU-evict down to it.
 
-        Clamped to ``[0, configured]``: the operator's budget stays an upper
-        bound. Returns the number of entries evicted.
+        Clamped to ``[0, configured]`` when ``bounded`` (the operator chose a
+        budget: it stays an upper bound). ``bounded=False``: no operator
+        budget -- the guard's own derivation is the budget (the 20%-of-RAM
+        heuristic was only the starting point). Returns the number of entries
+        evicted.
         """
-        target = max(0, min(int(max_bytes), int(self._configured_max_memory)))
+        target = max(0, int(max_bytes))
+        if bounded:
+            target = min(target, int(self._configured_max_memory))
         evicted = 0
         with self._lock:
             self._max_memory = target

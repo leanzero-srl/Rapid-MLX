@@ -196,6 +196,7 @@ class _Device:
         scheduler._current_metal_cache_bytes = lambda: 0
         scheduler._current_process_resident_bytes = device.active
         cap = int(device.physical * 0.97)
+        device.ceiling = cap
         scheduler._resolve_metal_cap_bytes = lambda: cap
         # A near-truth prior so these tests pin the eviction / budget /
         # deferral / handoff POLICY, not the calibration (tested separately).
@@ -276,52 +277,75 @@ def _new_tokens(turn: int, n: int) -> list[int]:
     return [(turn * 37 + i * 11) % 120 + 1 for i in range(n)]
 
 
-def _session(scheduler, device, turns: int, delta: int, native: int):
+def _session(scheduler, delta: int, native: int, max_tokens: int = 4):
+    """One growing session, turn after turn, up to the EDGE of the honest
+    window: a turn runs while its prompt + output fits the window."""
     prompt = _new_tokens(0, 600)
     history = []
     windows = []
-    for turn in range(turns):
+    for turn in range(200):
         rid = f"turn-{turn}"
         # The route's admission check runs first (it also measures the idle
         # base, as in production).
+        window = scheduler.memory_guard_max_context(native)
+        if window and len(prompt) + max_tokens > window:
+            break
         assert scheduler.device_memory_admission(len(prompt)) is None, turn
-        outs = _drive(scheduler, [_request(rid, prompt)])[rid]
+        outs = _drive(scheduler, [_request(rid, prompt, max_tokens)])[rid]
         assert outs[-1].finished and not outs[-1].error, (turn, outs[-1].error)
         history.append((turn, len(prompt), outs[-1].cached_tokens))
         windows.append(scheduler.memory_guard_max_context(native))
-        prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, delta - 4)
+        prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, delta - max_tokens)
     return history, windows
 
 
+def _auto_budget_scheduler(llama, monkeypatch, device, **config) -> Scheduler:
+    """A scheduler with NO operator prefix budget, on a Mac whose free memory
+    after the weights load is what this device leaves (the cache sizes its
+    starting budget from it, as on a real Mac: 20% of it, floored at 100 MiB)."""
+    import rapid_mlx.memory_cache as memory_cache
+
+    monkeypatch.setattr(
+        memory_cache, "_get_available_memory", lambda: device.physical - BASE
+    )
+    return _scheduler(llama, cache_memory_mb=None, **config)
+
+
 def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
-    """Every turn of a session re-prefills only its new tokens, to ~90% of
-    the honest window (goose compacts at 80%), with every end-of-turn entry stored and no
-    allocation over the device. The end-of-turn entry TAKES OVER the
-    finished request's KV (no second copy), the next turn takes it over in
-    turn when copying it would not fit, and the turn's own prompt entry is
-    redundant once the end-of-turn entry is in.
+    """Every turn of a session re-prefills only its new tokens, up to the
+    edge of the honest window, with every end-of-turn entry stored and
+    every step -- prefill AND decode -- under the guard's own ceiling. The
+    end-of-turn entry TAKES OVER the finished request's KV (no second copy),
+    the next turn takes it over in turn when copying it would not fit, and
+    the turn's own prompt entry is redundant once the end-of-turn entry is
+    in. The decode step at which the KV grows (~2 layers of the context
+    beyond the footprint) is in the plan and in the window.
 
     RED on 605548ef6 (same device): end-of-turn stores skipped from 8.1k,
-    0 prefix entries left from 10.1k, every later turn a full re-prefill."""
+    0 prefix entries left from 10.1k, every later turn a full re-prefill.
+    RED on f7df48332: the window let the session reach 20.1k, where the
+    decode growth step peaked at 508.65 MB over the 501 MB ceiling; and the
+    starting heuristic (20% of free RAM, floored at 100 MiB) stayed an upper
+    bound, so entries above it were refused ("Cache entry too large")."""
     device = _Device(physical=GABEE_PHYSICAL)
-    # The operator's --cache-memory-* cap stays an upper bound on the guard's
-    # budget; here it is out of the way so the guard's own policy is measured.
-    scheduler = _scheduler(llama, cache_memory_mb=4000)
+    # No operator budget (no --cache-memory-*): the guard derives it.
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, scheduler)
 
     delta = 500
-    history, windows = _session(scheduler, device, turns=37, delta=delta, native=65536)
+    history, windows = _session(scheduler, delta=delta, native=65536)
 
     guard = scheduler._memguard()
     assert device.ooms == 0
-    assert device.max_seen <= device.physical, device.max_seen
+    assert device.max_seen <= device.ceiling, (device.max_seen, device.ceiling)
+    assert guard.counts["decode_over_ceiling"] == 0
     assert guard.counts["turn_store_skips"] == 0
     # Near the window the next turn took its entry over instead of copying.
     assert guard.counts["admission_handoffs"] >= 1
     for _turn, length, cached in history[1:]:
         assert length - cached <= delta + 8, history
     last_length = history[-1][1]
-    assert last_length >= 0.85 * windows[-1], (last_length, windows[-1])
+    assert last_length + delta >= windows[-1], (last_length, windows[-1])
     # The advertised window never dips (goose compacts at 0.8x it).
     for before, after in zip(windows, windows[1:], strict=False):
         assert after >= 0.97 * before, windows
@@ -364,7 +388,7 @@ def _three_requests(llama, monkeypatch, physical: int):
         assert not outputs[rid][-1].error, (rid, outputs[rid][-1].error)
         assert len(_tokens(outputs[rid])) == n, rid
     assert device.ooms == 0
-    assert device.max_seen <= device.physical, (device.max_seen, device.physical)
+    assert device.max_seen <= device.ceiling, (device.max_seen, device.ceiling)
     guard = scheduler.get_stats()["memory_guard"]
     assert guard["actions"]["refusals"] == 0
     return steps, guard
@@ -385,7 +409,7 @@ def test_a_deferred_request_stops_gating_once_it_decodes(llama, monkeypatch):
     row, so C (which fits beside B) runs beside it instead of waiting for
     B to finish (review 2026-10-14, item 7). Negative control for the
     test above: here C does join a decoding batch."""
-    steps, guard = _three_requests(llama, monkeypatch, physical=555 * MB)
+    steps, guard = _three_requests(llama, monkeypatch, physical=595 * MB)
     assert guard["actions"]["deferrals"] >= 1
     assert steps["b"][0] > steps["a"][-1]  # B still waited for A
     assert steps["c"][0] < steps["b"][-1]  # C ran beside B
@@ -402,7 +426,7 @@ def test_a_prompt_that_cannot_fit_even_alone_is_still_refused(llama, monkeypatch
     detail = outs[-1].error_detail
     assert detail["n_ctx"] < detail["n_prompt_tokens"] == 3000
     assert device.ooms == 0
-    assert device.max_seen <= device.physical
+    assert device.max_seen <= device.ceiling
 
 
 def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
@@ -470,7 +494,7 @@ def test_max_model_len_is_the_same_idle_figure_under_load(llama, monkeypatch):
     assert len(scheduler.running) == 3
     assert guard.model.observations > observed  # the model kept learning
     assert device.active() > BASE + 20 * MB  # the load is real
-    assert device.max_seen <= device.physical
+    assert device.max_seen <= device.ceiling
     assert scheduler.projected_memory_max_context(16384) == idle
     assert scheduler.get_stats()["memory_guard"]["max_context_idle"] == idle
 
@@ -540,3 +564,21 @@ def test_guard_on_pressure_evictor_keeps_the_session_entry(llama, monkeypatch):
     before, evicted = _pressure_tick(scheduler, 0.985)
     assert evicted == before - 1
     assert len(scheduler.memory_aware_cache._entries) == 1
+
+
+def test_an_operator_prefix_budget_still_caps_the_session(llama, monkeypatch):
+    """Negative control for the derived budget, and the measured case for
+    goose's ``--cache-memory-percent 0.35``: an operator budget stays an upper
+    bound, so once the session's entry outgrows it (0.35 x the free memory
+    after the weights, floored at 100 MiB = 105 MB here; the derived budget
+    is 191 MB) it is refused and every later turn re-prefills in full --
+    while the guard would have kept it to the window."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _auto_budget_scheduler(
+        llama, monkeypatch, device, cache_memory_percent=0.35
+    )
+    device.install(monkeypatch, scheduler)
+    history, _windows = _session(scheduler, delta=500, native=65536)
+    full = [length for _t, length, cached in history[1:] if length - cached > 508]
+    assert full and min(full) < 14_000, history
+    assert scheduler._memguard().configured_prefix_budget is not None
