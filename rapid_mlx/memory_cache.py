@@ -2028,6 +2028,10 @@ class MemoryAwarePrefixCache:
 
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
+        # The operator's budget (--cache-memory-percent / --cache-memory-mb /
+        # env). The memory guard (E3) may lower ``_max_memory`` below it to
+        # what the device really has room for; it never raises it above.
+        self._configured_max_memory = self._max_memory
         self._current_memory = 0
         # id(array) -> [holders, bytes, array]: recurrent-state arrays held by
         # resident entries. The array reference keeps the id from being reused.
@@ -2848,6 +2852,12 @@ class MemoryAwarePrefixCache:
         legacy cache counters.
         """
         out = self._stats.to_dict()
+        # Memory guard E3: the budget in force (``max_memory_*``) next to the
+        # operator's configured upper bound.
+        out["effective_max_memory_mb"] = round(self._max_memory / _BYTES_PER_MB, 2)
+        out["configured_max_memory_mb"] = round(
+            self._configured_max_memory / _BYTES_PER_MB, 2
+        )
         # #1103: live count of retained non-trimmable (hybrid recurrent-state)
         # entries — drives the ``rapid_mlx_prefix_cache_non_trimmable_entries``
         # gauge so operators can verify the hybrid-reuse bound holds (0 when
@@ -2886,6 +2896,24 @@ class MemoryAwarePrefixCache:
             save_drift_drops=self._stats.save_drift_drops,
             non_trimmable_skips=self._stats.non_trimmable_skips,
         )
+
+    def set_max_memory(self, max_bytes: int) -> int:
+        """Set the budget in force (memory guard E3) and LRU-evict down to it.
+
+        Clamped to ``[0, configured]``: the operator's budget stays an upper
+        bound. Returns the number of entries evicted.
+        """
+        target = max(0, min(int(max_bytes), int(self._configured_max_memory)))
+        evicted = 0
+        with self._lock:
+            self._max_memory = target
+            self._stats.max_memory_bytes = target
+            while self._entries and self._current_memory > self._max_memory:
+                self._evict_lru()
+                evicted += 1
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+        return evicted
 
     @property
     def memory_usage_mb(self) -> float:
