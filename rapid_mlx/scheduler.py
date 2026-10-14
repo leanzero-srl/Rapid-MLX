@@ -6662,10 +6662,10 @@ class Scheduler:
         """``(line, frame)`` pairs whose heads are abandoned (EVICT_HEAD: they
         go under duress before the chunk is reduced, never without it):
 
-        * another (line, frame) that started BEFORE this one ran again after
-          this one's latest activity -- goose: the main session waits while
-          a subagent runs, then its next request: the subagent is finished;
-          likewise a helper call the main turn followed;
+        * another conversation (session) that started BEFORE this one ran
+          again after this one's latest activity -- goose: the main session
+          waits while a subagent runs, then its next request: the subagent
+          is finished;
         * this conversation's turn ENDED (every frame's latest completion
           finished with a reply, ``finish_reason == "stop"``, as the chat
           route reports it) and a YOUNGER conversation then started a user
@@ -6675,6 +6675,12 @@ class Scheduler:
           outcome reported) is never abandoned this way: a younger session's
           trailing user message (a tool image, a continuation nudge) is not
           a sign of anything (review 7, item 1);
+        * inside one session: a one-message frame (a title or summary helper
+          call) once a CONVERSATION frame of the same session ran after it.
+          A helper never outlives the conversation, whichever was admitted
+          first (review 7, item 2: a title spawned before the reply loop won
+          the admission race and its TurnEnd retitle demoted main).
+
         A line that runs again stops being outlived. Lines with no entry and
         no request are forgotten."""
         lines = self.__dict__.get("_memguard_lines")
@@ -6707,24 +6713,31 @@ class Scheduler:
                 agg[1] = max(agg[1], last)
                 agg[2] = max(agg[2], turn)
                 agg[3] = agg[3] and ended
-        outlived: set[Any] = set()
+        gone: set[Any] = set()
         latest_older = 0
-        for owner, (_first, last, *_r) in sorted(
-            lines.items(), key=lambda kv: kv[1][0]
+        for line, (_first, last, _turn, _ended) in sorted(
+            sessions.items(), key=lambda kv: kv[1][0]
         ):
             if latest_older > last:
-                outlived.add(owner)
+                gone.add(line)
             latest_older = max(latest_older, last)
-        gone: set[Any] = set()
         for line, (first, last, _turn, ended) in sessions.items():
-            if not ended:
+            if line in gone or not ended:
                 continue
             if any(
                 other != line and o_first > first and o_turn > last
                 for other, (o_first, _l, o_turn, _e) in sessions.items()
             ):
                 gone.add(line)
-        outlived |= {owner for owner in lines if owner[0] in gone}
+        outlived = {owner for owner in lines if owner[0] in gone}
+        for owner, (_first, last, _turn, _hint, conv) in lines.items():
+            if conv or owner in outlived:
+                continue
+            if any(
+                other[0] == owner[0] and o_conv and o_last > last
+                for other, (_f, o_last, _t, _h, o_conv) in lines.items()
+            ):
+                outlived.add(owner)
         return outlived
 
     def _memguard_entry_level(

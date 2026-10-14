@@ -207,6 +207,47 @@ def test_main_waiting_on_a_subagent_stays_protected(cpu, main_outcome):
     assert head in s.memory_aware_cache._entries
 
 
+def test_a_title_helper_admitted_first_never_demotes_main(cpu):
+    """Review 7, item 2 (HIGH): goose spawns the TurnStart title BEFORE the
+    reply loop, under main's session id (its own frame, ONE user message).
+    When it wins the admission race it is the older frame; on 5ba8a8870 its
+    TurnEnd retitle then marked MAIN outlived (EVICT_HEAD through the user's
+    idle gap) while the title's own entries stayed NEEDED all session. A
+    one-message helper frame never outlives the conversation; the
+    conversation outlives it once it runs after it."""
+    s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
+    title = _hybrid_tokens(700, 200)
+    helper = {"session": "main", "frame": 200, "multi": False}
+
+    def retitle(rid):
+        h = title + _hybrid_tokens(3, 100)
+        _hybrid_run(s, rid, h + _GEN_PROMPT, len(h), turn_start=True, **helper)
+
+    main = _hybrid_tokens(1, 300) + _hybrid_tokens(2, 1500)
+    retitle("t0")  # wins the race
+    _c, out = _hybrid_run(
+        s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, multi=False, **_MAIN
+    )
+    retitle("t1")  # TurnEnd retitle
+
+    def mains():
+        lv = _levels(s)
+        return [v for k, v in lv.items() if k[:300] == tuple(main[:300])]
+
+    def titles():
+        lv = _levels(s)
+        return [v for k, v in lv.items() if k[:200] == tuple(title)]
+
+    assert max(mains()) == EVICT_NEEDED, mains()
+    # The next user turn: main is a conversation and ran after the title.
+    nxt = main + _GEN_PROMPT + out + [904] + _hybrid_tokens(40, 80)
+    _hybrid_run(s, "m1", nxt + _GEN_PROMPT, len(nxt), turn_start=True, **_MAIN)
+    assert max(mains()) == EVICT_NEEDED, mains()
+    assert titles() and max(titles()) < EVICT_NEEDED, titles()
+    retitle("t2")  # another retitle: still never above main
+    assert max(mains()) == EVICT_NEEDED, mains()
+
+
 # -- item 2: the hybrid entry-count bound, NO memory pressure -------------
 
 
