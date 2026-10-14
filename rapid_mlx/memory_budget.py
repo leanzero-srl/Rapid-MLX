@@ -260,3 +260,41 @@ def compute_metal_cache_limit(soft_limit_bytes: int) -> int:
         min(32 * 1024 * 1024 * 1024, soft_limit_bytes // 4),
     )
     return min(cache, soft_limit_bytes) if soft_limit_bytes > 0 else cache
+
+
+# The kernel's memory-pressure levels (Darwin dispatch / memorystatus enum,
+# not tunables): 1 normal, 2 warn, 4 critical.
+SYSTEM_PRESSURE_WARN = 2
+SYSTEM_PRESSURE_CRITICAL = 4
+_LIBC = None
+
+
+def system_memory_pressure() -> int:
+    """The machine's memory-pressure level as the kernel reports it
+    (``kern.memorystatus_vm_pressure_level``): what the REST of the machine
+    needs -- other apps, other MLX engines -- as one measured signal. 0 when
+    unavailable (not Darwin)."""
+    try:
+        import ctypes
+        import ctypes.util
+        import sys
+
+        if sys.platform != "darwin":
+            return 0
+        global _LIBC
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+        libc = _LIBC
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if libc.sysctlbyname(
+            b"kern.memorystatus_vm_pressure_level",
+            ctypes.byref(value),
+            ctypes.byref(size),
+            None,
+            0,
+        ):
+            return 0
+        return int(value.value)
+    except Exception:  # noqa: BLE001
+        return 0

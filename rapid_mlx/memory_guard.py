@@ -585,7 +585,8 @@ EVICT_UNUSED = 1
 #    cache, so evicting it frees memory and loses nothing for that session.
 EVICT_REDUNDANT = 2
 # 3: the HEAD of a session that finished a turn (the entry its next turn
-#    fetches) other than the costliest one: evicted -- cheapest to re-prefill
+#    fetches) other than the most recently used one (an abandoned session, a
+#    finished side request, a pre-compaction head): evicted -- cheapest to re-prefill
 #    first, so a short side request's head goes before a long session's --
 #    after the unused and redundant entries and BEFORE the chunk is reduced
 #    (losing a 1.6k-token head costs one 1.6k re-prefill; a reduced chunk
@@ -594,8 +595,8 @@ EVICT_REDUNDANT = 2
 #    reductions on the main session (session sim, 2026-10-14).
 EVICT_HEAD = 3
 # 4: an entry a live session still needs: stored during this turn beyond what
-#    the running request fetched, on a waiting request's path, or the
-#    costliest session head. Evicted only after the chunk is at the floor,
+#    the running request fetched, on a waiting request's path, or the most
+#    recently used session head. Evicted only after the chunk is at the floor,
 #    before refusing a prefill, or under hard pressure at the cap.
 EVICT_NEEDED = 4
 
@@ -656,6 +657,12 @@ class MemoryGuard:
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
+            # Older entries of a session superseded by its newest
+            # end-of-turn entry (dead weight, not pressure).
+            "superseded": 0,
+            # Entries given back because the kernel reported machine-wide
+            # memory pressure (other apps / engines need it).
+            "system_pressure_evictions": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0

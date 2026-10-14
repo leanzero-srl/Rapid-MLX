@@ -155,6 +155,7 @@ from .memory_guard import (  # noqa: E402
     EVICT_REDUNDANT,
     EVICT_UNUSED,
     MARGIN_CEILING_RATIO,
+    OBS_PER_GROUP,
     REAPPLY_RATIO,
     GuardPlan,
     GuardProbe,
@@ -6587,8 +6588,9 @@ class Scheduler:
         Caller holds the cache lock.
 
         Levels (``memory_guard.EVICT_*``): UNUSED, REDUNDANT (a running
-        request fetched it: duplicated in its live cache), NEEDED (a live or
-        queued request still needs it, or it is a session's HEAD). A head is
+        request fetched it: duplicated in its live cache), HEAD (a session's
+        head other than the most recently used one), NEEDED (a live or
+        queued request still needs it, or the most recently used head). A head is
         the newest entry of a session that finished a turn -- an entry no
         other entry extends, or a message-boundary entry extended only by
         heads (non-trimmable caches resume from the boundary when the next
@@ -6623,16 +6625,25 @@ class Scheduler:
                 only_leaves and getattr(entries[key], "message_boundary", False)
             ):
                 heads.add(key)
-        # The costliest session (most tokens to re-prefill) keeps its heads
-        # until the floor; the other sessions' heads go first, cheapest first.
-        # A session running now counts (its own entry may be handed over: a
-        # 1.6k side head is not the costliest beside a live 10k session).
-        costliest = max(
-            [len(k) for k in heads]
-            + [len(tokens or ()) for tokens, _f in live]
-            + [len(tokens or ()) for tokens in waiting],
-            default=0,
-        )
+        # Only the MOST RECENTLY USED session keeps its head until the floor
+        # (a running or queued request that extends a head already makes it
+        # NEEDED above). Any other head -- an abandoned session, a finished
+        # side request, the pre-compaction head of a session goose compacted
+        # -- goes before the chunk is reduced, cheapest to re-prefill first.
+        # Review 3 (real Metal, half Gabee scale): a dead 32k head stayed
+        # protected as the "costliest" while a NEW session's chunk was cut
+        # 2048 -> 1968 -> 1784 at 27k; without it the chunk stays 2048.
+        # While a request runs or waits, IT is the most recent session (its
+        # own heads are NEEDED through ``live`` / ``waiting`` above): no other
+        # head is protected. A head the new session handed over must not
+        # leave an abandoned one as "most recent" (the review-3 case).
+        recent = None
+        if not waiting and not [
+            t for t, _f in live if storing is None or t is not storing[0]
+        ]:
+            for key in entries:  # LRU -> MRU
+                if key in heads:
+                    recent = key
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
@@ -6644,15 +6655,10 @@ class Scheduler:
                     and getattr(entry, "message_boundary", False)
                 )
             ):
-                chain_cost = max(
-                    (
-                        len(h)
-                        for h in heads
-                        if h[: len(key)] == key or key[: len(h)] == h
-                    ),
-                    default=len(key),
+                same_session = recent is not None and (
+                    recent[: len(key)] == key or key[: len(recent)] == recent
                 )
-                level = EVICT_NEEDED if chain_cost >= costliest else EVICT_HEAD
+                level = EVICT_NEEDED if same_session else EVICT_HEAD
             cost = int(getattr(entry, "memory_bytes", 0) or 0)
             ranked.append((level, len(key), position, key, cost))
         ranked.sort(key=lambda item: item[:3])
@@ -7577,6 +7583,10 @@ class Scheduler:
         named (one WARNING line) instead of only counted."""
         if getattr(self, "_memory_guard", None) is None:
             return
+        # The previous step ends HERE (its end-of-turn store copies, prompt
+        # snapshot extractions and responses happen after next() returned):
+        # its peak is read now, so it covers the whole step.
+        self._memguard_step_peak_record()
         try:
             bg = self.batch_generator
             prompt_rows = len(getattr(bg, "_prompt_batch", ()) or ()) + len(
@@ -7601,6 +7611,7 @@ class Scheduler:
             self._memguard_step_info = (kind, shape, planned, prompt_rows, gen_rows)
         except Exception:  # noqa: BLE001
             self._memguard_step_info = None
+        self._memguard_step_pending = True
         try:
             self._memguard_process_peak = max(
                 getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
@@ -7616,8 +7627,9 @@ class Scheduler:
         active memory. ``steps_over_ceiling`` counts steps whose peak crossed
         the guard's own ceiling (expected 0)."""
         guard = getattr(self, "_memory_guard", None)
-        if guard is None:
+        if guard is None or not getattr(self, "_memguard_step_pending", False):
             return
+        self._memguard_step_pending = False
         try:
             ceiling = self._memguard_ceiling()
             peak = int(mx.get_peak_memory())
@@ -7705,22 +7717,66 @@ class Scheduler:
         prefix = self._cache_self_pressure_current_bytes()
         base = max(0, active - prefix)
         if not running:
-            # The MINIMUM since the model loaded: an idle moment can still
-            # hold a finished request's KV (its responses / lazy extract
-            # copies outlive the step, more so when its store was skipped).
-            # Real Metal (review 2026-10-14): 35.26 GB recorded vs 30.00 GB
-            # of weights at 80k -> prefix budget 11.76 -> 6.50 GB -> "Cache
-            # entry too large" from 101k and a full re-prefill every turn.
-            if stored > 0:
-                base = min(stored, base)
+            # The MINIMUM of the recent idle measurements: an idle moment can
+            # still hold a finished request's KV (its responses / lazy
+            # extract copies outlive the step, more so when its store was
+            # skipped). Real Metal (review 2026-10-14): 35.26 GB recorded vs
+            # 30.00 GB of weights at 80k -> prefix budget 11.76 -> 6.50 GB.
+            # A window, not "since load": a base that really rose (another
+            # model loaded into this process) is followed once it persists.
+            samples = getattr(self, "_memguard_idle_samples", None)
+            if samples is None:
+                samples = self._memguard_idle_samples = deque(maxlen=OBS_PER_GROUP)
+            samples.append(base)
+            base = min(samples)
             self._memguard_idle_base_bytes = base
         return base
+
+    def _memguard_yield_to_system(self) -> None:
+        """Device-aware is system-aware: the prefix budget is the guard's
+        idle room only while the MACHINE is not under memory pressure. When
+        the kernel reports pressure (other apps, other MLX engines -- goose
+        runs more than one), the cache gives memory back at once, without a
+        fixed share: at WARN every entry except what a live or queued
+        request needs and the most recently used session's head; at
+        CRITICAL all but the last entry. Measured, re-checked whenever the
+        engine goes idle (and by the pressure path every tick it runs)."""
+        from .memory_budget import (
+            SYSTEM_PRESSURE_CRITICAL,
+            SYSTEM_PRESSURE_WARN,
+            system_memory_pressure,
+        )
+
+        level = system_memory_pressure()
+        if level < SYSTEM_PRESSURE_WARN:
+            return
+        guard = self._memguard()
+        max_level = EVICT_NEEDED if level >= SYSTEM_PRESSURE_CRITICAL else EVICT_HEAD
+        evicted = 0
+        while self._memguard_evict_ordered(
+            max_level, keep_last=True, reason="system pressure", count=False
+        ):
+            evicted += 1
+        if evicted:
+            mx.clear_cache()
+            if guard is not None:
+                guard.counts["system_pressure_evictions"] += evicted
+            logger.warning(
+                "[memory_guard] the machine is under memory pressure (kernel "
+                "level %d): gave back %d prefix entr%s",
+                level,
+                evicted,
+                "y" if evicted == 1 else "ies",
+            )
 
     def _memguard_on_idle(self) -> None:
         """The engine just went idle (step thread): re-measure the idle base
         and re-derive the budgets when it moved."""
         if getattr(self, "_memory_guard", None) is None or self.running:
             return
+        # The last step of the turn (and its store) ends with the batch.
+        self._memguard_step_peak_record()
+        self._memguard_yield_to_system()
         base = self._memguard_idle_base()
         applied = int(getattr(self, "_memguard_budget_base", 0) or 0)
         if applied <= 0 or abs(base - applied) > REAPPLY_RATIO * max(1, applied):
@@ -7972,6 +8028,65 @@ class Scheduler:
                 boot_cap / 1e9,
                 room / 1e9,
                 (effective or 0) / 1e9,
+            )
+
+    def _memguard_supersede(self, request: Request, sequence: list[int]) -> None:
+        """After a session's end-of-turn entry is stored, its OLDER entries
+        that the new one strictly extends are dead weight -- the previous
+        turns' end-of-turn and boundary entries. Review 3 (real Metal, 128 GB):
+        idle held 40 GB of cache with the guard vs 29 GB without, mostly
+        superseded entries of the same session. Kept: this turn's message-
+        boundary entry (a non-trimmable cache resumes from it when the next
+        prompt re-renders the reply), any entry another branch also extends
+        (a shared prefix), and anything a live or queued request needs."""
+        if getattr(self, "_memory_guard", None) is None:
+            return
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return
+        key = tuple(sequence)
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        keep = {tuple(request.prompt_token_ids[:boundary])} if boundary > 0 else set()
+        superseded = 0
+        with mac._lock:  # noqa: SLF001
+            if key not in mac._entries:  # noqa: SLF001
+                return
+            levels = {
+                k: level
+                for k, level, _c in self._memguard_ranked_entries(
+                    (sequence, len(sequence)), request.request_id
+                )
+            }
+            keys = list(mac._entries)  # noqa: SLF001
+            for k in keys:
+                if len(k) >= len(key) or key[: len(k)] != k or k in keep:
+                    continue
+                if levels.get(k, EVICT_NEEDED) > EVICT_REDUNDANT:
+                    continue
+                if any(
+                    o != k and o[: len(k)] == k and key[: len(o)] != o for o in keys
+                ):
+                    continue  # another branch extends it: a shared prefix
+                mac._evict_entry_locked(k, reason="superseded")  # noqa: SLF001
+                superseded += 1
+        if superseded:
+            guard = self._memguard()
+            if guard is not None:
+                guard.counts["superseded"] += superseded
+            logger.info(
+                "[memory_guard] %d older entr%s of request %s's session "
+                "superseded by its %d-token entry",
+                superseded,
+                "y" if superseded == 1 else "ies",
+                request.request_id[:12],
+                len(key),
             )
 
     def _memguard_room_for_store(
@@ -9266,6 +9381,9 @@ class Scheduler:
         sustained-pressure scenario still drains the cache within a
         few hundred ms.
         """
+        if getattr(self, "_memory_guard", None) is not None:
+            # The machine's own pressure signal (other apps / engines).
+            self._memguard_yield_to_system()
         metal_cap = self._resolve_metal_cap_bytes()
         cache_self_threshold = self._cache_self_pressure_threshold_bytes()
         # Short-circuit when NEITHER trigger is configured. This keeps
@@ -12247,6 +12365,8 @@ class Scheduler:
                                 handoff=True,
                             )
                             del handed
+                            if stored:
+                                self._memguard_supersede(request, full_token_sequence)
                             _store_dt = _time.monotonic() - _store_t0
                             # NOTE: We intentionally do NOT store a prompt-only
                             # cache entry.  Hybrid Mamba+Transformer models
@@ -12539,8 +12659,6 @@ class Scheduler:
                     else:
                         raw_next = self.batch_generator.next()
                     self._memguard_measure_end(guard_plan, guard_begin)
-                    if dispatch:
-                        self._memguard_step_peak_record()
                     self._srpf_step_end(srpf_step)
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. The barrier fires

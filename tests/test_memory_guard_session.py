@@ -38,7 +38,11 @@ pytestmark = pytest.mark.requires_mlx
 
 import mlx.core as mx  # noqa: E402
 
-from rapid_mlx.memory_guard import MemoryGuard, PeakPrior  # noqa: E402
+from rapid_mlx.memory_guard import (  # noqa: E402
+    MARGIN_CEILING_RATIO,
+    MemoryGuard,
+    PeakPrior,
+)
 from rapid_mlx.request import Request, SamplingParams  # noqa: E402
 from rapid_mlx.scheduler import Scheduler, SchedulerConfig  # noqa: E402
 
@@ -133,9 +137,10 @@ class _Device:
 
     def __init__(self, physical: int, scratch_scale: float = 1.0):
         self.physical = physical
-        # Multiplies the simulated attention scratch: 30 puts a full-context
-        # prefill step at ~3% of Gabee's ceiling at 1/100 (measured live:
-        # 1.72 GB at 1x512x29,184 of a 50.1 GB ceiling).
+        # Multiplies the simulated attention scratch. 600 = the REAL ratio
+        # for the goose 27B: a 2048-token chunk at 116k is ~27.3 GB of
+        # scratch (review 3) -> 273 MB at 1/100, which is what a 64-token
+        # chunk at 8.85k tokens costs here at 600.
         self.scratch_scale = scratch_scale
         self.ooms = 0
         self.fail_next = 0
@@ -165,7 +170,7 @@ class _Device:
         att = 1.6 * b * n * (x**1.15) / 8.0
         return int((att * self.scratch_scale + 700 * b * n + 30 * x + 40_000) * noise)
 
-    def install(self, monkeypatch, scheduler: Scheduler) -> None:
+    def install(self, monkeypatch, scheduler: Scheduler, guard: bool = True) -> None:
         self.scheduler = scheduler
         scheduler._test_device = self
         self._real_active = mx.get_active_memory
@@ -202,13 +207,25 @@ class _Device:
         cap = int(device.physical * 0.97)
         device.ceiling = cap
         scheduler._resolve_metal_cap_bytes = lambda: cap
+        if not guard:
+            # The A/B control arm: lz.10 exactly (RAPID_MLX_MEMORY_GUARD=0).
+            monkeypatch.setenv("RAPID_MLX_MEMORY_GUARD", "0")
+            scheduler._memory_guard = None
+            scheduler._memory_guard_disabled = True
+            return
         # A near-truth prior so these tests pin the eviction / budget /
         # deferral / handoff POLICY, not the calibration (tested separately).
         # The KV growth copy (one layer, mlx-lm KVCache grows by
         # concatenation) is the engine's own analytic term.
         scheduler._memory_guard = MemoryGuard(
             PeakPrior(
-                attention_bytes_per_unit=6.0 * device.scratch_scale,
+                # The simulated scratch costs 0.2 x context**0.15 x scale
+                # bytes per (batch x chunk x context): <= 0.8 x scale up to
+                # 10k tokens. 6.0 (scale 1) is this module's historical,
+                # deliberately loose prior.
+                attention_bytes_per_unit=(
+                    6.0 if device.scratch_scale == 1.0 else 0.8 * device.scratch_scale
+                ),
                 token_bytes=1500.0,
                 kv_copy_bytes_per_context=(
                     scheduler._memguard_prior().kv_copy_bytes_per_context
@@ -701,70 +718,105 @@ SESSION_TOKENS = 8_850
 SIDE_TOKENS = 1_600
 
 
-def _ladder_with_a_subagent(llama, monkeypatch, ceiling: int):
-    device = _Device(physical=int(ceiling / 0.97) + 1, scratch_scale=30.0)
+# The guard's degradations (what a user feels): a reduced chunk, a deferred
+# request, an entry evicted for a dispatch, one given back under device
+# pressure. (A hand-over costs nothing: the KV moves, nothing is lost.)
+DEGRADATIONS = ("chunks_reduced", "deferrals", "evictions")
+
+
+def _one_arm(llama, monkeypatch, ceiling: int, side: int, guard: bool, turns: int):
+    """The session grows (+500 tokens a turn, a side request of ``side``
+    tokens 3 steps into each turn) on a device with this ``ceiling``; the
+    attention scratch at the REAL ratio of the goose 27B. Per turn: the
+    step peak, an error, and the guard's degradations."""
+    device = _Device(physical=int(ceiling / 0.97) + 1, scratch_scale=600.0)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
-    device.install(monkeypatch, scheduler)
-    chunks: list[int] = []
-    real_step = scheduler.step
-
-    def step():
-        out = real_step()
-        bg = scheduler.batch_generator
-        if bg is not None and len(bg._prompt_batch):
-            chunks.append(int(bg.prefill_step_size))
-        return out
-
-    scheduler.step = step
-    turns = (SESSION_TOKENS - 600) // 500 + 1
-    history, _windows = _session_with_side_requests(
-        scheduler, turns=turns, side_tokens=SIDE_TOKENS
-    )
-    assert history[-1][1] >= SESSION_TOKENS - 500
-    for _turn, length, cached in history[1:]:
-        assert length - cached <= 508, history
-    assert device.ooms == 0
-    assert device.max_seen <= device.ceiling
-    return scheduler._memguard().counts, chunks, scheduler
+    device.install(monkeypatch, scheduler, guard=guard)
+    prompt = _new_tokens(0, 600)
+    turns_out = []
+    last: dict[str, int] = {}
+    for turn in range(turns):
+        device.max_seen = 0
+        main = _request(f"main-{turn}", prompt, 4)
+        arrive = (
+            {3: [_request(f"side-{turn}", _side_prompt(turn, side), 8)]} if side else {}
+        )
+        ooms = device.ooms
+        outputs = _drive(scheduler, [main], arrive=arrive)
+        out = outputs[main.request_id][-1]
+        g = scheduler._memguard()
+        counts = {k: g.counts[k] for k in DEGRADATIONS} if g else {}
+        counts["metal_pressure"] = getattr(
+            scheduler, "num_prefix_cache_metal_pressure_evictions", 0
+        )
+        acted = {k: v - last.get(k, 0) for k, v in counts.items() if v > last.get(k, 0)}
+        last = counts
+        turns_out.append(
+            (len(prompt), device.max_seen, bool(out.error) or device.ooms > ooms, acted)
+        )
+        if out.error:
+            break
+        prompt = prompt + _tokens(outputs[main.request_id]) + _new_tokens(turn + 1, 496)
+    return turns_out, device
 
 
 @pytest.mark.parametrize(
-    "ceiling", [M4_MAX_128_CEILING, M3_ULTRA_96_CEILING], ids=["128GB", "96GB"]
+    ("ceiling", "side", "duress"),
+    [
+        (M4_MAX_128_CEILING, 0, False),
+        (M4_MAX_128_CEILING, SIDE_TOKENS, True),
+        (M3_ULTRA_96_CEILING, 0, True),
+        (M3_ULTRA_96_CEILING, SIDE_TOKENS, True),
+        (GABEE_64_CEILING, 0, True),
+        (GABEE_64_CEILING, SIDE_TOKENS, True),
+    ],
+    ids=["128GB", "128GB+side", "96GB", "96GB+side", "64GB", "64GB+side"],
 )
-def test_a_big_mac_never_sees_the_guard_act(llama, monkeypatch, ceiling):
-    """Owner rule: the chunk is reduced only under duress on weaker devices;
-    a Mac with a lot of memory must see none of it. The live ladder (a
-    session growing to 116k + a 21k subagent request every turn) at 128 GB
-    and 96 GB proportions: zero chunk reductions, zero evictions forced by
-    the guard (E1, pressure, store-room, join), zero deferrals, and every
-    prefill dispatch at the engine's normal chunk."""
-    counts, chunks, scheduler = _ladder_with_a_subagent(llama, monkeypatch, ceiling)
-    assert counts["chunks_reduced"] == 0 and counts["chunk_halvings"] == 0
-    assert counts["evictions"] == 0
-    # (The cache keeping to its own budget -- capacity LRU, as without the
-    # guard -- is not device pressure.)
-    assert getattr(scheduler, "num_prefix_cache_metal_pressure_evictions", 0) == 0
-    assert counts["deferrals"] == 0
-    assert counts["admission_handoffs"] == 0
-    assert chunks and set(chunks) == {CHUNK}
+def test_the_guard_acts_only_under_duress(llama, monkeypatch, ceiling, side, duress):
+    """Owner rule: no degradation when there is no duress. Both arms on the
+    SAME workload -- a session growing to "116k" (8.85k tokens at 1/100 of
+    the goose 27B's bytes, 30 GB of weights), alone or with a "21k" side
+    request every turn, the scratch at the real 2048 x 116k ratio:
 
+    * guard OFF (lz.10) measures the duress: the turn its step peak first
+      comes within the guard's own margins of the cap (or crosses / OOMs);
+    * guard ON may degrade (reduce a chunk, defer, evict) only from that
+      turn on -- never while the unguarded engine stays clear of the cap --
+      and never crosses the cap itself.
 
-def test_the_same_ladder_at_64gb_makes_the_guard_act(llama, monkeypatch):
-    # Negative control for the test above: Gabee's proportions. The subagent
-    # cannot join the session's batch here: it waits (and the session still
-    # hits every turn, under the ceiling).
-    counts, _chunks, scheduler = _ladder_with_a_subagent(
-        llama, monkeypatch, GABEE_64_CEILING
+    Measured boundary (sim; real tokens = sim x 13.1 -- 8.85k = 116k):
+    guard-off's peak crosses the cap at 128 GB never to 9.1k alone (766 of
+    1,039 MB), 8.6k with the side request; 96 GB never alone (it comes
+    within the margin, 97.8%, at 9.1k), 5.6k with it; 64 GB 3.6k alone,
+    2.1k with it (an OOM)."""
+    turns = 18
+    with monkeypatch.context() as off_patch:
+        off, _ = _one_arm(llama, off_patch, ceiling, side, guard=False, turns=turns)
+    with monkeypatch.context() as on_patch:
+        on, on_device = _one_arm(
+            llama, on_patch, ceiling, side, guard=True, turns=turns
+        )
+
+    near = (1 - 2 * MARGIN_CEILING_RATIO) * ceiling
+    duress_from = next(
+        (i for i, (_n, peak, failed, _a) in enumerate(off) if failed or peak > near),
+        None,
     )
-    acted = (
-        counts["deferrals"]
-        + counts["evictions"]
-        + counts["chunks_reduced"]
-        + counts["admission_handoffs"]
-        + scheduler.num_prefix_cache_pressure_evictions
-    )
-    assert acted > 0
-    assert counts["evictions_then_deferred"] == 0
+    for turn, (length, _peak, failed, acted) in enumerate(on):
+        assert not failed, (turn, length)
+        if acted:
+            assert duress_from is not None and turn >= duress_from, (
+                turn,
+                length,
+                acted,
+                duress_from,
+            )
+    assert on_device.max_seen <= on_device.ceiling
+    if duress:
+        assert duress_from is not None
+    else:
+        assert duress_from is None
+        assert not any(acted for *_x, acted in on)
 
 
 def test_a_handed_over_admission_is_handed_over_once(llama, monkeypatch):
@@ -810,3 +862,98 @@ def test_a_handed_over_admission_is_handed_over_once(llama, monkeypatch):
     status = scheduler.get_stats()["memory_guard"]
     assert status["steps_over_ceiling"] == 0
     assert device.max_seen <= device.ceiling
+
+
+def test_an_abandoned_session_head_goes_before_a_new_session_slows(llama, monkeypatch):
+    """Review 3 (real Metal, half Gabee scale): an abandoned 32k session's
+    head stayed protected as the "costliest" while a NEW session's chunk was
+    cut 2048 -> 1968 -> 1784 at 27k (control without it: 2048). That is
+    exactly goose compaction: the pre-compaction head is never continued.
+    Only the most recently used session (or one a running / queued request
+    extends) keeps its head until the floor; an abandoned head goes before
+    any chunk is reduced."""
+    device = _Device(physical=GABEE_PHYSICAL, scratch_scale=600.0)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, scheduler)
+    abandoned = _side_prompt(99, 6000)
+    _drive(scheduler, [_request("abandoned", abandoned, 4)])
+    mac = scheduler.memory_aware_cache
+    heads = [k for k in mac._entries if k[: len(abandoned)] == tuple(abandoned)]
+    assert heads
+
+    guard = scheduler._memguard()
+    reduced_while_abandoned_kept = 0
+    real_step = scheduler.step
+
+    def step():
+        before = guard.counts["chunks_reduced"]
+        out = real_step()
+        if guard.counts["chunks_reduced"] > before and any(
+            k[: len(abandoned)] == tuple(abandoned) for k in mac._entries
+        ):
+            nonlocal reduced_while_abandoned_kept
+            reduced_while_abandoned_kept += 1
+        return out
+
+    scheduler.step = step
+    prompt = _new_tokens(0, 600)
+    for turn in range(10):
+        outs = _drive(scheduler, [_request(f"new-{turn}", prompt, 4)])[f"new-{turn}"]
+        assert not outs[-1].error
+        prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, 496)
+    assert reduced_while_abandoned_kept == 0
+    assert device.max_seen <= device.ceiling
+
+
+def test_a_session_keeps_only_its_newest_entries(llama, monkeypatch):
+    """Review 3 (real Metal, 128 GB): with the guard the idle cache held 40
+    GB vs 29 GB without, mostly OLDER entries of the same session that its
+    newest entry strictly extends (dead weight). After every end-of-turn
+    store they are superseded; the newest entry still serves the next turn.
+    RED on 4ac506f7d: every turn's entries accumulate."""
+    device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, scheduler)
+    history, _windows = _session(scheduler, delta=500, native=65536)
+    history = history[:12] if len(history) > 12 else history
+    newest = max(scheduler.memory_aware_cache._entries, key=len)
+    dead = [
+        k
+        for k in scheduler.memory_aware_cache._entries
+        if k != newest and newest[: len(k)] == k
+    ]
+    assert dead == []
+    assert scheduler._memguard().counts["superseded"] > 0
+    for _turn, length, cached in history[1:]:
+        assert length - cached <= 508
+
+
+def _two_sessions(llama, monkeypatch):
+    device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, scheduler)
+    _drive(scheduler, [_request("a", _new_tokens(1, 900), 4)])
+    _drive(scheduler, [_request("b", _side_prompt(2, 900), 4)])
+    return scheduler
+
+
+@pytest.mark.parametrize(("level", "left"), [(1, 2), (2, 1), (4, 1)])
+def test_the_cache_yields_to_machine_memory_pressure(llama, monkeypatch, level, left):
+    """Device-aware is system-aware: other apps and other MLX engines show
+    up as the kernel's memory-pressure level. NORMAL (1): nothing given
+    back (control). WARN (2): everything but the most recently used
+    session's head. CRITICAL (4): all but the last entry."""
+    import rapid_mlx.memory_budget as memory_budget
+
+    scheduler = _two_sessions(llama, monkeypatch)
+    mac = scheduler.memory_aware_cache
+    sessions = {key[0] for key in mac._entries}
+    assert len(sessions) == 2
+    monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: level)
+    scheduler._memguard_yield_to_system()
+    assert len({key[0] for key in mac._entries}) == left
+    if left == 1:
+        assert {key[0] for key in mac._entries} == {_side_prompt(2, 1)[0]}
+        assert scheduler._memguard().counts["system_pressure_evictions"] > 0
+    else:
+        assert scheduler._memguard().counts["system_pressure_evictions"] == 0
