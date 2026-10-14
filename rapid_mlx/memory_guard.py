@@ -552,6 +552,13 @@ class MemoryGuard:
             "calibrations": 0,
             "deferrals": 0,
             "store_skips": 0,
+            # Of which end-of-turn (prompt + output) entries: the one a
+            # session's next turn fetches. Mid-turn prompt/boundary entries
+            # are skipped first under pressure, by design.
+            "turn_store_skips": 0,
+            # Prefix entries handed over to the request admitted from them
+            # (no copy-on-admit) because the copy did not fit.
+            "admission_handoffs": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0

@@ -1783,6 +1783,47 @@ def own_cache_bytes(cache: list[Any]) -> list[Any]:
     return cache
 
 
+def hand_over_cache_bytes(cache: list[Any]) -> list[Any]:
+    """Make a FINISHED request's cache an entry that owns exactly its bytes,
+    one layer at a time, releasing each source layer as its copy lands.
+
+    The memory guard's end-of-turn handoff (LeanZero fork). At finish mlx-lm
+    hands the row over as offset-trimmed copies that are still LAZY (they
+    reference the live KV buffers: ``_copy_exact_layer`` /
+    ``BatchKVCache.extract``). :func:`own_cache_bytes` evaluates every layer
+    at once, so the whole new copy and the whole live KV coexist: 2x the
+    session at its largest moment (Gabee Q8: store_skips from 87k, then 0
+    entries and a 115k re-prefill). Here each layer is trimmed and made owned
+    IN PLACE (the request is done; nobody else writes these objects) and
+    evaluated before the next, so a source layer's buffer is freed as soon as
+    its copy exists: the peak is the session plus ONE layer. Q-110's
+    invariant holds unchanged (every stored array is an exact contiguous
+    copy, charged by shape).
+
+    For a B=1 request (the singleton fast path) the source buffers die with
+    their lazy copies. For a row of a batch still running, the batch buffer
+    stays alive for the other rows anyway; this is then exactly the old
+    copy, one layer at a time. Mutates and returns ``cache``.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    for index, layer in enumerate(cache):
+        if (
+            isinstance(layer, KVCache)
+            and layer.keys is not None
+            and 0 < layer.offset < layer.keys.shape[2]
+        ):
+            layer.keys = layer.keys[:, :, : layer.offset, :]
+            layer.values = layer.values[:, :, : layer.offset, :]
+        owned: list[Any] = []
+        _own_layer(layer, owned)
+        if owned:
+            mx.eval(owned)
+        cache[index] = layer
+    return cache
+
+
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
@@ -2402,9 +2443,15 @@ class MemoryAwarePrefixCache:
         evict_prefixes: bool = True,
         *,
         message_boundary: bool = False,
+        handoff: bool = False,
     ) -> bool:
         """
         Store KV cache for future reuse.
+
+        ``handoff=True`` (memory guard): ``cache`` belongs to a FINISHED
+        request; it is made owned layer by layer in place
+        (:func:`hand_over_cache_bytes`) so the store never holds two copies
+        of the session.
 
         This method stores the cache reference directly (no copy) and
         tracks memory usage. If memory limit is exceeded, LRU entries
@@ -2480,7 +2527,10 @@ class MemoryAwarePrefixCache:
 
         # Trim oversized KV arrays to actual used size (pure compute, no shared
         # state — kept outside the lock so concurrent fetch isn't blocked).
-        cache = own_cache_bytes(_trim_to_offset(cache))
+        if handoff:
+            cache = hand_over_cache_bytes(cache)
+        else:
+            cache = own_cache_bytes(_trim_to_offset(cache))
 
         # Compress cache for storage (TurboQuant or standard quantization)
         if (

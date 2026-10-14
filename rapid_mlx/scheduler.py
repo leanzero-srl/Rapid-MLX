@@ -6508,6 +6508,7 @@ class Scheduler:
         *,
         keep_last: bool = False,
         storing: tuple[Any, int] | None = None,
+        finished: str | None = None,
         reason: str = "memory_guard",
         count: bool = True,
     ) -> bool:
@@ -6516,8 +6517,10 @@ class Scheduler:
         the LOWEST eviction level present, if that level is <= ``max_level``.
         ``keep_last`` never takes the last entry. ``storing`` is the
         ``(tokens, fetched)`` of a request whose entry is being stored (it is
-        live for classification even if it already left ``running``).
-        Non-memory-aware caches fall back to their own LRU."""
+        live for classification even if it already left ``running``);
+        ``finished`` names a request still in ``running`` whose turn is over
+        (its ``storing`` tuple replaces its live one). Non-memory-aware
+        caches fall back to their own LRU."""
         mac = getattr(self, "memory_aware_cache", None)
         if mac is None:
             # Legacy / paged variants (not the text lane's cache): their own
@@ -6529,6 +6532,7 @@ class Scheduler:
             live: list[tuple[Any, int]] = [
                 (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
                 for r in list(getattr(self, "running", {}).values())
+                if finished is None or r.request_id != finished
             ]
             if storing is not None:
                 live.append(storing)
@@ -7183,7 +7187,14 @@ class Scheduler:
                 (effective or 0) / 1e9,
             )
 
-    def _memguard_room_for_store(self, request: Request | None, cache: Any) -> bool:
+    def _memguard_room_for_store(
+        self,
+        request: Request | None,
+        cache: Any,
+        *,
+        handoff: bool = False,
+        turn_end: bool = False,
+    ) -> bool:
         """Before a prefix entry is copied in (E3 store-time): the copy must
         fit beside everything resident now. Make room with the ONE eviction
         policy up to the redundant level (never an entry a live session still
@@ -7198,12 +7209,33 @@ class Scheduler:
         try:
             from .memory_cache import estimate_kv_cache_memory
 
-            need = int(estimate_kv_cache_memory(cache))
+            if handoff:
+                # Layer-by-layer takeover of a finished request's cache whose
+                # source buffers die as each copy lands: one layer of room.
+                need = max(
+                    (int(estimate_kv_cache_memory([layer])) for layer in cache),
+                    default=0,
+                )
+            else:
+                need = int(estimate_kv_cache_memory(cache))
         except Exception:  # noqa: BLE001
             return True
         margin = int(MARGIN_CEILING_RATIO * ceiling)
         storing = None
-        if request is not None:
+        finished = None
+        if request is not None and turn_end:
+            # The turn is over: the request can no longer be requeued to
+            # re-fetch, and the entry being stored covers everything it
+            # holds. Its own shorter entries (this turn's prompt/boundary
+            # snapshots, the entry it fetched) are REDUNDANT now, so the
+            # end-of-turn entry -- the one the next turn needs -- wins the
+            # room over them.
+            sequence = list(request.prompt_token_ids) + list(
+                getattr(request, "output_token_ids", ()) or ()
+            )
+            storing = (sequence, len(sequence))
+            finished = request.request_id
+        elif request is not None:
             storing = (
                 request.prompt_token_ids,
                 int(getattr(request, "cached_tokens", 0) or 0),
@@ -7211,7 +7243,10 @@ class Scheduler:
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - need - margin)
         while footprint + need + margin > ceiling:
             if not self._memguard_evict_ordered(
-                EVICT_REDUNDANT, storing=storing, reason="store-room"
+                EVICT_REDUNDANT,
+                storing=storing,
+                finished=finished,
+                reason="store-room",
             ):
                 break
             mx.clear_cache()
@@ -7219,6 +7254,8 @@ class Scheduler:
         if footprint + need + margin <= ceiling:
             return True
         guard.counts["store_skips"] += 1
+        if turn_end:
+            guard.counts["turn_store_skips"] += 1
         logger.warning(
             "[memory_guard] skipped storing a %.2fGB prefix entry: resident "
             "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB",
@@ -11359,13 +11396,31 @@ class Scheduler:
                             import time as _time
 
                             _store_t0 = _time.monotonic()
+                            # Memory guard: the end-of-turn entry TAKES OVER
+                            # the finished request's KV layer by layer (the
+                            # request lets go of it first), so the store never
+                            # holds two copies of the session. With no other
+                            # row left in the generation batch the source
+                            # buffers die as each layer's copy lands: the room
+                            # needed is one layer, not the whole entry.
+                            handed = request._extracted_cache
+                            request._extracted_cache = None
+                            gen = getattr(
+                                self.batch_generator, "_generation_batch", None
+                            )
+                            try:
+                                solo = gen is None or len(gen) == 0
+                            except TypeError:
+                                solo = False
                             stored = self._memguard_room_for_store(
-                                request, request._extracted_cache
+                                request, handed, handoff=solo, turn_end=True
                             ) and self.memory_aware_cache.store(
                                 full_token_sequence,
-                                request._extracted_cache,
+                                handed,
                                 evict_prefixes=False,
+                                handoff=True,
                             )
+                            del handed
                             _store_dt = _time.monotonic() - _store_t0
                             # NOTE: We intentionally do NOT store a prompt-only
                             # cache entry.  Hybrid Mamba+Transformer models
@@ -11714,6 +11769,11 @@ class Scheduler:
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
+                    # mlx-lm's responses carry the finished rows' caches; drop
+                    # them now so a skipped store frees the session at once
+                    # (not at the end of the step, after the idle re-measure).
+                    responses = None
+                    raw_next = None
 
                 # #558 PR-3: reconcile grammar processors when idle. The realign
                 # guard (which scrubs leaked slots AND flushes tombstones) only
