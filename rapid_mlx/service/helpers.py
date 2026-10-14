@@ -60,6 +60,7 @@ from ..api.utils import (
 from ..config import get_config
 from ..engine import BaseEngine, GenerationOutput
 from ..errors import BackpressureError
+from ..tool_call_scan import warn_undeclared_call
 from ..tool_parsers import ToolParserManager
 from ..utils.chat_template import (
     detect_native_reasoning_effort_levels,
@@ -3231,10 +3232,27 @@ def _run_tool_parser(
             return output_text or "", None
 
     if structured_tool_calls:
-        if declared is not None and any(
-            tc.get("name") not in declared for tc in structured_tool_calls
-        ):
-            return output_text or "", None
+        undeclared = (
+            [
+                tc.get("name")
+                for tc in structured_tool_calls
+                if tc.get("name") not in declared
+            ]
+            if declared is not None
+            else []
+        )
+        if undeclared:
+            # Same rule as the qwen3_coder_xml text parser
+            # (``Qwen3CoderToolParser._may_surface_undeclared``): a call to a
+            # name the request did not offer goes to the client, which answers
+            # it with "tool not found", rather than vanishing into text. A
+            # structured channel has no nesting to disambiguate. A NAMED
+            # tool_choice is a contract about which call may appear, so there
+            # the old refusal stands.
+            if isinstance(request_dict.get("tool_choice"), dict):
+                return output_text or "", None
+            for name in undeclared:
+                warn_undeclared_call(str(name), declared, "structured tool channel")
         tool_calls = [
             ToolCall(
                 id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -3307,9 +3325,12 @@ def _run_tool_parser(
             return result.content or "", tool_calls
         else:
             if cfg.tool_call_parser == "qwen3_coder_xml":
-                # The Qwen parser made an authoritative declared-name decision.
-                # Falling through to the generic parser would re-promote the
-                # exact undeclared/tool_choice=none span it rejected.
+                # The Qwen parser made an authoritative declared-name decision
+                # (it already surfaces canonical undeclared calls; what it
+                # refused is tool_choice=none, an off-choice name under a
+                # named tool_choice, or an unwrapped/unclosed undeclared
+                # span). Falling through to the generic parser would
+                # re-promote exactly that span.
                 return result.content or "", None
             return parse_tool_calls(output_text, request_dict)
     except Exception as e:
