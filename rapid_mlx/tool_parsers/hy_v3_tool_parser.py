@@ -78,6 +78,7 @@ from typing import Any
 
 from transformers import PreTrainedTokenizerBase
 
+from ..tool_call_scan import inside_code, may_surface_undeclared, warn_undeclared_call
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -331,6 +332,27 @@ class HyV3ToolParser(ToolParser):
             if isinstance(t, dict)
         }
 
+    def _refuses(
+        self, name: str, request: dict[str, Any] | None, text: str, opener: int
+    ) -> bool:
+        """Whether a call to ``name`` at ``opener`` stays off the wire.
+
+        A name the request did not offer is the model's mistake, and the
+        client is the one that answers it ("tool not found") so the model can
+        recover — the rule every XML path applies since 26452cbe3 (review
+        item 4). Suppressing it here sent NOTHING: the stream went silent and
+        an agent saw an empty final answer. It is still refused under
+        ``tool_choice`` none or a named choice, and when the call sits inside
+        markdown code (the model SHOWING the format).
+        """
+        valid_names = self._get_tool_names(request)
+        if not valid_names or name in valid_names:
+            return False
+        if may_surface_undeclared(request) and not inside_code(text, opener):
+            warn_undeclared_call(name, valid_names, "hy_v3")
+            return False
+        return True
+
     def _opener_positions(self, text: str) -> list[int]:
         """Byte offsets of every GENUINE ``<tool_call>`` call-start in ``text``.
 
@@ -478,7 +500,6 @@ class HyV3ToolParser(ToolParser):
             # the early return otherwise made this branch unreachable).
             return self._text_format_or_content(model_output, request)
 
-        valid_names = self._get_tool_names(request)
         tool_calls: list[dict[str, Any]] = []
         residual_parts: list[str] = []
         cursor = 0
@@ -493,7 +514,7 @@ class HyV3ToolParser(ToolParser):
             if not name:
                 cursor = block_end
                 continue
-            if valid_names and name not in valid_names:
+            if self._refuses(name, request, model_output, block_start):
                 # Preserve the rejected span in residual text so a request
                 # with a ``tools`` allowlist + a hallucinated off-list name
                 # surfaces the attempted call rather than a silent empty
@@ -953,7 +974,9 @@ class HyV3ToolParser(ToolParser):
                 # / ``_find_call_close_in_body`` fixes). Keep buffering until a
                 # real close lands outside every value span.
                 if self._end_token_outside_arg_value(buffer) != -1:
-                    return self._emit_sepless_closed_call(buffer, idx, request)
+                    return self._emit_sepless_closed_call(
+                        buffer, idx, request, current_text, opener_pos
+                    )
                 if idx + 1 < len(opener_positions):
                     # No sep and no close in this block, but a LATER opener
                     # exists (codex R11 BLOCKING): this opener is garbled
@@ -969,8 +992,7 @@ class HyV3ToolParser(ToolParser):
             name = buffer[:sep_idx].strip()
             if not name:
                 return None
-            valid_names = self._get_tool_names(request)
-            suppressed = bool(valid_names) and name not in valid_names
+            suppressed = self._refuses(name, request, current_text, opener_pos)
             self.current_tool_id = idx
             self._name_sent = True
             if idx >= len(self.streamed_args_for_tool):
@@ -1055,7 +1077,12 @@ class HyV3ToolParser(ToolParser):
         return deltas, closed
 
     def _emit_sepless_closed_call(
-        self, buffer: str, idx: int, request: dict[str, Any] | None
+        self,
+        buffer: str,
+        idx: int,
+        request: dict[str, Any] | None,
+        text: str = "",
+        opener: int = 0,
     ) -> tuple[list[dict[str, Any]], bool]:
         """Emit a SEP-LESS closed call (no ``<tool_sep>`` in the body).
 
@@ -1087,8 +1114,7 @@ class HyV3ToolParser(ToolParser):
 
         deltas: list[dict[str, Any]] = []
         if name:
-            valid_names = self._get_tool_names(request)
-            suppressed = bool(valid_names) and name not in valid_names
+            suppressed = self._refuses(name, request, text, opener)
             if not suppressed:
                 final_args = json.dumps(args, ensure_ascii=False)
                 if idx < len(self.streamed_args_for_tool):

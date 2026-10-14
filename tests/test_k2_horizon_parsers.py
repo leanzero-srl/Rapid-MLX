@@ -292,7 +292,6 @@ def test_json_string_may_contain_ifm_closing_delimiters():
     [
         "<ifm|tool_calls><ifm|tool_call>ping",
         _group("junk"),
-        _group(_xml_call("unknown")),
         _group(_xml_call("lookup", (("limit", "2"),), typed=True)),
     ],
 )
@@ -302,23 +301,49 @@ def test_malformed_or_mismatched_calls_fail_closed_as_content(output):
     assert result.content == output
 
 
+# An UNKNOWN name is no longer malformed: a well-formed call to a tool the
+# request did not offer reaches the client, which answers it with "tool not
+# found" (review of 26452cbe3, item 4; tests/
+# test_tool_call_undeclared_other_parsers.py). A contract still refuses it.
+UNKNOWN_CALL = _group(_xml_call("unknown"))
+# Malformed for the default xml envelope: a typed argument it does not allow.
+MALFORMED_CALL = _group(_xml_call("lookup", (("limit", "2"),), typed=True))
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    ["none", {"type": "function", "function": {"name": "lookup"}}],
+    ids=["none", "named"],
+)
+def test_an_unknown_name_under_a_tool_choice_contract_is_not_a_call(tool_choice):
+    result = K2HorizonToolParser().extract_tool_calls(
+        UNKNOWN_CALL, _request(tool_choice=tool_choice)
+    )
+    assert not result.tools_called
+
+
+def test_an_unknown_name_is_a_call_by_default():
+    result = K2HorizonToolParser().extract_tool_calls(UNKNOWN_CALL, _request())
+    assert [call["name"] for call in result.tool_calls] == ["unknown"]
+
+
 def test_malformed_call_never_exposes_prompt_primed_reasoning():
-    output = "private plan</ifm|think>" + _group(_xml_call("unknown"))
+    output = "private plan</ifm|think>" + MALFORMED_CALL
     result = K2HorizonToolParser().extract_tool_calls(output, _request())
     assert not result.tools_called
-    assert result.content == _group(_xml_call("unknown"))
+    assert result.content == MALFORMED_CALL
 
 
 def test_streaming_malformed_call_never_exposes_prompt_primed_reasoning():
     parser = K2HorizonToolParser()
-    output = "private plan</ifm|think>" + _group(_xml_call("unknown"))
+    output = "private plan</ifm|think>" + MALFORMED_CALL
     delta = parser.extract_tool_calls_streaming("", output, output, request=_request())
-    assert delta == {"content": _group(_xml_call("unknown"))}
+    assert delta == {"content": MALFORMED_CALL}
 
 
 def test_streaming_malformed_group_does_not_strand_later_visible_text():
     parser = K2HorizonToolParser()
-    malformed = _group(_xml_call("unknown"))
+    malformed = MALFORMED_CALL
     first = parser.extract_tool_calls_streaming(
         "", malformed, malformed, request=_request()
     )
