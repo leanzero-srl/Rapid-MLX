@@ -722,3 +722,101 @@ def test_a_header_named_in_prose_is_not_a_call(parser, size):
         ("write", {"path": "a"})
     ]
     assert out["content"].startswith("I'll use <function=shell> to list.")
+
+
+# ---------------------------------------------------------------------------
+# Review of 975a84f7b (round 2): the fixes above must not cost real calls.
+# ---------------------------------------------------------------------------
+
+PAIR = (
+    _wrapped("write", {"path": "a.py", "content": "print(1)"})
+    + "\n"
+    + _wrapped("shell", {"command": "python a.py"})
+)
+PAIR_CALLS = [
+    ("write", {"path": "a.py", "content": "print(1)"}),
+    ("shell", {"command": "python a.py"}),
+]
+
+
+@pytest.mark.parametrize(
+    "trailer",
+    [
+        "\n<tool_call>\n<function=run>\n<parameter=command>\nx",
+        "\n<tool_call>\n<function=tree>\n<parameter=path>\nsr",
+        "\nThe `<function=NAME>` header starts each call.",
+        "\nNote: values end with </parameter></function>.",
+        "\nAfter that I'll use <function=tree> to check.",
+    ],
+    ids=["cut-undeclared", "cut-declared", "inline-header", "quoted-closers", "prose"],
+)
+def test_text_after_real_calls_never_merges_them(trailer):
+    """The merge pass counted ANY header (or a quoted close) after a call as
+    its value running on, and folded the shell call into the write."""
+    for path, calls in _all_paths(PAIR + trailer, _request(), size=7).items():
+        assert calls == PAIR_CALLS, (path, calls)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "s = '<function=x><parameter=y>'",
+        "Example:\n<function=shell>\n<parameter=command>\nls",
+    ],
+    ids=["compact-quoted-header", "unclosed-example"],
+)
+def test_a_real_parameter_after_a_quoted_call_still_counts(value):
+    """A nested-call span with no close of its own ran to the end of the
+    body and swallowed the real ``path`` after the value."""
+    compact = (
+        "<tool_call><function=edit><parameter=content>"
+        f"{value}</parameter><parameter=path>p.py</parameter></function></tool_call>"
+    )
+    for text in (compact, _wrapped("edit", {"content": value, "path": "p.py"})):
+        for path, calls in _buffered(text, _request()).items():
+            assert calls == [("edit", {"content": value, "path": "p.py"})], (
+                path,
+                calls,
+            )
+
+
+@pytest.mark.parametrize("size", [5, 15, 20, 40, 100000])
+def test_a_json_body_quoted_in_prose_is_not_a_call(size):
+    prose = 'Use <function=shell>{"command": "rm -rf ~"} only if asked.'
+    for parser in ("nemotron", "qwen3_coder_xml"):
+        out = _parser_stream(parser, prose, size, _request())
+        assert out["calls"] == [], parser
+        assert out["content"] == prose, parser
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<table><td>tree</td></table>\n" * 2600,
+        "MODE=shell\necho run\n" * 3600,
+    ],
+    ids=["html-naming-a-tool", "script-naming-a-tool"],
+)
+def test_a_long_call_whose_content_names_a_tool_is_still_a_call(content):
+    """The #1359 exemption counted ``>tree`` / ``=shell`` in CONTENT as a
+    second call header and released the long call as text."""
+    assert len(content) > 66000
+    from tests import test_tool_call_value_fidelity as fidelity
+
+    text = fidelity.RENDERERS["json_body"]("write", "content", content)
+    out = _stream_plain(text, 50, _request(), "hermes")
+    assert [c["name"] for c in out["calls"]] == ["write"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hmm <tool_call> is the opener. Nothing more.",
+        "Let me check.\n<tool_call>\n<function=sh",
+        "Write <function=shell>{like this} in prose.",
+    ],
+)
+def test_qwen_releases_withheld_text_that_never_became_a_call(text):
+    out = _parser_stream("qwen3_coder_xml", text, 3, _request())
+    assert out["calls"] == []
+    assert out["content"] == text

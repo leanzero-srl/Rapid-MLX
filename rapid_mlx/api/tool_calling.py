@@ -550,6 +550,7 @@ def parse_tool_calls(
         valid_names=declared_tools,
         surface_undeclared=True,
         header=r"<function=([^>]+)>",
+        wrapper_pair=("<tool_call>", "</tool_call>"),
     )
     if not nemotron_matches:
         call_format = "<toolcall>"
