@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..api.tool_calling import _coerce_schema_value, validate_json_schema
+from ..tool_call_scan import inside_code, may_surface_undeclared, warn_undeclared_call
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -101,12 +102,23 @@ class K2HorizonToolParser(ToolParser):
         return function.get("name") if isinstance(function, dict) else None
 
     @classmethod
-    def _validate_name(cls, name: Any, request: dict[str, Any] | None) -> str:
+    def _validate_name(
+        cls, name: Any, request: dict[str, Any] | None, surface_undeclared: bool
+    ) -> str:
         if not isinstance(name, str) or not name or any(ch.isspace() for ch in name):
             raise ValueError("invalid IFM tool name")
         declared = cls._declared_tools(request)
         if name not in declared:
-            raise ValueError("unknown IFM tool name")
+            # A well-formed call to a name the request did not offer reaches
+            # the client, which answers it with "tool not found" (the rule
+            # every XML path applies since 26452cbe3; review item 4). Failing
+            # the group closed turned it into text and ended an agent's turn.
+            # Still refused under ``tool_choice`` none / a named choice, and
+            # for a group inside markdown code (``surface_undeclared``). With
+            # no schema to hold it to, its arguments pass as written.
+            if not surface_undeclared:
+                raise ValueError("unknown IFM tool name")
+            warn_undeclared_call(name, set(declared), "k2_horizon")
         named = cls._named_choice(request)
         if named is not None and name != named:
             raise ValueError("unexpected IFM tool name")
@@ -151,7 +163,11 @@ class K2HorizonToolParser(ToolParser):
 
     @classmethod
     def _parse_call(
-        cls, body: str, request: dict[str, Any] | None, wire_format: str
+        cls,
+        body: str,
+        request: dict[str, Any] | None,
+        wire_format: str,
+        surface_undeclared: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         if wire_format == "json":
             payload = json.loads(body.strip())
@@ -160,7 +176,7 @@ class K2HorizonToolParser(ToolParser):
             json_arguments = payload.get("arguments", {})
             if not isinstance(json_arguments, dict):
                 raise ValueError("invalid IFM JSON call")
-            name = cls._validate_name(payload.get("name"), request)
+            name = cls._validate_name(payload.get("name"), request, surface_undeclared)
             props = cls._properties(name, request)
             coerced = {
                 key: _coerce_schema_value(value, props.get(key))
@@ -171,11 +187,11 @@ class K2HorizonToolParser(ToolParser):
 
         first_arg = body.find(cls.ARG_KEY_START)
         if first_arg < 0:
-            name = cls._validate_name(body.strip(), request)
+            name = cls._validate_name(body.strip(), request, surface_undeclared)
             empty_arguments: dict[str, Any] = {}
             cls._validate_argument_contract(name, empty_arguments, request)
             return name, empty_arguments
-        name = cls._validate_name(body[:first_arg].strip(), request)
+        name = cls._validate_name(body[:first_arg].strip(), request, surface_undeclared)
         props = cls._properties(name, request)
         xml_arguments: dict[str, Any] = {}
         cursor = first_arg
@@ -216,7 +232,10 @@ class K2HorizonToolParser(ToolParser):
 
     @classmethod
     def _parse_group(
-        cls, group: str, request: dict[str, Any] | None
+        cls,
+        group: str,
+        request: dict[str, Any] | None,
+        surface_undeclared: bool = False,
     ) -> list[dict[str, Any]]:
         inner = group[len(cls.GROUP_START) : -len(cls.GROUP_END)]
         wire_format = cls._tool_format(request)
@@ -250,7 +269,9 @@ class K2HorizonToolParser(ToolParser):
             raise ValueError("malformed IFM tool-call group")
         calls = []
         for body in bodies:
-            name, arguments = cls._parse_call(body, request, wire_format)
+            name, arguments = cls._parse_call(
+                body, request, wire_format, surface_undeclared
+            )
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex}",
@@ -436,7 +457,14 @@ class K2HorizonToolParser(ToolParser):
                     False, [], self._visible_prefix(model_output)
                 )
             try:
-                calls.extend(self._parse_group(model_output[cursor:end], request))
+                calls.extend(
+                    self._parse_group(
+                        model_output[cursor:end],
+                        request,
+                        may_surface_undeclared(request)
+                        and not inside_code(model_output, cursor),
+                    )
+                )
             except (json.JSONDecodeError, TypeError, ValueError):
                 if suppress_calls:
                     content = self._without_tool_groups(model_output)
@@ -557,7 +585,14 @@ class K2HorizonToolParser(ToolParser):
                 break
             self._pending_tool_start = None
             try:
-                calls.extend(self._parse_group(current_text[cursor:group_end], request))
+                calls.extend(
+                    self._parse_group(
+                        current_text[cursor:group_end],
+                        request,
+                        may_surface_undeclared(request)
+                        and not inside_code(current_text, cursor),
+                    )
+                )
             except (json.JSONDecodeError, TypeError, ValueError):
                 # A complete but invalid envelope is deliberately surfaced as
                 # content. Latch the same consumed/content-visible state as a
@@ -628,6 +663,20 @@ class K2HorizonToolParser(ToolParser):
                 for index, call in enumerate(calls)
             ],
         }
+
+    def holds_call_in_progress(
+        self, text: str, request: dict[str, Any] | None = None
+    ) -> bool:
+        """An open native group is a call being written (the postprocessor's
+        #1359 budget must not release it): its envelope is special tokens,
+        and its name may reach the client unless a contract refuses it."""
+        start = text.rfind(self.GROUP_START)
+        if start < 0 or self.GROUP_END in text[start:] or inside_code(text, start):
+            return False
+        return (
+            bool(self._declared_tools(request))
+            and self._request_value(request, "tool_choice") != "none"
+        )
 
     def has_pending_tool_call(self, text: str) -> bool:
         start = text.rfind(self.GROUP_START)

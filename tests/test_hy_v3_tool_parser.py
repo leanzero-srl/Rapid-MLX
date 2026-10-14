@@ -493,7 +493,14 @@ def test_tool_name_filter_via_request_tools():
         "<tool_call:opensource>bogus_tool<tool_sep:opensource>"
         '{"x": 1}<end_of_tool_call:opensource>'
     )
-    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"function": {"name": "allowed_tool"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed_tool"}},
+    }
     res = parser.extract_tool_calls(out, request=request)
     assert res.tools_called is False
     assert res.tool_calls == []
@@ -509,7 +516,14 @@ def test_valid_names_filter_preserves_rejected_span_in_content():
         "<tool_call:opensource>bogus_tool<tool_sep:opensource>"
         '{"x": 1}<end_of_tool_call:opensource>'
     )
-    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"function": {"name": "allowed_tool"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed_tool"}},
+    }
     res = parser.extract_tool_calls(out, request=request)
     assert res.tools_called is False
     assert res.tool_calls == []
@@ -530,7 +544,14 @@ def test_valid_names_filter_preserves_mixed_valid_and_rejected():
         '<tool_call:opensource>bogus_tool<tool_sep:opensource>{"x": 1}'
         "<end_of_tool_call:opensource>"
     )
-    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"function": {"name": "allowed_tool"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed_tool"}},
+    }
     res = parser.extract_tool_calls(out, request=request)
     assert res.tools_called is True
     assert len(res.tool_calls) == 1
@@ -893,7 +914,14 @@ def test_streaming_respects_request_tool_allowlist():
     hallucinated off-list name emits NEITHER a header NOR argument deltas
     (codex R4 NIT: a name-only assertion would pass even if args leaked)."""
     parser = HyV3ToolParser()
-    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"function": {"name": "allowed_tool"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed_tool"}},
+    }
     chunks = [
         "<tool_call:opensource>",
         "hallucinated_tool",
@@ -915,7 +943,14 @@ def test_streaming_off_list_call_in_one_delta_emits_no_args():
     close together) must still emit NO argument delta — the same-delta path is
     the exact scenario codex R4 BLOCKING #3 raised for the args leak."""
     parser = HyV3ToolParser()
-    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"function": {"name": "allowed_tool"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed_tool"}},
+    }
     one_delta = (
         "<tool_call:opensource>hallucinated<tool_sep:opensource>"
         '{"leak": "me"}<end_of_tool_call:opensource>'
@@ -1176,7 +1211,14 @@ def test_streaming_sepless_call_respects_request_allowlist():
     emit a tool_call (the drain path applies the same suppression as the JSON
     path)."""
     parser = HyV3ToolParser()
-    request = {"tools": [{"type": "function", "function": {"name": "allowed"}}]}
+    # Policy since 26452cbe3 (review item 4): a call to a name the request
+    # did not offer reaches the client unless a CONTRACT refuses it — a named
+    # ``tool_choice`` here (``tool_choice="none"`` likewise). Default
+    # surfacing: tests/test_tool_call_undeclared_other_parsers.py.
+    request = {
+        "tools": [{"type": "function", "function": {"name": "allowed"}}],
+        "tool_choice": {"type": "function", "function": {"name": "allowed"}},
+    }
     tool_acc, _content = _collect_stream(
         parser,
         [

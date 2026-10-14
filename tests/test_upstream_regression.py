@@ -345,10 +345,20 @@ class TestGlm47UpstreamStreaming:
             delta_text="</tool_call>",
             request=glm47_request,
         )
-        # Our GLM parser re-parses the full text on close, so both should appear
+        # The first call is emitted as it closes; every later one is read once,
+        # from the complete output, at stream end — whether a later block is a
+        # call or an earlier value's text depends on what follows it (review
+        # of 26452cbe3; it also stopped the re-emission of every call from
+        # index 0 on each close). Both reach the wire, each exactly once.
         assert result is not None
-        assert "tool_calls" in result
-        assert len(result["tool_calls"]) == 2
+        assert [tc["index"] for tc in result["tool_calls"]] == [0]
+        rest = glm47_parser.finalize_legacy_raw_stream(full, request=glm47_request)
+        assert [tc["index"] for tc in rest["tool_calls"]] == [1]
+        cities = [
+            json.loads(tc["function"]["arguments"])["city"]
+            for tc in result["tool_calls"] + rest["tool_calls"]
+        ]
+        assert cities == ["Beijing", "Shanghai"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
