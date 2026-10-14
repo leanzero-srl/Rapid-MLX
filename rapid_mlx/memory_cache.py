@@ -2786,8 +2786,9 @@ class MemoryAwarePrefixCache:
 
         * ``hybrid_reuse_max_entries <= 0`` (disabled, the default) → drop ALL
           evictable non-trimmable entries (``keep = max(limit, 0) == 0``).
-        * ``> 0`` → LRU-evict the oldest evictable non-trimmable entries until
-          at most N remain. ``_entries`` is an ``OrderedDict`` in LRU order, so
+        * ``> 0`` → evict evictable non-trimmable entries until at most N
+          remain: in ``bound_order`` (the memory guard's eviction order) when
+          the scheduler set one, else oldest first. ``_entries`` is an ``OrderedDict`` in LRU order, so
           the head of the filtered list is the least-recently-used.
 
         Called UNCONDITIONALLY at BOTH sites (live-store after inserting a
@@ -2812,6 +2813,22 @@ class MemoryAwarePrefixCache:
         # on a large persisted snapshot).
         keep = max(limit, 0)
         n_evict = max(0, len(evictable_non_trimmable_keys) - keep)
+        order = getattr(self, "bound_order", None)
+        if n_evict and callable(order):
+            # LeanZero memory guard: the count bound evicts in the guard's
+            # ONE eviction order (dead branches and abandoned heads first,
+            # the conversations' newest heads last), not plain LRU -- review
+            # 5: a 6-request subagent loop pushed the main session's head out
+            # at the default bound (main cached 512 of 4,643).
+            try:
+                candidates = set(evictable_non_trimmable_keys)
+                ranked = [k for k in order() if k in candidates]
+                seen = set(ranked)
+                evictable_non_trimmable_keys = ranked + [
+                    k for k in evictable_non_trimmable_keys if k not in seen
+                ]
+            except Exception:  # noqa: BLE001 — the plain LRU bound still holds
+                logger.debug("[hybrid_bound] guard order failed", exc_info=True)
         victims = evictable_non_trimmable_keys[:n_evict]
         for oldest in victims:
             self._evict_entry_locked(oldest, reason="hybrid_bound")

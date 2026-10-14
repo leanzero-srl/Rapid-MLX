@@ -670,6 +670,9 @@ class MemoryGuard:
             # Older entries of a session superseded by its newest
             # end-of-turn entry (dead weight, not pressure).
             "superseded": 0,
+            # Entries of a conversation's dead branch (compaction, a turn
+            # the template re-rendered) dropped when its next turn stored.
+            "abandoned": 0,
             # Entries given back because the kernel reported machine-wide
             # memory pressure (other apps / engines need it).
             "system_pressure_evictions": 0,

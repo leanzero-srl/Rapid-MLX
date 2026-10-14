@@ -310,6 +310,9 @@ _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
 # re-plan defers, refuses, hands over or evicts something, so a converging
 # plan needs at most one per row and entry).
 _PLAN_ATTEMPTS = 64
+# The memory guard's line for requests that carry no SessionHint (raw
+# prompts): one conversation, as before per-session identity existed.
+_ANONYMOUS_LINE = ("anonymous",)
 
 
 def _exact_data_layers(caches: Any) -> list[Any]:
@@ -4272,6 +4275,9 @@ class Scheduler:
                     config=cache_config,
                     radix_index=radix_idx,
                 )
+                # The hybrid entry-count bound evicts in the memory guard's
+                # order while the guard is on (plain LRU otherwise).
+                self.memory_aware_cache.bound_order = self._memguard_bound_order
                 logger.info(
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB, "
@@ -5273,6 +5279,7 @@ class Scheduler:
             # evict_prefixes=False: keep mid-prefill boundary entries so
             # that future requests with the same prefix but different
             # suffix get a prefix cache hit (critical for agentic multi-turn).
+            self._memguard_tag(request, prompt_tokens)
             stored = self.memory_aware_cache.store(
                 prompt_tokens, extracted_cache, evict_prefixes=False
             )
@@ -5587,6 +5594,7 @@ class Scheduler:
                 # evict_prefixes=False matches the prompt-cache save
                 # path — keep boundary entries so later turns with the
                 # same prefix but different suffix still hit.
+                self._memguard_tag(request, prefix_tokens)
                 stored = self.memory_aware_cache.store(
                     prefix_tokens,
                     reconstructed,
@@ -6557,6 +6565,113 @@ class Scheduler:
             return False
         return tuple(tokens[:n]) == key
 
+    @staticmethod
+    def _memguard_seq_prefix(a: Any, b: Any) -> bool:
+        """``a`` is a prefix of ``b`` (tuples or lists, cheap checks first)."""
+        n = len(a)
+        if n > len(b):
+            return False
+        if n == 0:
+            return True
+        if a[n - 1] != b[n - 1] or a[0] != b[0]:
+            return False
+        return tuple(a) == tuple(b[:n])
+
+    @property
+    def _memguard_entry_meta(self) -> dict[tuple, tuple[Any, Any]]:
+        """Prefix-entry key -> ``(line, frame)`` of the request that stored
+        it (see ``_memguard_line``). Unknown keys are anonymous."""
+        meta = self.__dict__.get("_memguard_entry_meta_store")
+        if meta is None:
+            meta = self.__dict__["_memguard_entry_meta_store"] = {}
+        return meta
+
+    def _memguard_line(self, request: Any) -> tuple[Any, Any]:
+        """``(line, frame)``: the conversation a request continues, from its
+        ``SessionHint`` (set by the chat route from the model's own chat
+        template and the client's session header). Session id present: the
+        line is the session, the frame is the rendered system/tools frame
+        (its length and a hash of its tokens) -- a helper call of the same
+        session (title, summary) renders another frame. No id: the line is
+        the frame plus the first message (goose swarm workers carry their
+        task in it). No hint at all (raw prompts): one anonymous line --
+        never a fixed token count."""
+        cached = getattr(request, "_memguard_line_key", None)
+        if cached is not None:
+            return cached
+        hint = getattr(request, "session_hint", None)
+        prompt = getattr(request, "prompt_token_ids", None) or ()
+        line: tuple[Any, Any] = (_ANONYMOUS_LINE, (0, 0))
+        if hint is not None:
+            sid = getattr(hint, "session_id", None)
+            frame = min(int(getattr(hint, "frame", 0) or 0), len(prompt))
+            first_end = min(int(getattr(hint, "first_end", 0) or 0), len(prompt))
+            if sid:
+                signature = (frame, hash(tuple(prompt[:frame])))
+                line = (("session", sid), signature)
+            elif first_end > 0:
+                signature = (first_end, hash(tuple(prompt[:first_end])))
+                line = (("frame", *signature), signature)
+        try:
+            request._memguard_line_key = line
+        except AttributeError:
+            pass
+        return line
+
+    def _memguard_tag(self, request: Any, tokens: Any) -> None:
+        """Record which line an entry about to be stored belongs to (before
+        the store: the cache's own count bound ranks it during the store)."""
+        if getattr(self, "_memory_guard", None) is None or request is None:
+            return
+        meta = self._memguard_entry_meta
+        tagged = tuple(tokens)
+        meta[tagged] = self._memguard_line(request)
+        self._memguard_line_activity(request)
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None and len(meta) > 2 * (len(mac._entries) + 1):  # noqa: SLF001
+            live = set(mac._entries)  # noqa: SLF001
+            for key in [k for k in meta if k not in live and k != tagged]:
+                meta.pop(key, None)
+
+    def _memguard_line_activity(self, request: Any) -> None:
+        """A line's first and latest activity (admission, store), in one
+        monotonic sequence: what ``_memguard_outlived_lines`` reads."""
+        line = self._memguard_line(request)[0]
+        seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
+        self._memguard_seq = seq
+        lines = self.__dict__.setdefault("_memguard_lines", {})
+        if line in lines:
+            lines[line][1] = seq
+        else:
+            lines[line] = [seq, seq]
+
+    def _memguard_outlived_lines(self) -> set[Any]:
+        """Lines an OLDER line outlived: it started before this one and ran
+        again after this one's latest activity. goose's shape: the main
+        session waits while a subagent (its own session) runs, then the main
+        session's next turn -- the subagent is finished; likewise a helper
+        call the main turn followed. A line that runs again stops being
+        outlived. Lines with no entry and no request are forgotten."""
+        lines = self.__dict__.get("_memguard_lines")
+        if not lines:
+            return set()
+        meta = self._memguard_entry_meta
+        mac = getattr(self, "memory_aware_cache", None)
+        present = {meta.get(k, (_ANONYMOUS_LINE, None))[0] for k in mac._entries} if mac is not None else set()  # noqa: SLF001
+        for r in list(getattr(self, "running", {}).values()) + list(
+            getattr(self, "waiting", ())
+        ):
+            present.add(self._memguard_line(r)[0])
+        for line in [k for k in lines if k not in present]:
+            lines.pop(line, None)
+        outlived: set[Any] = set()
+        latest_older = 0
+        for line, (first, last) in sorted(lines.items(), key=lambda kv: kv[1][0]):
+            if latest_older > last:
+                outlived.add(line)
+            latest_older = max(latest_older, last)
+        return outlived
+
     def _memguard_entry_level(
         self, key: tuple, live: list[tuple[Any, int]], waiting: list[Any]
     ) -> int:
@@ -6581,6 +6696,7 @@ class Scheduler:
         self,
         storing: tuple[Any, int] | None = None,
         finished: str | None = None,
+        storing_line: tuple[Any, Any] | None = None,
     ) -> list[tuple[tuple, int, int]]:
         """``(key, level, bytes)`` of every prefix entry in EVICTION order:
         lowest level first, then the cheapest to re-prefill (fewest tokens --
@@ -6588,9 +6704,10 @@ class Scheduler:
         Caller holds the cache lock.
 
         Levels (``memory_guard.EVICT_*``): UNUSED, REDUNDANT (a running
-        request fetched it: duplicated in its live cache), HEAD (a session's
-        head other than the most recently used one), NEEDED (a live or
-        queued request still needs it, or the most recently used head). A head is
+        request fetched it: duplicated in its live cache), HEAD (an abandoned
+        head: its conversation was compacted, or an older one outlived it),
+        NEEDED (a live or queued request still needs it, or a live
+        conversation's newest head). A head is
         the newest entry of a session that finished a turn -- an entry no
         other entry extends, or a message-boundary entry extended only by
         heads (non-trimmable caches resume from the boundary when the next
@@ -6625,48 +6742,54 @@ class Scheduler:
                 only_leaves and getattr(entries[key], "message_boundary", False)
             ):
                 heads.add(key)
-        # Every LOGICAL SESSION keeps its newest head until the floor; a head
-        # is abandoned only when something newer of the same session --
-        # same system-prompt prefix (at least one KV block: KVCache.step
-        # tokens) -- diverges from it: a running / queued request or a newer
-        # head. That is goose compaction (the pre-compaction head is never
-        # continued). goose subagents run their own system prompt, so the
-        # main session's head stays protected while one runs alone (review 4:
-        # with "nothing may run" as the test the main session missed 14 of
-        # 15 turns behind a 60k subagent). Abandoned heads go before any
-        # chunk reduction, cheapest to re-prefill first (review 3: a dead
-        # 32k head made a new session's chunk 2048 -> 1784).
-        block = kv_growth_step()
-
-        def same_session(a: Any, b: Any) -> bool:
-            # Keys are tuples, live prompts lists: compare as tuples.
-            return (
-                len(a) >= block
-                and len(b) >= block
-                and tuple(a[:block]) == tuple(b[:block])
-            )
-
-        newest: list[Any] = [
-            t for t, _f in live if storing is None or t is not storing[0]
-        ] + list(waiting)
+        # Every conversation LINE keeps its newest heads until the floor (see
+        # ``_memguard_line``: the client's session id, else the rendered
+        # system/tools frame + first message, measured with the model's own
+        # template -- review 5: tools-first templates (Qwen3.5, Qwen3.8)
+        # put 500+ identical tokens BEFORE goose's system prompt, so a fixed
+        # first block merged the main session with its subagents). A head
+        # is abandoned only when something NEWER of the same line that
+        # shares its frame (a running / queued request, a newer head)
+        # neither continues it nor is continued by it: goose compaction.
+        # A helper call of the session (a title, a summary) has its own
+        # frame and abandons nothing. A line another, OLDER line outlived
+        # (the older one ran again after this one's last request: a
+        # finished subagent, a helper call the main turn followed) is
+        # abandoned as a whole. Abandoned heads go before any chunk
+        # reduction, cheapest to re-prefill first (review 3: a dead 32k head
+        # made a new session's chunk 2048 -> 1784).
+        meta = self._memguard_entry_meta
+        reps: list[tuple[Any, Any, Any]] = []
         if storing is not None:
-            newest.insert(0, storing[0])
+            reps.append((*(storing_line or (_ANONYMOUS_LINE, (0, 0))), storing[0]))
+        for r in list(getattr(self, "running", {}).values()):
+            if (finished is None or r.request_id != finished) and (
+                storing is None or r.prompt_token_ids is not storing[0]
+            ):
+                reps.append((*self._memguard_line(r), r.prompt_token_ids))
+        for r in list(getattr(self, "waiting", ())):
+            reps.append((*self._memguard_line(r), r.prompt_token_ids))
+        outlived = self._memguard_outlived_lines()
         protected: set[tuple] = set()
         for key in reversed(list(entries)):  # MRU -> LRU
             if key not in heads:
                 continue
-            rep = next((r for r in newest if same_session(key, r)), None)
-            if rep is None:
-                newest.append(key)  # the newest head of its session
+            line, frame = meta.get(key, (_ANONYMOUS_LINE, (0, 0)))
+            dead = line in outlived or any(
+                rep_line == line
+                and rep_frame == frame
+                and not self._memguard_seq_prefix(key, tokens)
+                and not self._memguard_seq_prefix(tokens, key)
+                for rep_line, rep_frame, tokens in reps
+            )
+            if not dead:
                 protected.add(key)
-            elif tuple(rep[: len(key)]) == key and (
-                not isinstance(rep, tuple) or rep in protected
-            ):
-                protected.add(key)  # on the newest path (its boundary)
+            reps.append((line, frame, key))  # a newer head for older ones
+        protected |= self._memguard_kept_turn_boundaries(outlived)
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
-            if key in heads and (
+            if (key in heads or key in protected) and (
                 level == EVICT_UNUSED
                 or (
                     finished is not None
@@ -6679,6 +6802,13 @@ class Scheduler:
             ranked.append((level, len(key), position, key, cost))
         ranked.sort(key=lambda item: item[:3])
         return [(key, level, cost) for level, _n, _p, key, cost in ranked]
+
+    def _memguard_bound_order(self) -> list[tuple]:
+        """Every prefix entry in the guard's eviction order (the cache's own
+        count bound calls it with its lock held); empty with the guard off."""
+        if getattr(self, "_memory_guard", None) is None:
+            return []
+        return [key for key, _level, _cost in self._memguard_ranked_entries()]
 
     def _memguard_evictable_bytes(self, max_level: int) -> int:
         """Bytes the ONE policy could free evicting up to ``max_level``."""
@@ -6701,6 +6831,7 @@ class Scheduler:
         finished: str | None = None,
         reason: str = "memory_guard",
         count: bool = True,
+        storing_line: tuple[Any, Any] | None = None,
     ) -> bool:
         """THE prefix-cache eviction policy (E1, E5, the pressure evictor and
         store-time room all call it): evict the least-recently-used entry of
@@ -6720,7 +6851,9 @@ class Scheduler:
             evicted = self._evict_one_prefix_cache_entry()
         else:
             with mac._lock:  # noqa: SLF001 — coordinated eviction
-                ranked = self._memguard_ranked_entries(storing, finished)
+                ranked = self._memguard_ranked_entries(
+                    storing, finished, storing_line
+                )
                 if not ranked or (keep_last and len(ranked) <= 1):
                     return False
                 best_key, best_level, _cost = ranked[0]
@@ -7450,6 +7583,7 @@ class Scheduler:
         try:
             if not self._memguard_room_for_store(request, cache, handoff=solo):
                 return
+            self._memguard_tag(request, tokens)
             stored = mac.store(tokens, cache, evict_prefixes=False, handoff=True)
         except Exception:  # noqa: BLE001
             logger.debug("[memory_guard] requeue store failed", exc_info=True)
@@ -7770,7 +7904,9 @@ class Scheduler:
         the kernel reports pressure (other apps, other MLX engines -- goose
         runs more than one), the cache gives memory back at once, without a
         fixed share: at WARN every entry except what a live or queued
-        request needs and the most recently used session's head; at
+        request needs and each live conversation's newest head (review 5: a
+        helper call -- the session's title -- after the main turn was the
+        "most recently used" and cost the main session its head); at
         CRITICAL all but the last entry. Measured, re-checked whenever the
         engine goes idle (and by the pressure path every tick it runs)."""
         from .memory_budget import (
@@ -7789,8 +7925,6 @@ class Scheduler:
             max_level, keep_last=True, reason="system pressure", count=False
         ):
             evicted += 1
-        if level < SYSTEM_PRESSURE_CRITICAL:
-            evicted += self._memguard_keep_only_recent_session()
         if evicted:
             mx.clear_cache()
             if guard is not None:
@@ -7802,50 +7936,6 @@ class Scheduler:
                 evicted,
                 "y" if evicted == 1 else "ies",
             )
-
-    def _memguard_keep_only_recent_session(self) -> int:
-        """Under machine pressure (WARN) the cache keeps what a running or
-        queued request needs and the MOST RECENTLY USED session's head (and
-        its boundary) -- not every logical session's newest head. Running
-        requests count as live, so the main session's head survives while
-        its subagent runs (review 4, C2)."""
-        mac = getattr(self, "memory_aware_cache", None)
-        if mac is None:
-            return 0
-        evicted = 0
-        with mac._lock:  # noqa: SLF001
-            entries = mac._entries  # noqa: SLF001
-            if len(entries) <= 1:
-                return 0
-            live = [
-                (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
-                for r in list(getattr(self, "running", {}).values())
-            ]
-            waiting = [r.prompt_token_ids for r in list(getattr(self, "waiting", ()))]
-            # The most recently used FINISHED session: entries a running or
-            # queued request needs are kept anyway (their level), so recency
-            # is taken among the rest -- the main session's head while its
-            # subagent runs and stores entries of its own.
-            recent = next(
-                (
-                    k
-                    for k in reversed(list(entries))
-                    if self._memguard_entry_level(k, live, waiting) == EVICT_UNUSED
-                ),
-                None,
-            )
-            if recent is None:
-                return 0
-            for key in list(entries):
-                if len(entries) <= 1:
-                    break
-                if recent[: len(key)] == key or key[: len(recent)] == recent:
-                    continue
-                if self._memguard_entry_level(key, live, waiting) != EVICT_UNUSED:
-                    continue
-                mac._evict_entry_locked(key, reason="system pressure")  # noqa: SLF001
-                evicted += 1
-        return evicted
 
     def _memguard_on_idle(self) -> None:
         """The engine just went idle (step thread): re-measure the idle base
@@ -8108,105 +8198,157 @@ class Scheduler:
                 (effective or 0) / 1e9,
             )
 
-    def _memguard_session_key(self, tokens: Any) -> tuple | None:
-        """A logical session's identity: its first KV block (system prompt)."""
-        block = kv_growth_step()
-        if tokens is None or len(tokens) < block:
-            return None
-        return tuple(tokens[:block])
+    @staticmethod
+    def _memguard_lcp(a: Any, b: Any) -> int:
+        """Length of the common prefix of two token sequences (bisection over
+        slice equality: C-speed compares, not a Python loop per token)."""
+        lo, hi = 0, min(len(a), len(b))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if tuple(a[:mid]) == tuple(b[:mid]):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
-    def _memguard_session_diverges(self, tokens: Any) -> bool:
-        if self._memguard_template_strips():
-            return True
-        key = self._memguard_session_key(tokens)
-        return key is not None and key in getattr(
-            self, "_memguard_divergent_sessions", ()
-        )
-
-    def _memguard_template_strips(self) -> bool:
-        """Does the model's chat template DROP an earlier assistant turn's
-        reasoning once a new user message follows (classic Qwen3)? Then a
-        new user message diverges right after the boundary before the last
-        tool loop, and a non-trimmable cache can resume only from there.
-        Probed once by rendering: reasoning present in [user, assistant] but
-        absent in [user, assistant, user]. Unknown (no template, a render
-        error) -> False: the observed-divergence rule still applies."""
-        cached = getattr(self, "_memguard_strips", None)
+    def _memguard_template_rewrites_tool_loops(self) -> bool:
+        """Does the engine's own rendering DROP the reasoning of an earlier
+        TOOL LOOP once a new user message follows? Rapid-MLX re-renders
+        tool-loop rows with their reasoning on the templates that drop it
+        (``_retain_tool_loop_think_blocks``), so on Qwen-family templates
+        only the final reply loses its reasoning -- and a new user message
+        resumes from the newest boundary, which superseding always keeps.
+        Rendered once through the same pipeline the chat route uses, with a
+        tool-call row and its tool response (review 5: a plain [user,
+        assistant] probe misses templates that render reasoning only on
+        tool-call rows, e.g. Gemma 4). Unknown (no template, a render error)
+        -> False: an observed rewrite still flags its line."""
+        cached = self.__dict__.get("_memguard_rewrites_tool_loops")
         if cached is not None:
             return cached
-        strips = False
+        rewrites = False
         tok = getattr(self, "_actual_tokenizer", None) or getattr(
             self, "tokenizer", None
         )
-        render = getattr(tok, "apply_chat_template", None)
-        if callable(render):
-            marker = "zq7reasoningmarker"
-            for assistant in (
-                {"role": "assistant", "content": "a1", "reasoning_content": marker},
-                {"role": "assistant", "content": f"<think>{marker}</think>a1"},
-            ):
-                try:
-                    one = render(
-                        [{"role": "user", "content": "u1"}, assistant],
-                        tokenize=False,
-                    )
-                    two = render(
-                        [
-                            {"role": "user", "content": "u1"},
-                            assistant,
-                            {"role": "user", "content": "u2"},
-                        ],
-                        tokenize=False,
-                    )
-                except Exception:  # noqa: BLE001
-                    continue
-                if isinstance(one, str) and isinstance(two, str) and marker in one:
-                    strips = marker not in two
-                    break
-        self._memguard_strips = strips
-        if strips:
+        if callable(getattr(tok, "apply_chat_template", None)):
+            from .utils.chat_template import apply_chat_template
+
+            marker = "zq7loopreasoning"
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "probe",
+                        "description": "probe",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            loop = [
+                {"role": "user", "content": "u1"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": marker,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "probe", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "r1"},
+                {"role": "assistant", "content": "a1"},
+            ]
+            try:
+                before = apply_chat_template(
+                    tok, loop, tools=tools, add_generation_prompt=False
+                )
+                after = apply_chat_template(
+                    tok,
+                    [*loop, {"role": "user", "content": "u2"}],
+                    tools=tools,
+                    add_generation_prompt=True,
+                )
+                if isinstance(before, str) and isinstance(after, str):
+                    rewrites = marker in before and marker not in after
+            except Exception:  # noqa: BLE001
+                rewrites = False
+        self._memguard_rewrites_tool_loops = rewrites
+        if rewrites:
             logger.info(
-                "[memory_guard] the chat template drops earlier reasoning on "
-                "a new user message: message-boundary entries of non-trimmable "
-                "caches are never superseded"
+                "[memory_guard] the chat template drops a tool loop's reasoning "
+                "on a new user message: each conversation keeps the boundary "
+                "its turn started at"
             )
-        return strips
+        return rewrites
+
+    def _memguard_line_rewrites(self, line: Any) -> bool:
+        return line in self.__dict__.get(
+            "_memguard_rewriting_lines", ()
+        ) or self._memguard_template_rewrites_tool_loops()
+
+    def _memguard_kept_turn_boundaries(self, outlived: set[Any]) -> set[tuple]:
+        """The one boundary each live line keeps beyond the default (the
+        boundary its current turn started at) -- only on a line whose
+        template rewrites an earlier tool loop (probed or observed). Review 5:
+        keeping EVERY boundary held 24 entries / 445.7 MB vs 3 / 82.9 MB."""
+        kept = self.__dict__.get("_memguard_turn_boundaries")
+        mac = getattr(self, "memory_aware_cache", None)
+        if not kept or mac is None:
+            return set()
+        entries = mac._entries  # noqa: SLF001
+        return {
+            key
+            for line, key in kept.items()
+            if key in entries
+            and line not in outlived
+            and self._memguard_line_rewrites(line)
+        }
 
     def _memguard_note_divergence(self, request: Request) -> None:
-        """Admission (step thread): a request that shares its conversation
-        with a cached non-trimmable entry (more than the system block) but
-        does NOT extend it has diverged from its own session -- the template
-        rewrote an earlier part (stripped reasoning). From then on that
-        session's message-boundary entries are never superseded."""
+        """Admission (step thread): a request whose OWN line holds a non-
+        trimmable entry it neither continues nor is a retry of, diverging
+        past its first message and earlier than the newest boundary it can
+        resume from (by more than its generation prompt), has seen its
+        template rewrite an earlier tool loop. From then on that line keeps
+        the boundary each turn starts at. Review 5: the old detector compared
+        across conversations (a 512-token span, a fixed absolute) and fired
+        on a subagent's first request, a retry and every swarm worker."""
         if getattr(self, "_memory_guard", None) is None:
             return
         mac = getattr(self, "memory_aware_cache", None)
-        prompt = request.prompt_token_ids
-        session = self._memguard_session_key(prompt)
-        if mac is None or session is None or self._memguard_session_diverges(prompt):
+        line, _frame = self._memguard_line(request)
+        if mac is None or line == _ANONYMOUS_LINE or self._memguard_line_rewrites(line):
             return
-        span = 2 * len(session)
-        head = tuple(prompt[:span])
+        prompt = request.prompt_token_ids or ()
+        hint = getattr(request, "session_hint", None)
+        first_end = min(int(getattr(hint, "first_end", 0) or 0), len(prompt))
+        boundary = int(getattr(request, "prefix_boundary", 0) or 0)
+        generation = len(prompt) - boundary if 0 < boundary <= len(prompt) else 0
+        meta = self._memguard_entry_meta
+        best = 0
+        divergence = 0
         with mac._lock:  # noqa: SLF001
-            for key, entry in mac._entries.items():  # noqa: SLF001
-                if (
-                    len(key) <= span
-                    or not getattr(entry, "non_trimmable", False)
-                    or key[:span] != head
-                ):
+            for key, entry in list(mac._entries.items()):  # noqa: SLF001
+                if not getattr(entry, "non_trimmable", False):
                     continue
-                if len(key) > len(prompt) or tuple(prompt[: len(key)]) != key:
-                    if not hasattr(self, "_memguard_divergent_sessions"):
-                        self._memguard_divergent_sessions = set()
-                    self._memguard_divergent_sessions.add(session)
-                    logger.info(
-                        "[memory_guard] request %s diverges from its session's "
-                        "%d-token entry: its message-boundary entries are kept "
-                        "from now on",
-                        request.request_id[:12],
-                        len(key),
-                    )
-                    return
+                if meta.get(key, (_ANONYMOUS_LINE, None))[0] != line:
+                    continue
+                if self._memguard_seq_prefix(key, prompt):
+                    best = max(best, len(key))
+                elif not self._memguard_seq_prefix(prompt, key):  # not a retry
+                    divergence = max(divergence, self._memguard_lcp(key, prompt))
+        if divergence > first_end and divergence - best > generation:
+            self.__dict__.setdefault("_memguard_rewriting_lines", set()).add(line)
+            logger.info(
+                "[memory_guard] request %s rewrites its conversation at token %d "
+                "(resumes at %d): its line keeps the boundary each turn starts at",
+                request.request_id[:12],
+                divergence,
+                best,
+            )
 
     def _memguard_supersede(self, request: Request, sequence: list[int]) -> None:
         """After a session's end-of-turn entry is stored, the OLDER entries
@@ -8230,11 +8372,11 @@ class Scheduler:
         Cost (hybrids only): a session idles with two entries, not one; under
         duress the older one ranks first for eviction.
 
-        Also kept: this turn's message-boundary entry, message-boundary
-        entries of a non-trimmable cache whose template rewrites history
-        (see ``_memguard_session_diverges``), any entry another branch also
-        extends (a shared prefix), and anything a live or queued request
-        needs."""
+        Also kept: this turn's message-boundary entry, the boundary the
+        line's current turn started at when its template rewrites an earlier
+        tool loop (``_memguard_kept_turn_boundaries``), any entry another
+        branch also extends (a shared prefix), and anything a live or queued
+        request needs."""
         if getattr(self, "_memory_guard", None) is None:
             return
         mac = getattr(self, "memory_aware_cache", None)
@@ -8251,6 +8393,14 @@ class Scheduler:
         )
         keep = {tuple(request.prompt_token_ids[:boundary])} if boundary > 0 else set()
         resumed = int(getattr(request, "_memguard_resumed", 0) or 0)
+        line = self._memguard_line(request)
+        hint = getattr(request, "session_hint", None)
+        if keep and getattr(hint, "turn_start", False):
+            # The boundary this turn started at: a template that rewrites the
+            # turn's tool loop on the next user message resumes there.
+            self.__dict__.setdefault("_memguard_turn_boundaries", {})[line[0]] = (
+                next(iter(keep))
+            )
         superseded = 0
         with mac._lock:  # noqa: SLF001
             if key not in mac._entries:  # noqa: SLF001
@@ -8258,10 +8408,29 @@ class Scheduler:
             levels = {
                 k: level
                 for k, level, _c in self._memguard_ranked_entries(
-                    (sequence, len(sequence)), request.request_id
+                    (sequence, len(sequence)), request.request_id, line
                 )
             }
             entries = mac._entries  # noqa: SLF001
+            meta = self._memguard_entry_meta
+            abandoned = 0
+            if line[0] != _ANONYMOUS_LINE:
+                # The dead branches of THIS conversation: entries of the same
+                # session and frame this turn diverged from (a compaction, a
+                # turn the template re-rendered). Review 5: on a template
+                # that drops reasoning, every user turn left the previous
+                # turn's entries behind (14 entries after 4 turns vs 4).
+                for k in list(entries):
+                    if (
+                        k == key
+                        or k in keep
+                        or meta.get(k) != line
+                        or self._memguard_seq_prefix(k, key)
+                        or levels.get(k, EVICT_NEEDED) > EVICT_HEAD
+                    ):
+                        continue
+                    mac._evict_entry_locked(k, reason="abandoned")  # noqa: SLF001
+                    abandoned += 1
             keys = list(entries)
             for k in keys:
                 if len(k) >= len(key) or key[: len(k)] != k or k in keep:
@@ -8269,21 +8438,6 @@ class Scheduler:
                 entry = entries[k]
                 if len(k) == resumed and getattr(entry, "non_trimmable", False):
                     continue  # the non-trimmable entry it resumed FROM
-                if (
-                    getattr(entry, "non_trimmable", False)
-                    and getattr(entry, "message_boundary", False)
-                    and self._memguard_session_diverges(k)
-                ):
-                    # A non-trimmable (hybrid recurrent-state) cache cannot
-                    # rewind: a message boundary is the only place a prompt
-                    # that diverges after it can resume from. Kept only for
-                    # a session OBSERVED to diverge from its own newest
-                    # entry (a template that strips earlier reasoning when a
-                    # new user message arrives -- review 4: re-prefill from
-                    # 0 instead of resuming at 6000). A template that just
-                    # extends the prefix (AREX-2, measured live) never
-                    # diverges, and keeps the superseding win.
-                    continue
                 if levels.get(k, EVICT_NEEDED) > EVICT_REDUNDANT:
                     continue
                 if any(
@@ -8292,17 +8446,19 @@ class Scheduler:
                     continue  # another branch extends it: a shared prefix
                 mac._evict_entry_locked(k, reason="superseded")  # noqa: SLF001
                 superseded += 1
-        if superseded:
+        if superseded or abandoned:
             guard = self._memguard()
             if guard is not None:
                 guard.counts["superseded"] += superseded
+                guard.counts["abandoned"] += abandoned
             logger.info(
-                "[memory_guard] %d older entr%s of request %s's session "
-                "superseded by its %d-token entry",
-                superseded,
-                "y" if superseded == 1 else "ies",
+                "[memory_guard] request %s's %d-token entry superseded %d older "
+                "entr%s and dropped %d its conversation left behind",
                 request.request_id[:12],
                 len(key),
+                superseded,
+                "y" if superseded == 1 else "ies",
+                abandoned,
             )
 
     def _memguard_room_for_store(
@@ -8365,6 +8521,9 @@ class Scheduler:
                 storing=storing,
                 finished=finished,
                 reason="store-room",
+                storing_line=(
+                    self._memguard_line(request) if request is not None else None
+                ),
             ):
                 break
             mx.clear_cache()
@@ -10189,7 +10348,9 @@ class Scheduler:
         """
         import time as _time
 
-        self._memguard_note_divergence(request)
+        if getattr(self, "_memory_guard", None) is not None:
+            self._memguard_note_divergence(request)
+            self._memguard_line_activity(request)
         _fetch_t0 = _time.monotonic()
         cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
         _fetch_dt = _time.monotonic() - _fetch_t0
@@ -12579,6 +12740,7 @@ class Scheduler:
                                 solo = gen is None or len(gen) == 0
                             except TypeError:
                                 solo = False
+                            self._memguard_tag(request, full_token_sequence)
                             stored = self._memguard_room_for_store(
                                 request, handed, handoff=solo, turn_end=True
                             ) and self.memory_aware_cache.store(
