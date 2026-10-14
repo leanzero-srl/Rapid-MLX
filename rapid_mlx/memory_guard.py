@@ -653,6 +653,9 @@ class MemoryGuard:
             # Plans that evicted prefix entries and then deferred the request
             # anyway (feasibility is decided first, so expected 0).
             "evictions_then_deferred": 0,
+            # Steps whose plan did not converge and dispatched unplanned
+            # (a planner defect signal; expected 0).
+            "plan_exhausted": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
