@@ -109,3 +109,66 @@ def test_the_handed_over_entry_owns_exactly_its_charged_bytes():
     for c in entry.cache:
         assert c.keys.shape[2] == TOKENS and c.offset == TOKENS
 
+
+# -- the admission side: a loan whose entry was evicted is not copied -------
+
+
+def _loaned_layer(tokens: int = 512) -> KVCache:
+    layer = KVCache()
+    layer.keys = mx.random.normal((1, HEADS, tokens, DIM))
+    layer.values = mx.random.normal((1, HEADS, tokens, DIM))
+    layer.offset = tokens
+    mx.eval(layer.keys, layer.values)
+    return layer
+
+
+def test_a_handed_over_loan_is_admitted_without_its_copy_once():
+    from rapid_mlx.scheduler import _handed_over, _mark_handed_over
+    from rapid_mlx.singleton_cache_fastpath import (
+        _detach_layer,
+        install_singleton_cache_fastpath,
+    )
+
+    assert install_singleton_cache_fastpath()  # what the scheduler runs on
+    loan = [_loaned_layer() for _ in range(3)]
+    assert not _handed_over(loan)
+    _mark_handed_over(loan)
+    assert _handed_over(loan)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    admitted = [_detach_layer(layer) for layer in loan]
+    mx.eval([a.keys for a in admitted])
+    assert all(a is b for a, b in zip(admitted, loan, strict=True))
+    assert mx.get_active_memory() - before < 4096  # no copy
+    # One-shot: the flag is consumed at admission, so a later admission of
+    # the same objects (or anything derived from them) copies again.
+    assert not _handed_over(loan)
+    again = _detach_layer(loan[0])
+    assert again is not loan[0] and again.keys is not loan[0].keys
+
+
+def test_a_loan_that_was_not_handed_over_is_still_copied():
+    # Negative control: copy-on-admit protects a loan that shares array
+    # objects with a stored entry (LCP / supersequence rewinds).
+    from rapid_mlx.singleton_cache_fastpath import _detach_layer
+
+    entry = _loaned_layer()
+    loan = KVCache()
+    loan.keys, loan.values, loan.offset = entry.keys, entry.values, 256
+    admitted = _detach_layer(loan)
+    assert admitted is not loan
+    assert admitted.keys is not entry.keys
+
+
+def test_the_sole_owner_flag_never_travels_with_a_copy():
+    from rapid_mlx.scheduler import _handed_over, _mark_handed_over
+    from rapid_mlx.singleton_cache_fastpath import _copy_exact_layer
+
+    loan = [_loaned_layer()]
+    _mark_handed_over(loan)
+    clone = _copy_exact_layer(loan[0])  # extract / store / copy-on-admit body
+    assert not _handed_over([clone])
+    # No data layers at all (fresh request, wrappers only) is never "handed
+    # over": the admission charge stays as computed.
+    assert not _handed_over([])
+    assert not _handed_over([KVCache()])

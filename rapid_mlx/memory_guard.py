@@ -450,12 +450,14 @@ class RowPlan:
     chunk_cap: int = 0  # per-request chunk ceiling (0 = none), E5 backstop
     chunk_floor: int = 0  # per-request floor override (0 = guard floor)
     prompt_tokens: int = 0  # the request's full prompt, for the refusal
-    # Bytes of the row's cached KV that its FIRST chunk copies: a prefix hit
-    # whose arrays its prefix entry still holds grows every layer into new
-    # buffers on the first write (Gabee Q8: +3-4 GB at 51-62k on the first
-    # chunk of each turn). Context-proportional and one-off: charged to the
-    # plan as such, never fitted as chunk x context.
+    # Bytes of the row's cached KV its admission copies (copy-on-admit /
+    # batched merge; the source stays alive until the copy is evaluated in
+    # this very dispatch). Gabee Q8: +3-4 GB at 51-62k on the first chunk of
+    # each turn. Context-proportional and one-off: charged to the plan as
+    # such, never fitted as chunk x context.
     admit_bytes: int = 0
+    # Pulled into the prompt batch by THIS dispatch (first chunk).
+    admitting: bool = False
 
 
 def step_shape(rows: Sequence[RowPlan], chunk: int) -> StepShape:
@@ -489,11 +491,6 @@ class GuardProbe:
     # one was evicted.
     evict_one: Callable[[int], bool]
     entry_count: Callable[[], int]
-    # Current first-chunk copy bytes of the rows this dispatch admits: only
-    # rows whose cached KV a prefix entry still holds pay it (once the entry
-    # is evicted, the first write frees each old layer as it grows). Re-read
-    # after every eviction. ``None``: use ``RowPlan.admit_bytes``.
-    admit: Callable[[], int] | None = None
 
 
 # The ONE prefix-cache eviction order every path uses (E1, the pressure
@@ -707,12 +704,9 @@ class MemoryGuard:
         def footprint() -> int:
             return int(probe.active()) + int(probe.cache())
 
-        static_admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
-        admit = static_admit
+        admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
 
         def fits(c: int, fp: int) -> tuple[bool, StepShape, int, int]:
-            nonlocal admit
-            admit = static_admit if probe.admit is None else max(0, int(probe.admit()))
             shape = step_shape(rows, c)
             transient = self.plan_transient(shape, admit_bytes=admit)
             margin = self.margin(transient, ceiling)

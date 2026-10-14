@@ -161,6 +161,7 @@ from .memory_guard import (  # noqa: E402
     RowPlan,
     guard_enabled,
     is_metal_oom,
+    step_shape,
 )
 from .memory_guard import GUARD_ENV as MEMORY_GUARD_ENV  # noqa: E402
 from .paged_cache import PagedCacheManager
@@ -300,6 +301,57 @@ _MEMORY_GUARD_INIT_LOCK = threading.Lock()
 # When that gap is this small the second ~full-size owned copy is not worth
 # its memory: on goose's text lane each copy is ~3.7 GB at 22.5k tokens.
 _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
+
+
+def _exact_data_layers(caches: Any) -> list[Any]:
+    """Leaf layers that carry K/V arrays (wrappers such as CacheList
+    recursed), i.e. the layers copy-on-admit would copy."""
+    out: list[Any] = []
+    for c in caches or ():
+        sub = getattr(c, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            out.extend(_exact_data_layers(sub))
+        elif getattr(c, "keys", None) is not None:
+            out.append(c)
+    return out
+
+
+def _mark_handed_over(caches: Any) -> None:
+    """Flag a loan whose prefix entries were evicted as the sole owner of its
+    buffers: the singleton admission skips its copy-on-admit. Only layer
+    types the singleton pass-through admits honour the flag."""
+    from .singleton_cache_fastpath import _SINGLETON_EXACT_TYPES
+
+    for layer in _exact_data_layers(caches):
+        if type(layer) in _SINGLETON_EXACT_TYPES:
+            layer._lz_sole_owner = True
+
+
+def _handover_admissible(caches: Any) -> bool:
+    """The loan would be admitted by the singleton pass-through (the only
+    admission that honours the hand-over; the stock merge copies every
+    layer regardless)."""
+    import importlib
+
+    from .singleton_cache_fastpath import _is_singleton_passthrough_layer
+
+    gen = importlib.import_module("mlx_lm.generate")
+    return bool(caches) and (
+        getattr(gen, "_rapid_singleton_cache_fastpath", False)
+        and all(_is_singleton_passthrough_layer(c) for c in caches)
+    )
+
+
+def _handed_over(caches: Any) -> bool:
+    """True when every K/V layer of a queued loan was handed over (and
+    there is at least one) and the pass-through will admit it, so admission
+    copies nothing."""
+    layers = _exact_data_layers(caches)
+    return (
+        bool(layers)
+        and all(getattr(c, "_lz_sole_owner", False) for c in layers)
+        and _handover_admissible(caches)
+    )
 
 
 @dataclass
@@ -6575,42 +6627,14 @@ class Scheduler:
     def _memguard_evict_one(self, max_level: int) -> bool:
         return self._memguard_evict_ordered(max_level, reason="E1")
 
-    def _memguard_probe(self, rows: list[RowPlan] | None = None) -> GuardProbe:
-        admitting = [r for r in (rows or ()) if r.admit_bytes > 0]
+    def _memguard_probe(self) -> GuardProbe:
         return GuardProbe(
             active=self._current_metal_active_bytes,
             cache=self._current_metal_cache_bytes,
             clear_cache=mx.clear_cache,
             evict_one=self._memguard_evict_one,
             entry_count=self._memguard_prefix_entry_count,
-            admit=(
-                (lambda: self._memguard_shared_admit_bytes(admitting))
-                if admitting
-                else None
-            ),
         )
-
-    def _memguard_shared_admit_bytes(self, admitting: list[RowPlan]) -> int:
-        """First-chunk copy of each admitted row whose cached prefix a prefix
-        entry still holds (an entry covering that prefix is resident)."""
-        mac = getattr(self, "memory_aware_cache", None)
-        total = 0
-        for row in admitting:
-            request = self.running.get(row.request_id) or self.requests.get(
-                row.request_id
-            )
-            cached = int(getattr(request, "cached_tokens", 0) or 0)
-            if request is None or cached <= 0:
-                continue
-            if mac is None:
-                total += row.admit_bytes
-                continue
-            prefix = tuple(request.prompt_token_ids[:cached])
-            with mac._lock:  # noqa: SLF001
-                keys = list(mac._entries)  # noqa: SLF001
-            if any(len(k) >= cached and k[:cached] == prefix for k in keys):
-                total += row.admit_bytes
-        return total
 
     def _memguard_request_for_uid(self, uid: Any) -> Request | None:
         if uid is None:
@@ -6649,10 +6673,12 @@ class Scheduler:
 
         kv_fn = None
 
-        def _admit_bytes(offset: int) -> int:
+        def _admit_bytes(offset: int, caches: Any = None) -> int:
             nonlocal kv_fn
             if offset <= 0:
                 return 0
+            if _handed_over(caches):
+                return 0  # handed over: no copy at admission
             if kv_fn is None:
                 kv_fn = self._kv_footprint_fn() or (lambda _t: 0)
             return int(kv_fn(offset))
@@ -6663,6 +6689,7 @@ class Scheduler:
             offset_known: int,
             processed: int,
             admitting: bool = False,
+            caches: Any = None,
         ) -> None:
             try:
                 if not segments:
@@ -6689,8 +6716,11 @@ class Scheduler:
                     chunk_floor=int(getattr(request, "_memguard_chunk_floor", 0) or 0),
                     prompt_tokens=prompt_tokens,
                     # Pulled into the prompt batch by THIS dispatch with a
-                    # prefix hit: its first write copies the cached KV.
-                    admit_bytes=_admit_bytes(offset) if admitting else 0,
+                    # prefix hit: admission copies the cached KV (the singleton
+                    # fast path's copy-on-admit, or the batched merge), and
+                    # the source stays alive until the copy is evaluated.
+                    admit_bytes=_admit_bytes(offset, caches) if admitting else 0,
+                    admitting=admitting,
                 )
             )
 
@@ -6712,9 +6742,10 @@ class Scheduler:
         ]:
             try:
                 uid, segments, all_tokens = item[0], item[1], item[4]
+                caches = item[3]
             except (IndexError, TypeError):
                 continue
-            _row(uid, segments, len(all_tokens or ()), 0, admitting=True)
+            _row(uid, segments, len(all_tokens or ()), 0, admitting=True, caches=caches)
         return rows
 
     def _memguard_set_chunk(self, chunk: int) -> None:
@@ -6750,10 +6781,30 @@ class Scheduler:
         if ceiling <= 0:
             return None, refusals
         for _ in range(64):
+            # Finding 3 (review 2026-10-14): a row that joins a DECODING batch
+            # is merged into it (padded to the longest row; the singleton
+            # fast path first promotes the decoding row to a batched copy).
+            # That merge runs inside this very next(), outside the prefill
+            # projection -- at goose's scale (a 100k session decoding while a
+            # subagent finishes its prefill) ~+16 GB. Charge it, and defer
+            # the JOINER when it does not fit (never the decoding rows).
+            if self._memguard_check_generation_merge(guard, ceiling):
+                continue
             rows = self._memguard_rows()
             if not rows:
                 return None, refusals
-            probe = self._memguard_probe(rows)
+            if self._memguard_admit_handoffs(guard, ceiling, rows):
+                continue
+            deferred_joiner = False
+            for row in rows:
+                if row.admitting and not self._memguard_joiner_fits(
+                    guard, ceiling, row
+                ):
+                    deferred_joiner = True
+                    break
+            if deferred_joiner:
+                continue
+            probe = self._memguard_probe()
             configured = int(
                 getattr(self.batch_generator, "prefill_step_size", 0)
                 or getattr(self.config, "prefill_step_size", 2048)
@@ -6785,6 +6836,223 @@ class Scheduler:
                 continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
         return None, refusals
+
+    def _memguard_admit_handoffs(
+        self, guard: MemoryGuard, ceiling: int, rows: list[RowPlan]
+    ) -> bool:
+        """Admission side of the session handoff. A request admitted with a
+        prefix hit is copied into the batch while its prefix entry still
+        holds the same buffers (copy-on-admit): the session twice. When that
+        does not fit, the entry hands its buffers over instead: every entry
+        holding them is evicted -- the one keyed by the fetched prefix (exact
+        and prefix loans are deep copies sharing its buffers) and any whose
+        array OBJECTS the loan shares (LCP and supersequence loans) -- and
+        the loan becomes their sole owner, so the copy is skipped. Not when
+        another queued loan shares the same array objects (a write would
+        reach it). Returns True when it handed over."""
+        admitting = [r for r in rows if r.admitting and r.admit_bytes > 0]
+        if not admitting:
+            return False
+        configured = int(getattr(self.batch_generator, "prefill_step_size", 0) or 0)
+        shape = step_shape(rows, max(1, configured))
+        need = guard.plan_transient(
+            shape, admit_bytes=sum(r.admit_bytes for r in rows if r.segment > 0)
+        )
+        need += guard.margin(need, ceiling)
+        if self._metal_footprint_bytes(reclaim_over=ceiling - need) + need <= ceiling:
+            return False
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return False
+        bg = self.batch_generator
+        # The singleton pass-through (which honours the hand-over) only runs
+        # when the row is admitted ALONE into an empty prompt batch; any
+        # padded merge copies regardless, so the copy stays charged there.
+        unprocessed = list(getattr(bg, "_unprocessed_sequences", ()) or ())
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if len(unprocessed) != 1 or (
+            prompt_batch is not None and len(prompt_batch) > 0
+        ):
+            return False
+        handed = False
+        for row in admitting:
+            request = self.running.get(row.request_id)
+            if request is None:
+                continue
+            uid = self.request_id_to_uid.get(row.request_id)
+            item = next((it for it in unprocessed if it and it[0] == uid), None)
+            layers = _exact_data_layers(item[3]) if item is not None else []
+            if not layers or not _handover_admissible(item[3]):
+                continue
+            shared = {id(a) for layer in layers for a in (layer.keys, layer.values)}
+            if any(
+                id(getattr(layer, "keys", None)) in shared
+                for queued in list(self.waiting)
+                for layer in _exact_data_layers(getattr(queued, "prompt_cache", None))
+            ):
+                continue
+            cached = int(request.cached_tokens or 0)
+            keys = {
+                tuple(request.prompt_token_ids[:cached]),
+                tuple(request.prompt_token_ids[: cached + 1]),
+            }
+            with mac._lock:  # noqa: SLF001
+                owners = [
+                    key
+                    for key, entry in mac._entries.items()  # noqa: SLF001
+                    if key in keys
+                    or any(
+                        id(getattr(layer, "keys", None)) in shared
+                        for layer in _exact_data_layers(entry.cache)
+                    )
+                ]
+                for key in owners:
+                    mac._evict_entry_locked(key, reason="handoff")  # noqa: SLF001
+            # No entry left holds these buffers (each entry owns distinct
+            # ones; any that held them was just evicted): the loan is their
+            # sole owner and its copy would hold the session twice.
+            _mark_handed_over(item[3])
+            guard.counts["admission_handoffs"] += 1
+            handed = True
+            logger.warning(
+                "[memory_guard] admission handoff: request %s takes over its "
+                "%s prefix hit (%d cached tokens, %.2fGB, %d entr%s evicted) "
+                "instead of copying it",
+                row.request_id[:12],
+                getattr(request, "cache_hit_type", None),
+                cached,
+                row.admit_bytes / 1e9,
+                len(owners),
+                "y" if len(owners) == 1 else "ies",
+            )
+        return handed
+
+    def _memguard_generation_lengths(self) -> list[int]:
+        """Context length of every row in mlx-lm's generation (decode) batch."""
+        bg = self.batch_generator
+        gen = getattr(bg, "_generation_batch", None)
+        lengths: list[int] = []
+        for uid in list(getattr(gen, "uids", None) or ()):
+            request = self._memguard_request_for_uid(uid)
+            if request is None:
+                continue
+            lengths.append(
+                len(request.prompt_token_ids or ()) + int(request.num_output_tokens)
+            )
+        return lengths
+
+    def _memguard_merge_bytes(
+        self, gen_lengths: list[int], join_lengths: list[int], kv_fn: Any
+    ) -> int:
+        """Bytes a join allocates: the merged batch buffers (every row padded
+        to the longest), plus -- when the decoding batch is one singleton row
+        -- the promotion copy of that row (measured on Metal: an 82 MB row
+        joined by a 50-token row = +205 MB active, +246 MB peak = 3 x 82)."""
+        if not gen_lengths or not join_lengths:
+            return 0
+        longest = max(gen_lengths + join_lengths)
+        merged = (len(gen_lengths) + len(join_lengths)) * int(kv_fn(longest))
+        promote = int(kv_fn(gen_lengths[0])) if len(gen_lengths) == 1 else 0
+        return merged + promote
+
+    def _memguard_make_room(self, extra: int, ceiling: int, max_level: int) -> bool:
+        """Footprint + ``extra`` + margin under the ceiling, clearing the
+        allocator cache and evicting with the ONE policy up to ``max_level``."""
+        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        footprint = self._metal_footprint_bytes(reclaim_over=ceiling - extra - margin)
+        while footprint + extra + margin > ceiling:
+            if not self._memguard_evict_ordered(max_level, reason="join"):
+                return False
+            mx.clear_cache()
+            footprint = self._metal_footprint_bytes()
+        return True
+
+    def _memguard_check_generation_merge(
+        self, guard: MemoryGuard, ceiling: int
+    ) -> bool:
+        """Rows whose prefill ends now move to the decoding batch in this
+        next(). Returns True when one was deferred (the caller re-plans)."""
+        bg = self.batch_generator
+        gen_lengths = self._memguard_generation_lengths()
+        if not gen_lengths:
+            return False
+        completion = int(getattr(bg, "completion_batch_size", 0) or 0)
+        if completion and len(gen_lengths) >= completion:
+            return False  # mlx-lm moves nothing to generation this step
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        uids = list(getattr(prompt_batch, "uids", None) or ())
+        joiners: list[Request] = []
+        for index, item in enumerate(getattr(bg, "_currently_processing", ()) or ()):
+            try:
+                segments = item[0]
+                moving = len(segments) == 1 and len(segments[0]) == 1
+            except (IndexError, TypeError):
+                continue
+            if moving and index < len(uids):
+                request = self._memguard_request_for_uid(uids[index])
+                if request is not None:
+                    joiners.append(request)
+        if not joiners:
+            return False
+        kv_fn = self._kv_footprint_fn()
+        if kv_fn is None:
+            return False
+        extra = self._memguard_merge_bytes(
+            gen_lengths, [len(r.prompt_token_ids or ()) for r in joiners], kv_fn
+        )
+        if self._memguard_make_room(extra, ceiling, EVICT_NEEDED):
+            return False
+        for request in joiners:
+            self._memguard_defer_request(
+                request, extra, ceiling, reason="join the decoding batch"
+            )
+        return True
+
+    def _memguard_joiner_fits(
+        self, guard: MemoryGuard, ceiling: int, row: RowPlan
+    ) -> bool:
+        """A request admitted while others decode will, at the end of its
+        prefill, hold its whole KV AND merge into the decoding batch. If that
+        cannot fit even after evicting what no live session needs, it waits
+        (deferred) -- it is never refused for a peak the others cause."""
+        gen_lengths = self._memguard_generation_lengths()
+        kv_fn = self._kv_footprint_fn()
+        if not gen_lengths or kv_fn is None:
+            return True
+        final = max(row.prompt_tokens, row.offset + row.segment)
+        extra = (
+            int(kv_fn(final))
+            + row.admit_bytes
+            + self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+        )
+        if self._memguard_make_room(extra, ceiling, EVICT_REDUNDANT):
+            return True
+        request = self.running.get(row.request_id)
+        if request is None:
+            return True
+        self._memguard_defer_request(
+            request, extra, ceiling, reason="prefill beside the decoding batch"
+        )
+        return False
+
+    def _memguard_defer_request(
+        self, request: Request, needed: int, ceiling: int, *, reason: str
+    ) -> None:
+        guard = self._memguard()
+        if guard is not None:
+            guard.counts["deferrals"] += 1
+        request._memguard_wait_for_idle = True
+        others = [rid for rid in self.running if rid != request.request_id]
+        self._memguard_requeue(request)
+        logger.warning(
+            "[memory_guard] deferred request %s (%s needs %.2fGB more, ceiling "
+            "%.2fGB): waits until %d running request(s) finish",
+            request.request_id[:12],
+            reason,
+            needed / 1e9,
+            ceiling / 1e9,
+            len(others),
+        )
 
     def _memguard_requeue(self, request: Request) -> None:
         """Put a tokenless running request back at the head of the queue:

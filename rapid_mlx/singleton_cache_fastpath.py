@@ -179,6 +179,9 @@ def _singleton_filter(self, batch_indices):
 
 
 _SURFACE_NAMES = ("filter", "extract", "extend")
+# Set by the memory guard's admission handoff (scheduler._mark_handed_over).
+_SOLE_OWNER = "_lz_sole_owner"
+_NOT_CARRIED = (*_SURFACE_NAMES, _SOLE_OWNER)
 
 
 def _copy_exact_layer(cache_obj: Any) -> Any:
@@ -193,12 +196,12 @@ def _copy_exact_layer(cache_obj: Any) -> Any:
     """
     if isinstance(cache_obj, RotatingKVCache):
         clone = copy.deepcopy(cache_obj)
-        for name in _SURFACE_NAMES:
+        for name in _NOT_CARRIED:
             clone.__dict__.pop(name, None)
         return clone
     clone = type(cache_obj).__new__(type(cache_obj))
     clone.__dict__.update(
-        (k, v) for k, v in cache_obj.__dict__.items() if k not in _SURFACE_NAMES
+        (k, v) for k, v in cache_obj.__dict__.items() if k not in _NOT_CARRIED
     )
     if cache_obj.keys is None:
         return clone
@@ -235,6 +238,13 @@ def _detach_layer(cache_obj: Any) -> Any:
         return clone
     if type(cache_obj) in _SINGLETON_EXACT_TYPES:
         if getattr(cache_obj, "keys", None) is None:
+            return cache_obj
+        if cache_obj.__dict__.pop(_SOLE_OWNER, False):
+            # LeanZero memory guard (admission handoff): every prefix entry
+            # holding this loan's buffers or array objects was evicted and no
+            # queued loan shares them, so nothing else can see a write and
+            # the copy -- the session twice under memory pressure -- is
+            # skipped. One-shot: popped here, never carried by a copy.
             return cache_obj
         return _copy_exact_layer(cache_obj)
     # Native batch-surface layers (hybrid ArraysCache/MambaCache): every
