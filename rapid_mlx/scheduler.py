@@ -6625,25 +6625,44 @@ class Scheduler:
                 only_leaves and getattr(entries[key], "message_boundary", False)
             ):
                 heads.add(key)
-        # Only the MOST RECENTLY USED session keeps its head until the floor
-        # (a running or queued request that extends a head already makes it
-        # NEEDED above). Any other head -- an abandoned session, a finished
-        # side request, the pre-compaction head of a session goose compacted
-        # -- goes before the chunk is reduced, cheapest to re-prefill first.
-        # Review 3 (real Metal, half Gabee scale): a dead 32k head stayed
-        # protected as the "costliest" while a NEW session's chunk was cut
-        # 2048 -> 1968 -> 1784 at 27k; without it the chunk stays 2048.
-        # While a request runs or waits, IT is the most recent session (its
-        # own heads are NEEDED through ``live`` / ``waiting`` above): no other
-        # head is protected. A head the new session handed over must not
-        # leave an abandoned one as "most recent" (the review-3 case).
-        recent = None
-        if not waiting and not [
+        # Every LOGICAL SESSION keeps its newest head until the floor; a head
+        # is abandoned only when something newer of the same session --
+        # same system-prompt prefix (at least one KV block: KVCache.step
+        # tokens) -- diverges from it: a running / queued request or a newer
+        # head. That is goose compaction (the pre-compaction head is never
+        # continued). goose subagents run their own system prompt, so the
+        # main session's head stays protected while one runs alone (review 4:
+        # with "nothing may run" as the test the main session missed 14 of
+        # 15 turns behind a 60k subagent). Abandoned heads go before any
+        # chunk reduction, cheapest to re-prefill first (review 3: a dead
+        # 32k head made a new session's chunk 2048 -> 1784).
+        block = kv_growth_step()
+
+        def same_session(a: Any, b: Any) -> bool:
+            # Keys are tuples, live prompts lists: compare as tuples.
+            return (
+                len(a) >= block
+                and len(b) >= block
+                and tuple(a[:block]) == tuple(b[:block])
+            )
+
+        newest: list[Any] = [
             t for t, _f in live if storing is None or t is not storing[0]
-        ]:
-            for key in entries:  # LRU -> MRU
-                if key in heads:
-                    recent = key
+        ] + list(waiting)
+        if storing is not None:
+            newest.insert(0, storing[0])
+        protected: set[tuple] = set()
+        for key in reversed(list(entries)):  # MRU -> LRU
+            if key not in heads:
+                continue
+            rep = next((r for r in newest if same_session(key, r)), None)
+            if rep is None:
+                newest.append(key)  # the newest head of its session
+                protected.add(key)
+            elif tuple(rep[: len(key)]) == key and (
+                not isinstance(rep, tuple) or rep in protected
+            ):
+                protected.add(key)  # on the newest path (its boundary)
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
@@ -6655,10 +6674,7 @@ class Scheduler:
                     and getattr(entry, "message_boundary", False)
                 )
             ):
-                same_session = recent is not None and (
-                    recent[: len(key)] == key or key[: len(recent)] == recent
-                )
-                level = EVICT_NEEDED if same_session else EVICT_HEAD
+                level = EVICT_NEEDED if key in protected else EVICT_HEAD
             cost = int(getattr(entry, "memory_bytes", 0) or 0)
             ranked.append((level, len(key), position, key, cost))
         ranked.sort(key=lambda item: item[:3])
@@ -7757,6 +7773,8 @@ class Scheduler:
             max_level, keep_last=True, reason="system pressure", count=False
         ):
             evicted += 1
+        if level < SYSTEM_PRESSURE_CRITICAL:
+            evicted += self._memguard_keep_only_recent_session()
         if evicted:
             mx.clear_cache()
             if guard is not None:
@@ -7768,6 +7786,50 @@ class Scheduler:
                 evicted,
                 "y" if evicted == 1 else "ies",
             )
+
+    def _memguard_keep_only_recent_session(self) -> int:
+        """Under machine pressure (WARN) the cache keeps what a running or
+        queued request needs and the MOST RECENTLY USED session's head (and
+        its boundary) -- not every logical session's newest head. Running
+        requests count as live, so the main session's head survives while
+        its subagent runs (review 4, C2)."""
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return 0
+        evicted = 0
+        with mac._lock:  # noqa: SLF001
+            entries = mac._entries  # noqa: SLF001
+            if len(entries) <= 1:
+                return 0
+            live = [
+                (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
+                for r in list(getattr(self, "running", {}).values())
+            ]
+            waiting = [r.prompt_token_ids for r in list(getattr(self, "waiting", ()))]
+            # The most recently used FINISHED session: entries a running or
+            # queued request needs are kept anyway (their level), so recency
+            # is taken among the rest -- the main session's head while its
+            # subagent runs and stores entries of its own.
+            recent = next(
+                (
+                    k
+                    for k in reversed(list(entries))
+                    if self._memguard_entry_level(k, live, waiting) == EVICT_UNUSED
+                ),
+                None,
+            )
+            if recent is None:
+                return 0
+            for key in list(entries):
+                if len(entries) <= 1:
+                    break
+                if recent[: len(key)] == key or key[: len(recent)] == recent:
+                    continue
+                if self._memguard_entry_level(key, live, waiting) != EVICT_UNUSED:
+                    continue
+                mac._evict_entry_locked(key, reason="system pressure")  # noqa: SLF001
+                evicted += 1
+        return evicted
 
     def _memguard_on_idle(self) -> None:
         """The engine just went idle (step thread): re-measure the idle base
