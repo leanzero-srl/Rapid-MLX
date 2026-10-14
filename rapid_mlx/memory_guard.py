@@ -325,8 +325,11 @@ class PeakModel:
             if a is None or a < 0 or b is None or b < g:
                 a = b = None  # not separable on this data: fall through
         if a is None:
+            # Not separable: b = the analytic copy, a = the MEDIAN over chunk
+            # sizes (the first guard took the max, so one size's noise -- or
+            # chunk-256's non-linearity in context -- set the coefficient).
             b = g
-            a = max(max(0.0, sl - g) / max(1, u) for u, sl in groups)
+            a = _median([max(0.0, sl - g) / max(1, u) for u, sl in groups])
         return min(max(0.0, a), a_cap), min(max(g, b), b_cap)
 
     @staticmethod
@@ -570,6 +573,7 @@ class MemoryGuard:
         self.last_step_footprint = 0
         # The advertised window and a pending (candidate, model version).
         self._published_window: int | None = None
+        self._published_calibrated = False
         self._pending_window: tuple[int, Any] | None = None
         # E5: [context_threshold, extra_bytes, original] decaying margins.
         self._backstop: list[list[float]] = []
@@ -623,11 +627,30 @@ class MemoryGuard:
         if version is None:
             version = self.model.observations
         published = self._published_window
-        if published is None:
+        if published is None or (
+            not self._published_calibrated and self.model.calibrated
+        ):
+            # The first figure, and the first CALIBRATED figure (the prior is
+            # conservative), publish at once; after that only confirmed
+            # decreases move it.
+            if published != candidate and published is not None:
+                logger.warning(
+                    "[memory_guard] advertised window %d -> %d tokens (first "
+                    "calibrated figure)",
+                    published,
+                    candidate,
+                )
             self._published_window = candidate
+            self._published_calibrated = self.model.calibrated
             self._pending_window = None
             return candidate
         if abs(candidate - published) <= WINDOW_BAND_RATIO * max(1, published):
+            self._pending_window = None
+            return published
+        if candidate > published and self._published_calibrated:
+            # Never RISES once a calibrated figure is out: goose caches the
+            # first figure it reads (real Metal 124,440 -> 155,476 -> 140,512
+            # -> 145,647 before this rule).
             self._pending_window = None
             return published
         pending = self._pending_window
@@ -643,6 +666,7 @@ class MemoryGuard:
                 candidate,
             )
             self._published_window = candidate
+            self._published_calibrated = self.model.calibrated
             self._pending_window = None
             return candidate
         if pending is None or pending[1] != version:

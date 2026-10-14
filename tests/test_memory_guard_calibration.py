@@ -189,3 +189,69 @@ def test_context_scaled_cost_is_separated_from_chunk_x_context():
     assert model.context_bytes_per_token == pytest.approx(30_000, rel=0.25)
     far = StepShape(1, 256, 200_000)
     assert truth(far) <= 1.10 * model.project(far)
+
+
+@pytest.mark.parametrize("context", [40_000, 80_000, 130_000])
+def test_calibrated_at_2048_a_first_chunk_at_256_is_not_under_projected(context):
+    """A guard that has only ever seen 2048-token chunks (the steady ladder)
+    plans a turn's FIRST chunk at the 256 floor after a prefix hit: its
+    projection must cover the true step -- the 256-chunk work AND the
+    admission copy of the cached KV (copy-on-admit: the entry still holds
+    the same buffers). Nothing about the 256 shape was observed, so no credit
+    is given for it, and the copy is charged whole."""
+    rng = random.Random(7)
+    guard = MemoryGuard(Q8_PRIOR, floor_tokens=256)
+    for x in range(8_000, 40_000, 2_000):
+        s = StepShape(1, 2048, x)
+        guard.observe(s, int(_steady(s) * rng.uniform(0.97, 1.03)))
+    assert guard.model.calibrated
+    shape = StepShape(1, 256, context)
+    copy = _kv(context - 256)
+    truth = _steady(shape) + copy
+    assert guard.plan_transient(shape, admit_bytes=copy) >= truth
+    # Negative control: without the copy charged, the same plan is short by
+    # far more than any margin -- the first chunk would be an OOM.
+    plain = guard.model.project(shape)
+    assert plain + guard.margin(plain, CEILING) < truth
+
+
+def test_the_advertised_window_never_rises_after_its_first_calibrated_figure():
+    """goose caches the first max_model_len it reads per model, so a figure
+    that later RISES is worse than useless (real Metal before this rule:
+    124,440 -> 155,476 -> 140,512 -> 145,647). The prior's conservative
+    figure gives way to the first calibrated one at once; after that only
+    confirmed decreases move it. RED on 605548ef6: a confirmed rise is
+    published."""
+    guard = MemoryGuard(Q8_PRIOR, floor_tokens=256)
+    assert not guard.model.calibrated
+    prior_figure = guard.published_window(120_000, NATIVE)
+    assert prior_figure == 120_000
+    for x in range(8_000, 40_000, 2_000):  # calibrates
+        s = StepShape(1, 2048, x)
+        guard.observe(s, int(_steady(s)))
+    assert guard.model.calibrated
+    first = guard.published_window(150_000, NATIVE, version=1)
+    assert first == 150_000  # the first calibrated figure, at once
+    for version, candidate in enumerate((170_000, 171_000, 172_000), start=2):
+        assert guard.published_window(candidate, NATIVE, version=version) == first
+    # A confirmed decrease still moves it.
+    guard.published_window(120_000, NATIVE, version=10)
+    assert guard.published_window(120_500, NATIVE, version=11) < first
+
+
+def test_unseparable_chunk_sizes_take_the_median_not_the_worst():
+    """When a and b cannot be separated (the per-unit cost is not linear in
+    the chunk, so the fitted intercept falls below one layer's copy), the
+    attention coefficient is the MEDIAN per-unit slope across chunk sizes:
+    one size's outlier does not set it for every size. RED on 605548ef6
+    (the max: ~299 here)."""
+    model = PeakModel(Q8_PRIOR)
+    g = Q8_PRIOR.kv_copy_bytes_per_context
+    per_unit = {256: 20.0, 1024: 70.0, 2048: 300.0}  # convex in the chunk
+
+    for chunk, a in per_unit.items():
+        for x in range(20_000, 120_000, 6_000):
+            s = StepShape(1, chunk, x)
+            # A context term BELOW the analytic copy: not separable.
+            model.observe(s, int(a * s.units + 0.5 * g * s.context + 1e6))
+    assert model.attention_bytes_per_unit < 120.0
