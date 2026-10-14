@@ -8533,7 +8533,11 @@ class Scheduler:
             # the next-turn entries go too. The first guard ran plain LRU
             # here and twice left 0 entries mid-session on Gabee (61k, 74k),
             # so the next turn re-prefilled everything (361 s, 465 s).
-            if not self._memguard_evict_ordered(
+            if getattr(self, "_memory_guard", None) is None and not guard_enabled():
+                # RAPID_MLX_MEMORY_GUARD=0 restores the lz.10 evictor exactly.
+                if not self._evict_one_prefix_cache_entry():
+                    break
+            elif not self._memguard_evict_ordered(
                 EVICT_NEEDED if hard else EVICT_REDUNDANT,
                 keep_last=not hard,
                 reason="pressure",
