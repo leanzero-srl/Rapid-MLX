@@ -315,6 +315,12 @@ _PLAN_ATTEMPTS = 64
 _ANONYMOUS_LINE = ("anonymous",)
 
 
+def _memguard_named_line(line: Any) -> bool:
+    """A conversation line the client named (goose's agent-session-id): the
+    only kind whose diverged heads are certainly its own dead branches."""
+    return isinstance(line, tuple) and len(line) == 2 and line[0] == "session"
+
+
 def _exact_data_layers(caches: Any) -> list[Any]:
     """Leaf layers that carry K/V arrays (wrappers such as CacheList
     recursed), i.e. the layers copy-on-admit would copy."""
@@ -6814,9 +6820,10 @@ class Scheduler:
         # first. Gabee Q8 ladder (b06acd8ea, k=57): main's admission evicted
         # the side subagent's two entries and kept main's dead 72,260-token
         # branch; the side then re-prefilled 22.6k tokens at the floor chunk
-        # and that cost main its 73,223-token boundary. As in the store: the
-        # anonymous line (raw prompts, no hint) is many conversations, so it
-        # has no branches.
+        # and that cost main its 73,223-token boundary. As in the store: only
+        # a conversation the client named (a session id) has branches; a
+        # line of raw prompts or of a frame + first message can be several
+        # clients (review 6, item 3).
         branches: set[tuple] = set()
         for key in reversed(list(entries)):  # MRU -> LRU
             if key not in heads:
@@ -6832,7 +6839,7 @@ class Scheduler:
             gone = (line, frame) in outlived
             if not diverged and not gone:
                 protected.add(key)
-            elif diverged and not gone and line != _ANONYMOUS_LINE:
+            elif diverged and not gone and _memguard_named_line(line):
                 branches.add(key)
             reps.append((line, frame, key))  # a newer head for older ones
         protected |= self._memguard_kept_turn_boundaries(outlived)
@@ -8476,12 +8483,19 @@ class Scheduler:
             }
             entries = mac._entries  # noqa: SLF001
             abandoned = 0
-            if line[0] != _ANONYMOUS_LINE:
+            if _memguard_named_line(line[0]):
                 # The dead branches of THIS conversation: entries of the same
                 # session and frame this turn diverged from (a compaction, a
                 # turn the template re-rendered). Review 5: on a template
                 # that drops reasoning, every user turn left the previous
                 # turn's entries behind (14 entries after 4 turns vs 4).
+                # Only when the CLIENT named the conversation (a session id):
+                # without one, two clients sharing the system prompt, tools
+                # and first message (best-of-N, parallel agents) are one
+                # line and each dropped the other's head at every store, with
+                # no pressure at all (review 6, item 3: both twins cached 900
+                # of 1,404-2,016 every turn on a 128 GB sim). Their diverged
+                # heads rank EVICT_HEAD and go only under duress.
                 for k in list(entries):
                     if (
                         k == key

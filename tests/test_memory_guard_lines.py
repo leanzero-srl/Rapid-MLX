@@ -195,3 +195,43 @@ def test_the_count_bound_keeps_the_live_chat_after_finished_chats(cpu, cap, head
     nxt = line + [904] + _hybrid_tokens(901, 300) + _GEN_PROMPT
     cached, _o = _hybrid_run(s, "live-1", nxt, len(nxt) - 3, **kw)
     assert cached >= len(line) - 8, (cached, len(line))
+
+
+# -- item 3: no-header twins, a big Mac with no pressure ------------------
+
+from tests.test_memory_guard_session import M4_MAX_128_CEILING  # noqa: E402
+
+
+@pytest.mark.parametrize("hint", ["frame", "none", "sessions"])
+def test_twin_clients_without_a_session_id_keep_their_heads(llama, monkeypatch, hint):
+    """Item 3 (MED): two clients with no session id that share the system
+    prompt, tools and first message (best-of-N, parallel agents) are one
+    line. On b06acd8ea each store dropped the other's head as "its
+    conversation left behind" -- no pressure at all on 128 GB: both cached
+    900 of 1,404-2,016 tokens every turn (9 abandoned). The store drops
+    dead branches only of a conversation the client named. "none" (raw)
+    and "sessions" (two session ids) are the controls."""
+    device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
+    s = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, s)
+    first = _new_tokens(0, 900)
+    paths = {"A": first + _new_tokens(1, 300), "B": first + _new_tokens(2, 300)}
+    rows = []
+    for t in range(5):
+        for name in ("A", "B"):
+            kw = {
+                "frame": {"first_end": 900},
+                "none": {},
+                "sessions": {"session": name, "frame": 900},
+            }[hint]
+            rid = f"{name}{t}"
+            outs = _drive(s, [_request(rid, paths[name], 4, **kw)])[rid]
+            rows.append((name, t, len(paths[name]), outs[-1].cached_tokens))
+            paths[name] = paths[name] + _tokens(outs) + _new_tokens(
+                10 * t + (1 if name == "A" else 2), 200
+            )
+    misses = [r for r in rows if r[1] > 0 and r[2] - r[3] > 210]
+    assert not misses, misses
+    guard = s._memguard()
+    assert guard.counts["abandoned"] == 0
+    assert guard.counts["evictions"] == 0 and guard.counts["chunks_reduced"] == 0
