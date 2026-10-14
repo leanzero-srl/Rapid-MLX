@@ -523,8 +523,9 @@ def sc_helper_beside_a_younger_turn(w, header, end):
     w.turn("A", outcome="tool_calls")
     w.turn("A", user=False, outcome=end)
     before = len(w.convs["A"].tokens)
-    w.chat("B", size=3500, header=header)
-    title = w.helper("title", "A", size=1500, build=True)
+    w.chat("B", size=1500, header=header)
+    # a long helper call: the younger chat's whole prefill runs beside it
+    title = w.helper("title", "A", size=4000, build=True)
     b_request, b_prompt = w.turn("B", add=200, outcome="stop", build=True)
     w.concurrent(title, b_request)
     conv = w.convs["B"]
