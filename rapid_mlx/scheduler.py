@@ -315,6 +315,22 @@ _PLAN_ATTEMPTS = 64
 _ANONYMOUS_LINE = ("anonymous",)
 
 
+# finish_reasons that mean the client owes the conversation's next request
+# (a tool call being executed -- a subagent working for it --, a length cut
+# to be continued): the only evidence that keeps a non-running line.
+_MEMGUARD_MID_TURN = frozenset({"tool_calls", "length"})
+
+
+def _memguard_outcome(hint: Any) -> str | None:
+    """The finish_reason the chat route reported for a request (its
+    ``SessionHint.outcome`` holder), or None."""
+    holder = getattr(hint, "outcome", None)
+    if not holder:
+        return None
+    value = holder[0]
+    return value if isinstance(value, str) else None
+
+
 def _memguard_named_line(line: Any) -> bool:
     """A conversation line the client named (goose's agent-session-id): the
     only kind whose diverged heads are certainly its own dead branches."""
@@ -6636,108 +6652,169 @@ class Scheduler:
         return {"owner": self._memguard_line(request)}
 
     def _memguard_line_activity(self, request: Any) -> None:
-        """A (line, frame)'s first and latest activity (admission, store), in
-        one monotonic sequence, plus what ``_memguard_outlived_lines`` reads
-        from the request itself: its latest user-turn activity, the hint of
-        its latest request (whose ``outcome`` the chat route fills with the
-        finish_reason), and whether the frame ever carried more than one
-        message (a conversation, not a one-message helper call)."""
+        """Record one activity (admission, store) of a request's
+        ``(line, frame)`` in one monotonic sequence -- what
+        ``_memguard_outlived_lines`` reads. Everything recorded is a property
+        of the request itself: its hint (whose ``outcome`` the chat route
+        fills with the finish_reason), whether it ends in a user message,
+        its rendered system/tools frame (the conversation's KIND), and
+        whether its prompt CONTINUES the previous request of the same frame
+        (a conversation, not a one-shot helper call: a title, a summary, a
+        Recipe or MCP-sampling call)."""
         owner = self._memguard_line(request)
         seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
         self._memguard_seq = seq
         lines = self.__dict__.setdefault("_memguard_lines", {})
-        hint = getattr(request, "session_hint", None)
-        # [first, latest, latest user-turn activity, latest hint, conversation]
         record = lines.get(owner)
         if record is None:
-            record = lines[owner] = [seq, seq, 0, hint, False]
-        record[1] = seq
-        record[3] = hint
+            record = lines[owner] = {
+                "first": seq,
+                "last": seq,
+                "turn": 0,
+                "hint": None,
+                "rid": None,
+                "prev": None,
+                "continues": False,
+                "kind": None,
+            }
+        hint = getattr(request, "session_hint", None)
+        prompt = getattr(request, "prompt_token_ids", None) or ()
+        rid = getattr(request, "request_id", None)
+        if rid != record["rid"]:  # a new request of this frame
+            prev = record["prev"]
+            if prev is not None:
+                # It continues the previous request: longer than that whole
+                # prompt and sharing it up to its last message boundary (the
+                # generation prompt may re-render). A repeat is not one.
+                tokens, upto = prev
+                if len(prompt) > len(tokens) and self._memguard_seq_prefix(
+                    tokens[:upto], prompt
+                ):
+                    record["continues"] = True
+            boundary = int(getattr(request, "prefix_boundary", 0) or 0)
+            upto = boundary if 0 < boundary <= len(prompt) else len(prompt)
+            record["prev"] = (prompt, upto)
+            record["rid"] = rid
+            frame = min(int(getattr(hint, "frame", 0) or 0), len(prompt))
+            if frame > 0:
+                record["kind"] = (frame, hash(tuple(prompt[:frame])))
+        record["last"] = seq
+        record["hint"] = hint
         if getattr(hint, "turn_start", False):
-            record[2] = seq
-        if hint is None or getattr(hint, "multi", True):
-            record[4] = True
+            record["turn"] = seq
 
     def _memguard_outlived_lines(self) -> set[Any]:
         """``(line, frame)`` pairs whose heads are abandoned (EVICT_HEAD: they
-        go under duress before the chunk is reduced, never without it):
+        go under duress before any chunk is reduced, never without it).
 
-        * another conversation (session) that started BEFORE this one ran
-          again after this one's latest activity -- goose: the main session
-          waits while a subagent runs, then its next request: the subagent
-          is finished;
-        * this conversation's turn ENDED (every frame's latest completion
-          finished with a reply, ``finish_reason == "stop"``, as the chat
-          route reports it) and a YOUNGER conversation then started a user
-          turn -- the user left chat A for chat B, or the next benchmark
-          task (review 6, item 1). A conversation that is mid-turn (a tool
-          call pending -- a subagent running for it --, a length cut, or no
-          outcome reported) is never abandoned this way: a younger session's
-          trailing user message (a tool image, a continuation nudge) is not
-          a sign of anything (review 7, item 1);
-        * inside one session: a one-message frame (a title or summary helper
-          call) once a CONVERSATION frame of the same session ran after it.
-          A helper never outlives the conversation, whichever was admitted
-          first (review 7, item 2: a title spawned before the reply loop won
-          the admission race and its TurnEnd retitle demoted main).
+        Per conversation (session line), from its CONVERSATION frames -- the
+        frames whose requests continue each other; until one has, all of
+        them: PENDING when one ended mid-turn (finish_reason "tool_calls" or
+        "length": the client owes the next request -- a tool is running, a
+        subagent works for it, a continuation follows). That is the only
+        evidence that keeps a conversation that is not running; anything
+        else -- a reply, a user Stop, a disconnect, an error, "cancelled", a
+        refusal, a route that reports nothing -- is IDLE. A conversation with
+        a running or queued request is LIVE and never abandoned. Otherwise:
 
-        A line that runs again stops being outlived. Lines with no entry and
-        no request are forgotten."""
+        * an OLDER conversation (one whose requests continue each other) ran
+          after this one's latest activity: a finished subagent (its main
+          took the result);
+        * IDLE, and a YOUNGER conversation started a user turn after it --
+          one of the same kind, or one whose requests continue each other:
+          the user left the chat (or the next benchmark task began). A
+          one-shot call of another kind (a title, a summary: with no session
+          id each is its own line) says nothing about it;
+        * PENDING, and a conversation of the SAME kind (the same rendered
+          system/tools frame: another goose chat window, the next task) that
+          BEGAN after this one's latest activity started a user turn: the
+          chat was left mid tool call. One already running beside it (a
+          concurrent swarm worker of the same kind) does not release it. A session of another kind -- a subagent, whose task and
+          mid-task nudges (a tool image, a FINAL_OUTPUT / goal / grind
+          continuation after a reply) look exactly like a user's turns --
+          never releases it.
+
+        Inside one session, a one-shot frame (a helper call) is outlived once
+        a conversation frame of the session ran after it, whichever was
+        admitted first; a conversation frame is never outlived by its own
+        session. Reviews 6-8: each lifecycle rule built on a single signal
+        broke a sibling goose shape; test_memory_guard_lifecycle_matrix runs
+        all of them on both device arms. Lines with no entry and no request
+        are forgotten."""
         lines = self.__dict__.get("_memguard_lines")
         if not lines:
             return set()
         mac = getattr(self, "memory_aware_cache", None)
         entries = mac._entries if mac is not None else {}  # noqa: SLF001
         present = {self._memguard_entry_line(e) for e in entries.values()}
+        live: set[Any] = set()
         for r in list(getattr(self, "running", {}).values()) + list(
             getattr(self, "waiting", ())
         ):
-            present.add(self._memguard_line(r))
+            owner = self._memguard_line(r)
+            present.add(owner)
+            live.add(owner[0])
         kept = self.__dict__.get("_memguard_turn_boundaries", {})
         for owner in [k for k in lines if k not in present]:
             lines.pop(owner, None)
             kept.pop(owner, None)
             if not any(o[0] == owner[0] for o in lines):
                 self.__dict__.get("_memguard_rewriting_lines", set()).discard(owner[0])
-        # Per conversation: first and latest activity, latest user turn, and
-        # whether its turn ended (every frame's latest completion a reply).
-        sessions: dict[Any, list[Any]] = {}
-        for (line, _frame), (first, last, turn, hint, _conv) in lines.items():
-            outcome = getattr(hint, "outcome", None)
-            ended = bool(outcome) and outcome[0] == "stop"
-            agg = sessions.get(line)
-            if agg is None:
-                sessions[line] = [first, last, turn, ended]
-            else:
-                agg[0] = min(agg[0], first)
-                agg[1] = max(agg[1], last)
-                agg[2] = max(agg[2], turn)
-                agg[3] = agg[3] and ended
+        by_line: dict[Any, list[tuple[Any, dict]]] = {}
+        for owner, record in lines.items():
+            by_line.setdefault(owner[0], []).append((owner, record))
+        state: dict[Any, dict[str, Any]] = {}
+        for line, members in by_line.items():
+            convo = [r for _o, r in members if r["continues"]] or [
+                r for _o, r in members
+            ]
+            state[line] = {
+                "first": min(r["first"] for _o, r in members),
+                "last": max(r["last"] for _o, r in members),
+                "turn": max(r["turn"] for _o, r in members),
+                "pending": any(
+                    _memguard_outcome(r["hint"]) in _MEMGUARD_MID_TURN for r in convo
+                ),
+                "kinds": {r["kind"] for r in convo if r["kind"] is not None},
+                "continues": any(r["continues"] for _o, r in members),
+            }
         gone: set[Any] = set()
-        latest_older = 0
-        for line, (_first, last, _turn, _ended) in sorted(
-            sessions.items(), key=lambda kv: kv[1][0]
-        ):
-            if latest_older > last:
-                gone.add(line)
-            latest_older = max(latest_older, last)
-        for line, (first, last, _turn, ended) in sessions.items():
-            if line in gone or not ended:
+        for line, st in state.items():
+            if line in live:
                 continue
+            others = [(o, ost) for o, ost in state.items() if o != line]
             if any(
-                other != line and o_first > first and o_turn > last
-                for other, (o_first, _l, o_turn, _e) in sessions.items()
+                ost["first"] < st["first"]
+                and ost["last"] > st["last"]
+                and ost["continues"]
+                for _o, ost in others
+            ):
+                gone.add(line)
+            elif not st["pending"]:
+                if any(
+                    ost["first"] > st["first"]
+                    and ost["turn"] > st["last"]
+                    and (ost["continues"] or ost["kinds"] & st["kinds"])
+                    for _o, ost in others
+                ):
+                    gone.add(line)
+            elif any(
+                ost["first"] > st["last"]
+                and ost["turn"] > st["last"]
+                and ost["kinds"] & st["kinds"]
+                for _o, ost in others
             ):
                 gone.add(line)
         outlived = {owner for owner in lines if owner[0] in gone}
-        for owner, (_first, last, _turn, _hint, conv) in lines.items():
-            if conv or owner in outlived:
+        for line, members in by_line.items():
+            if line in gone:
                 continue
-            if any(
-                other[0] == owner[0] and o_conv and o_last > last
-                for other, (_f, o_last, _t, _h, o_conv) in lines.items()
-            ):
-                outlived.add(owner)
+            latest_convo = max(
+                (r["last"] for _o, r in members if r["continues"]), default=0
+            )
+            for owner, record in members:
+                if not record["continues"] and record["last"] < latest_convo:
+                    outlived.add(owner)
         return outlived
 
     def _memguard_entry_level(

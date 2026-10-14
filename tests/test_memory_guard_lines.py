@@ -174,7 +174,10 @@ def test_a_finished_chat_goes_before_the_new_chats_chunk_shrinks(
     assert all(c > 0 for c in turns[1:]), turns
 
 
-@pytest.mark.parametrize("main_outcome", [["tool_calls"], ["length"], None])
+# Review 8: an unreported outcome (a disconnect, a user Stop, a route that
+# reports nothing) is NOT evidence of a pending tool call; only "tool_calls"
+# and "length" are (see test_memory_guard_lifecycle_matrix).
+@pytest.mark.parametrize("main_outcome", [["tool_calls"], ["length"]])
 def test_main_waiting_on_a_subagent_stays_protected(cpu, main_outcome):
     """Review 7, item 1 (HIGH): main is mid-turn (its last completion is a
     tool call -- the subagent --, a length cut, or not reported) while a

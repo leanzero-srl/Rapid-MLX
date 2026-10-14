@@ -49,6 +49,8 @@ ARMS = {
     "nopressure": GABEE_PHYSICAL * 64,
 }
 FRAME = 48  # the rendered system/tools frame of each conversation
+MAIN = 5  # goose's main-agent frame (system prompt + tools)
+SUBAGENT = 6  # a subagent's frame (its own system prompt)
 HELPER_FRAME = 40
 
 
@@ -95,9 +97,12 @@ class World:
         self.s.step = step
 
     # -- traffic ----------------------------------------------------------
-    def chat(self, name, sid=None, *, size=1500, header=True, seed=None):
+    def chat(self, name, sid=None, *, size=1500, header=True, seed=None, kind=MAIN):
+        """A conversation. ``kind``: its rendered system/tools frame -- every
+        goose chat window (and every sequential benchmark task) renders the
+        same one; a subagent renders its own (another system prompt)."""
         seed = seed if seed is not None else 10 + len(self.convs) * 7
-        conv = _Conv(name, sid or name, seed, seed + 1, size, header)
+        conv = _Conv(name, sid or name, kind, seed + 1, size, header)
         self.convs[name] = conv
         return conv
 
@@ -200,16 +205,33 @@ class World:
 
     def flush(self, header=True):
         """(d): a younger chat completes a turn and starts the next one; only
-        it may then hold NEEDED heads."""
-        z = self.chat("zflush", header=header, size=300, seed=97)
+        it may then hold NEEDED heads -- and lines with POSITIVE evidence
+        (their last completion a tool call or a length cut) of a kind the
+        flush chat is not (with no session id, a helper of another system
+        prompt that ended on "length" is its own line; the client owes it a
+        continuation)."""
+        self.chat("zflush", header=header, size=300, seed=97)
         self.turn("zflush", add=100, outcome="stop")
         self.turn("zflush", add=100, outcome="stop")
+        records = self.s.__dict__.get("_memguard_lines", {})
+        flush_record = records.get(self.convs["zflush"].owner)
+        flush_kind = (
+            flush_record.get("kind") if isinstance(flush_record, dict) else None
+        )
         owners = {c.owner for c in self.convs.values() if c.name != "zflush"}
         owners |= set(self.helpers.values())
         for owner in owners:
-            if owner is not None and self._entries(owner):
-                assert self.level(owner) < EVICT_NEEDED, ("pinned", owner)
-        return z
+            if owner is None or not self._entries(owner):
+                continue
+            record = records.get(owner)
+            record = record if isinstance(record, dict) else {}
+            holder = getattr(record.get("hint"), "outcome", None) or [None]
+            if (
+                holder[0] in ("tool_calls", "length")
+                and record.get("kind") != flush_kind
+            ):
+                continue  # positive evidence, another kind
+            assert self.level(owner) < EVICT_NEEDED, ("pinned", owner)
 
     def finish(self):
         assert not self.violations, self.violations
@@ -253,7 +275,7 @@ def sc_main_waits_on_subagent(w, header, mid):
     w.turn("main", outcome="tool_calls")
     w.turn("main", user=False, outcome=mid)
     before = len(w.convs["main"].tokens)
-    w.chat("sub", size=800, header=header)
+    w.chat("sub", size=800, header=header, kind=SUBAGENT)
     for j, out in enumerate(["tool_calls", "tool_calls", "stop", "tool_calls", "stop"]):
         w.turn("sub", user=j != 1, outcome=out)
         w.protected("main", f"subagent step {j}")
@@ -302,30 +324,83 @@ def sc_user_leaves_chat(w, header, end):
     that reports nothing -- with an end-of-turn helper that ended non-stop;
     the user opens chat B. A becomes evictable at B's first completed turn
     and stays so while B grows."""
-    w.chat("A", size=2500, header=header)
+    w.chat("A", size=5600, header=header)
     w.turn("A", outcome="tool_calls")
     w.turn("A", user=False, outcome=end)
     w.helper("factcheck", "A", outcome="length")
     w.chat("B", size=600, header=header)
     w.turn("B", add=200, outcome="stop")
     w.evictable("A", f"A ended with {end}")
-    for _t in range(5):
+    for _t in range(8):
         w.turn("B", add=500, outcome="stop")
         w.protected("B", "B grows")
     w.flush(header)
 
 
-def sc_chat_abandoned_mid_tool_call(w, header, mid):
+def sc_chat_abandoned_mid_tool_call(w, header, arg):
     """A ends mid-turn (a tool call or a length cut) and the user never comes
-    back: B completes a turn and starts another -- A is released."""
-    w.chat("A", size=2500, header=header)
+    back: a chat of the same kind starts its turns -- whether or not its
+    route reports how they ended -- and A is released."""
+    mid, b_out = arg
+    w.chat("A", size=5600, header=header)
     w.turn("A", outcome=mid)
     w.chat("B", size=600, header=header)
-    w.turn("B", add=200, outcome="stop")
-    w.turn("B", add=200, outcome="stop")
+    w.turn("B", add=200, outcome=b_out)
     w.evictable("A", "abandoned mid tool call")
-    for _t in range(4):
-        w.turn("B", add=500, outcome="stop")
+    for _t in range(8):
+        w.turn("B", add=500, outcome=b_out)
+    w.flush(header)
+
+
+def sc_one_request_chat_then_helper(w, header, helper_out):
+    """Review 8's shape: chat A is ONE request (a plain reply), then an
+    end-of-turn helper of A's session ends on "length" or a tool call
+    (FactCheck, PermissionCheck) or is still unreported; the user opens chat
+    B, whose route reports nothing. A is released at B's first turn."""
+    w.chat("A", size=5600, header=header)
+    w.turn("A", outcome="stop")
+    w.helper("factcheck", "A", outcome=helper_out)
+    w.chat("B", size=600, header=header)
+    w.turn("B", add=200, outcome="noholder")
+    w.evictable("A", f"helper {helper_out}")
+    for _t in range(8):
+        w.turn("B", add=500, outcome="noholder")
+    w.flush(header)
+
+
+def sc_mid_tool_call_beside_another_kind(w, header, mid):
+    """The limit of what a request can tell: A is mid-turn (a tool call
+    pending) and a session of ANOTHER kind (another system prompt: a
+    subagent, a different agent) completes turns and starts new ones --
+    including a FINAL_OUTPUT / goal / grind nudge after a reply, which looks
+    exactly like a user's next turn. That is main waiting on its subagent,
+    so A keeps its head (positive evidence: the pending tool call); a chat of
+    A's own kind completing a turn releases it (the flush)."""
+    w.chat("A", size=2500, header=header)
+    w.turn("A", outcome=mid)
+    w.chat("S", size=600, header=header, kind=SUBAGENT)
+    for _t in range(3):
+        w.turn("S", add=200, outcome="stop")
+        w.protected("A", "another kind resumed after a reply")
+    w.flush(header)
+
+
+def sc_concurrent_same_kind_workers(w, header, mid):
+    """Two conversations of the same kind running side by side (swarm
+    workers, two goose windows in use): W1 is mid-turn (its tool is running)
+    while W2, which began before W1's latest request, takes user turns. W1
+    keeps its head and hits when its tool result arrives."""
+    w.chat("W1", size=1500, header=header)
+    w.chat("W2", size=1500, header=header)
+    w.turn("W1", outcome="tool_calls")
+    w.turn("W2", outcome="tool_calls")
+    w.turn("W1", user=False, outcome=mid)
+    before = len(w.convs["W1"].tokens)
+    for _t in range(3):
+        w.turn("W2", add=300, outcome="stop")
+        w.protected("W1", "a concurrent worker of the same kind")
+    cached, length = w.turn("W1", user=False, outcome="stop")
+    assert _hit(cached, length, before), (cached, before)
     w.flush(header)
 
 
@@ -369,14 +444,41 @@ for header in (True, False):
         SCENARIOS.append(
             (f"helpers-{mid}-{tag}", sc_main_waits_on_helpers, header, mid)
         )
+        for b_out in ("stop", "noholder"):
+            SCENARIOS.append(
+                (
+                    f"abandoned-{mid}-b{b_out}-{tag}",
+                    sc_chat_abandoned_mid_tool_call,
+                    header,
+                    (mid, b_out),
+                )
+            )
         SCENARIOS.append(
-            (f"abandoned-{mid}-{tag}", sc_chat_abandoned_mid_tool_call, header, mid)
+            (
+                f"otherkind-{mid}-{tag}",
+                sc_mid_tool_call_beside_another_kind,
+                header,
+                mid,
+            )
         )
     for end in END_STATES:
         SCENARIOS.append((f"left-{end}-{tag}", sc_user_leaves_chat, header, end))
     for end in ("stop", "tool_calls"):
         SCENARIOS.append(
             (f"first-turn-{end}-{tag}", sc_first_turn_then_multi_helper, header, end)
+        )
+    for helper_out in ("length", "tool_calls", "none"):
+        SCENARIOS.append(
+            (
+                f"onerequest-helper{helper_out}-{tag}",
+                sc_one_request_chat_then_helper,
+                header,
+                helper_out,
+            )
+        )
+    for mid in MID_STATES:
+        SCENARIOS.append(
+            (f"concurrent-{mid}-{tag}", sc_concurrent_same_kind_workers, header, mid)
         )
     SCENARIOS.append((f"alternating-{tag}", sc_two_chats_alternating, header, "stop"))
 SCENARIOS.append(("twins", sc_twins, False, "stop"))
