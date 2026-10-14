@@ -928,10 +928,12 @@ class MemoryGuard:
     def idle_room(*, ceiling: int, base: int, fraction: float) -> int:
         """Bytes the prefix entries (and the allocator cache) may hold while
         the engine is IDLE: ``fraction x ceiling - idle base``. ``fraction``
-        is the pressure evictor's own trigger (0.9), so an idle engine never
-        sits above it and nothing is evicted between turns. Live KV is NOT
-        charged here: during a turn the guard makes room on demand (E1 evicts
-        the entry the turn was fetched from, then halves the chunk)."""
+        is the pressure evictor's own trigger (under the guard 1 - the static
+        margin), so an idle engine never sits above it and nothing is
+        evicted between turns. Live KV is NOT charged here: during a turn
+        the guard makes room on demand (E1 evicts the entry the turn was
+        fetched from -- or the next turn takes it over -- then halves the
+        chunk)."""
         return int(fraction * ceiling - base)
 
     def snapshot(self) -> dict[str, Any]:

@@ -6984,6 +6984,14 @@ class Scheduler:
         prefix = self._cache_self_pressure_current_bytes()
         base = max(0, active - prefix)
         if not running:
+            # The MINIMUM since the model loaded: an idle moment can still
+            # hold a finished request's KV (its responses / lazy extract
+            # copies outlive the step, more so when its store was skipped).
+            # Real Metal (review 2026-10-14): 35.26 GB recorded vs 30.00 GB
+            # of weights at 80k -> prefix budget 11.76 -> 6.50 GB -> "Cache
+            # entry too large" from 101k and a full re-prefill every turn.
+            if stored > 0:
+                base = min(stored, base)
             self._memguard_idle_base_bytes = base
         return base
 
@@ -7096,9 +7104,10 @@ class Scheduler:
     def _memguard_apply_budgets(self) -> None:
         """E2 + E3 from what the IDLE engine holds -- never from live KV.
 
-        Idle room = pressure fraction (0.9) x ceiling - idle base (weights +
-        fixed state). E3: the prefix budget in force is min(configured, idle
-        room): entries that fit beside the weights while idle are kept, and
+        Idle room = pressure fraction (0.98 under the guard) x ceiling - idle
+        base (weights + fixed state). E3: the prefix budget in force is
+        min(configured, idle room): entries that fit beside the weights while
+        idle are kept, and
         the operator's --cache-memory-percent / --cache-memory-mb stay upper
         bounds. During a turn the guard makes room on demand (E1 evicts the
         entry the turn was fetched from -- duplicated in the live cache --
@@ -7124,7 +7133,7 @@ class Scheduler:
             guard.idle_room(
                 ceiling=ceiling,
                 base=base,
-                fraction=self._resolve_pressure_evict_fraction(),
+                fraction=self._memguard_pressure_fraction(),
             ),
         )
 
@@ -7137,6 +7146,13 @@ class Scheduler:
             )
             guard.configured_prefix_budget = configured
             effective = min(configured, room)
+            # Never below the newest entry: the session's next-turn base must
+            # stay storable (it fits by construction at idle; a budget
+            # squeezed under it turns every later turn into a re-prefill).
+            with mac._lock:  # noqa: SLF001
+                newest = next(reversed(mac._entries.values()), None)  # noqa: SLF001
+            if newest is not None:
+                effective = max(effective, min(configured, int(newest.memory_bytes)))
             previous = guard.effective_prefix_budget
             if previous is None or abs(effective - previous) > REAPPLY_RATIO * max(
                 1, previous
@@ -7152,7 +7168,7 @@ class Scheduler:
                         effective / 1e9,
                         configured / 1e9,
                         room / 1e9,
-                        self._resolve_pressure_evict_fraction(),
+                        self._memguard_pressure_fraction(),
                         ceiling / 1e9,
                         base / 1e9,
                         evicted,
@@ -8346,6 +8362,21 @@ class Scheduler:
             raw_fraction = 1.0
         return raw_fraction
 
+    def _memguard_pressure_fraction(self) -> float:
+        """The pressure evictors' trigger as a fraction of the cap.
+
+        Guard off: the operator's ``metal_pressure_evict_fraction`` (0.9),
+        lz.10 exactly. Guard on: the guard's own static margin
+        (1 - MARGIN_CEILING_RATIO). Every allocation is planned against the
+        ceiling at dispatch (E1) and store time, so an IDLE engine may hold
+        entries up to the margin; a 10% idle reserve capped the largest
+        storable session at 0.9 x ceiling - weights, below the context the
+        guard itself admits, and every later turn re-prefilled (session sim,
+        2026-10-14: entries vanished at 18.6k with a 22.9k window)."""
+        if getattr(self, "_memory_guard", None) is None and not guard_enabled():
+            return self._resolve_pressure_evict_fraction()
+        return 1.0 - MARGIN_CEILING_RATIO
+
     def _cache_self_pressure_threshold_bytes(self) -> int:
         """Return the prefix-cache memory threshold above which the
         scheduler proactively evicts, INDEPENDENT of ``gpu_memory_utilization``.
@@ -8383,7 +8414,7 @@ class Scheduler:
         max_memory = int(getattr(cache, "_max_memory", 0) or 0)
         if max_memory <= 0:
             return 0
-        return int(max_memory * self._resolve_pressure_evict_fraction())
+        return int(max_memory * self._memguard_pressure_fraction())
 
     def _cache_self_pressure_current_bytes(self) -> int:
         """Snapshot of memory_aware_cache's current ledger in bytes.
@@ -8467,7 +8498,7 @@ class Scheduler:
         # trie-based PrefixCacheManager engines).
         if metal_cap <= 0 and cache_self_threshold <= 0:
             return 0
-        fraction = self._resolve_pressure_evict_fraction()
+        fraction = self._memguard_pressure_fraction()
         metal_threshold = int(metal_cap * fraction) if metal_cap > 0 else 0
         evicted = 0
         # Track which trigger fired at least once during this tick so
