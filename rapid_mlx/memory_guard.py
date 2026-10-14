@@ -126,11 +126,31 @@ MAX_PRIOR_MULTIPLE = 4.0
 BACKSTOP_CONTEXT_FRACTION = 0.75
 BACKSTOP_DECAY = 0.97
 BACKSTOP_DROP_FRACTION = 0.01
+# A decode step at which mlx-lm grows the KV (a row's offset reaches the
+# buffer's capacity; KVCache grows by KVCache.step tokens by concatenation)
+# holds this many full-attention LAYERS of the whole context beyond the
+# resident footprint: the layer being concatenated (old + new buffer) and
+# the previous layer still referenced by the in-flight async step (mlx-lm's
+# generation pipelines one step ahead).
+# measured: real MLX allocator, session sim at 1/100 of Gabee, peak - resident
+# on the growth step = 42.54 MB at 19,600 tokens and 43.58 MB at 20,100
+# (one layer 20.07 / 20.58 MB): 2.12 layers each, of which 0.10 is the new
+# KVCache.step block (charged separately); post-step +1.1 layer, freed on
+# the next step. 605548ef6..f7df48332 never planned it: 1.5% over the
+# ceiling at the window edge (0.4% at Gabee's 1/8 scale).
+DECODE_GROWTH_LAYERS = 2.0  # measured: see above
 
 
 def guard_enabled() -> bool:
     raw = os.environ.get(GUARD_ENV, "1").strip().lower()
     return raw not in ("0", "off", "false", "no")
+
+
+def kv_growth_step() -> int:
+    """Tokens mlx-lm's KVCache grows by when a write exceeds its buffer."""
+    from mlx_lm.models.cache import KVCache
+
+    return max(1, int(KVCache.step))
 
 
 def _gb(value: float) -> float:
@@ -559,6 +579,11 @@ class MemoryGuard:
             # Prefix entries handed over to the request admitted from them
             # (no copy-on-admit) because the copy did not fit.
             "admission_handoffs": 0,
+            # Decode steps whose KV growth would cross the ceiling even after
+            # clearing the cache and evicting every entry: decoded anyway (a
+            # decoding row is never aborted). Expected 0: the window and the
+            # admission of every joiner include the growth.
+            "decode_over_ceiling": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
@@ -715,7 +740,11 @@ class MemoryGuard:
         configured_chunk: int,
         ceiling: int,
         probe: GuardProbe,
+        extra_bytes: int = 0,
     ) -> GuardPlan:
+        """``extra_bytes``: allocated in the same ``next()`` outside the
+        prefill projection (the decoding rows' KV growth): charged like the
+        admission copy, and never fitted."""
         self.counts["checks"] += 1
         self.last_ceiling = ceiling
         caps = [r.chunk_cap for r in rows if r.chunk_cap > 0]
@@ -729,6 +758,7 @@ class MemoryGuard:
             return int(probe.active()) + int(probe.cache())
 
         admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
+        admit += max(0, int(extra_bytes))
 
         def fits(c: int, fp: int) -> tuple[bool, StepShape, int, int]:
             shape = step_shape(rows, c)
@@ -890,6 +920,30 @@ class MemoryGuard:
         return changed
 
     # -- honest context / admission -------------------------------------
+    def decode_growth(
+        self,
+        context: int,
+        *,
+        batch: int = 1,
+        kv_footprint: Callable[[int], int] | None = None,
+    ) -> int:
+        """Bytes beyond the resident footprint of a decode step at which the
+        KV grows (see ``DECODE_GROWTH_LAYERS``): that many full-attention
+        layers of the grown buffer for every row of the decoding batch (rows
+        are padded to the longest), plus the new ``KVCache.step`` block."""
+        if context <= 0:
+            return 0
+        step = kv_growth_step()
+        rows = max(1, int(batch))
+        layer = self.model.prior.kv_copy_bytes_per_context
+        grown = DECODE_GROWTH_LAYERS * layer * (int(context) + step) * rows
+        if kv_footprint is not None:
+            block = int(kv_footprint(int(context) + step)) - int(
+                kv_footprint(int(context))
+            )
+            grown += max(0, block) * rows
+        return int(math.ceil(grown))
+
     def single_sequence_need(
         self,
         context: int,
@@ -898,13 +952,16 @@ class MemoryGuard:
         kv_footprint: Callable[[int], int],
         ceiling: int,
     ) -> int:
-        """Bytes one sequence of ``context`` tokens needs at its last chunk:
-        the idle base (weights), its live KV/state, and the floor chunk's
-        step peak plus margin."""
+        """Bytes one sequence of ``context`` tokens needs at its worst step:
+        the idle base (weights), its live KV/state, and the larger of the
+        floor chunk's prefill peak and a decode step that grows the KV, plus
+        margin."""
         chunk = min(self.floor_tokens, max(1, context))
         shape = StepShape(1, chunk, max(1, context))
         transient, margin = self.need(shape, ceiling, backstop=False)
-        return int(base) + int(kv_footprint(context)) + transient + margin
+        decode = self.decode_growth(context, kv_footprint=kv_footprint)
+        step = max(transient + margin, decode + self.margin(decode, ceiling))
+        return int(base) + int(kv_footprint(context)) + step
 
     def max_context(
         self,

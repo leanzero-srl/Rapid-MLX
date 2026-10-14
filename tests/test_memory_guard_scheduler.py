@@ -233,7 +233,9 @@ def test_a_prompt_that_cannot_fit_at_the_floor_is_refused_with_the_typed_error(
     assert detail["type"] == "invalid_request_error"
     assert detail["lz_reason"] == "context_exceeds_device_memory"
     assert detail["n_prompt_tokens"] == PROMPT
-    assert 0 < detail["n_ctx"] < PROMPT
+    # The honest window here is 0: the first KV write alone allocates a
+    # KVCache.step block for every layer (131 kB), over the 60 kB left.
+    assert 0 <= detail["n_ctx"] < PROMPT
     assert detail["message"].startswith(f"This prompt ({PROMPT} tokens) needs ")
     assert scheduler.get_stats()["memory_guard"]["actions"]["refusals"] == 1
 

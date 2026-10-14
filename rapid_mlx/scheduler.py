@@ -6793,8 +6793,14 @@ class Scheduler:
             # the JOINER when it does not fit (never the decoding rows).
             if self._memguard_check_generation_merge(guard, ceiling):
                 continue
+            # The decoding rows run first in this next(); at a step where
+            # their KV grows it holds ~2 layers of the context beyond the
+            # footprint (DECODE_GROWTH_LAYERS). Charged in the same plan.
+            decode = self._memguard_decode_growth(guard)
             rows = self._memguard_rows()
             if not rows:
+                if decode > 0:
+                    self._memguard_room_for_decode(guard, decode, ceiling)
                 return None, refusals
             if self._memguard_admit_handoffs(guard, ceiling, rows):
                 continue
@@ -6813,7 +6819,11 @@ class Scheduler:
                 or getattr(self.config, "prefill_step_size", 2048)
             )
             plan = guard.plan(
-                rows, configured_chunk=configured, ceiling=ceiling, probe=probe
+                rows,
+                configured_chunk=configured,
+                ceiling=ceiling,
+                probe=probe,
+                extra_bytes=decode,
             )
             if plan.refuse is None:
                 self._memguard_set_chunk(plan.chunk)
@@ -6930,6 +6940,69 @@ class Scheduler:
             )
         return handed
 
+    def _memguard_decode_growth(self, guard: MemoryGuard) -> int:
+        """Bytes the decoding batch allocates beyond its footprint in the
+        coming ``next()`` -- nonzero only at a step where its KV grows: a
+        full-attention layer's write position reaches its buffer's capacity
+        (mlx-lm KVCache/BatchKVCache then grow by ``KVCache.step`` tokens by
+        concatenation). Read from the live layers, so it is exact about WHEN;
+        the bytes are ``guard.decode_growth``."""
+        bg = self.batch_generator
+        gen = getattr(bg, "_generation_batch", None)
+        try:
+            if gen is None or len(gen) == 0:
+                return 0
+        except TypeError:
+            return 0
+        from mlx_lm.models.cache import RotatingKVCache
+
+        growing = False
+        for layer in _exact_data_layers(getattr(gen, "prompt_cache", None)):
+            if isinstance(layer, RotatingKVCache) or type(layer).__name__.startswith(
+                "BatchRotating"
+            ):
+                continue
+            keys = getattr(layer, "keys", None)
+            shape = getattr(keys, "shape", None)
+            if not shape or len(shape) < 3:
+                continue
+            idx = getattr(layer, "_idx", None)
+            if idx is None:
+                idx = getattr(layer, "offset", None)
+            if not isinstance(idx, int):
+                continue
+            growing = idx + 1 > int(shape[2])
+            break
+        if not growing:
+            return 0
+        lengths = self._memguard_generation_lengths()
+        if not lengths:
+            return 0
+        return guard.decode_growth(
+            max(lengths), batch=len(lengths), kv_footprint=self._kv_footprint_fn()
+        )
+
+    def _memguard_room_for_decode(
+        self, guard: MemoryGuard, decode: int, ceiling: int
+    ) -> None:
+        """A decode-only step whose KV grows: footprint + growth + margin
+        under the ceiling, in the one order -- clear the allocator cache,
+        evict with the ONE policy. There is no prefill to defer; a decoding
+        row is never aborted, so if even that does not fit it decodes
+        anyway, counted and logged (the window and every admission include
+        the growth, so this is a defect signal, not a path)."""
+        if self._memguard_make_room(decode, ceiling, EVICT_NEEDED):
+            return
+        guard.counts["decode_over_ceiling"] += 1
+        logger.warning(
+            "[memory_guard] decode KV growth %.2fGB: footprint %.2fGB + growth "
+            "+ margin exceeds the ceiling %.2fGB with nothing left to evict; "
+            "decoding anyway (a decoding row is never aborted)",
+            decode / 1e9,
+            self._metal_footprint_bytes() / 1e9,
+            ceiling / 1e9,
+        )
+
     def _memguard_generation_lengths(self) -> list[int]:
         """Context length of every row in mlx-lm's generation (decode) batch."""
         bg = self.batch_generator
@@ -7000,8 +7073,15 @@ class Scheduler:
         kv_fn = self._kv_footprint_fn()
         if kv_fn is None:
             return False
+        joined = [len(r.prompt_token_ids or ()) for r in joiners]
+        # The merged batch must also be able to decode: its first KV growth
+        # holds ~2 layers of every (padded) row.
         extra = self._memguard_merge_bytes(
-            gen_lengths, [len(r.prompt_token_ids or ()) for r in joiners], kv_fn
+            gen_lengths, joined, kv_fn
+        ) + guard.decode_growth(
+            max(gen_lengths + joined),
+            batch=len(gen_lengths) + len(joined),
+            kv_footprint=kv_fn,
         )
         if self._memguard_make_room(extra, ceiling, EVICT_NEEDED):
             return False
@@ -7027,6 +7107,11 @@ class Scheduler:
             int(kv_fn(final))
             + row.admit_bytes
             + self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+            + guard.decode_growth(
+                max([*gen_lengths, final]),
+                batch=len(gen_lengths) + 1,
+                kv_footprint=kv_fn,
+            )
         )
         if self._memguard_make_room(extra, ceiling, EVICT_REDUNDANT):
             return True
