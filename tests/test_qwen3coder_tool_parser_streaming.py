@@ -265,10 +265,16 @@ def test_complete_legacy_raw_call_in_one_chunk_preserves_closer(value):
         f"{value}\n</parameter>\n</function>\n</tool_call>"
     )
 
+    # A raw value's close is only certain from what FOLLOWS the call (a value
+    # can quote a whole call), so even a call complete in one chunk streams
+    # its header now and its arguments from the end-of-stream parse.
     delta = parser.extract_tool_calls_streaming("", wire, wire, request=request)
-    assert json.loads(delta["tool_calls"][0]["function"]["arguments"]) == {
-        "content": value
-    }
+    assert delta["tool_calls"][0]["function"]["name"] == "write"
+    final = parser.finalize_legacy_raw_stream(wire, request=request)
+    arguments = delta["tool_calls"][0]["function"]["arguments"] + "".join(
+        tc["function"]["arguments"] for tc in final["tool_calls"]
+    )
+    assert json.loads(arguments) == {"content": value}
 
 
 @pytest.mark.parametrize(

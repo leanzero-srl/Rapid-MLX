@@ -21,6 +21,7 @@ from ..tool_call_scan import (
 from ..tool_call_scan import (
     inside_code,
     may_surface_undeclared,
+    named_tool_choice,
     split_marked_calls,
     split_marked_parameters,
     warn_undeclared_call,
@@ -380,6 +381,7 @@ class NemotronToolParser(ToolParser):
             )
 
     _HEADER = re.compile(r"<function=([^>]+)>")
+    _WHITESPACE = re.compile(r"\s*")
 
     def _first_call_header(
         self, text: str, request: dict[str, Any] | None
@@ -393,12 +395,22 @@ class NemotronToolParser(ToolParser):
         top-level: nothing before it can hold it as a value.
         """
         declared = _declared_tool_names(request) or frozenset()
+        forced = named_tool_choice(request)
+        if forced is not None:
+            declared = declared & {forced}
         for match in self._HEADER.finditer(text, self._content_upto):
-            rest = text[match.end() :].lstrip()
-            if rest.startswith("<function="):
-                continue  # a header that meets another header is prose
-            if not rest or "<function=".startswith(rest):
-                return None  # what follows the header is not here yet
+            after = self._WHITESPACE.match(text, match.end()).end()
+            rest = text[after : after + len("<parameter=")]
+            # A call's header is followed by its first parameter, its close
+            # or a JSON body; anything else (``use <function=shell> to …``)
+            # is prose naming the format, never a call — sending its header
+            # made a turn end in a phantom ``shell`` (review of 7a1d93272).
+            if not rest.startswith(("<parameter=", "</function>", "{")):
+                if not rest or any(
+                    marker.startswith(rest) for marker in ("<parameter=", "</function>")
+                ):
+                    return None  # what follows the header is not here yet
+                continue
             name = match.group(1).strip()
             before = text[: match.start()].rstrip()
             wrapped = before.endswith("<tool_call>")
@@ -466,6 +478,21 @@ class NemotronToolParser(ToolParser):
         if content.strip():
             out["content"] = content
         return out
+
+    def flush_held_content(self, full_text: str) -> str:
+        """Text withheld after a marker that never became a call.
+
+        The postprocessor calls this at stream end when no call reached the
+        wire. Nemotron withholds from the first ``<function=`` / ``<tool_call>``
+        until a close; a stream that ends first (prose that merely mentions
+        the format, a cut-off) used to lose those bytes. The buffered parser
+        returns them as content, and so does the stream now.
+        """
+        if self._deferred or self._content_upto >= len(full_text):
+            return ""
+        held = full_text[self._content_upto :]
+        self._content_upto = len(full_text)
+        return held
 
     @staticmethod
     def _close_tag_count(text: str) -> int:

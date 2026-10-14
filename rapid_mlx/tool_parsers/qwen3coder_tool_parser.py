@@ -671,6 +671,15 @@ class Qwen3CoderToolParser(ToolParser):
                 if function_close >= 0
                 else span_end
             )
+            # An admitted call whose value runs on (the shared structural
+            # reading) ends at its LAST close in the span, past the first.
+            span_close = model_output.rfind(
+                self.function_end_token, function_start, span_end
+            )
+            if span_close >= 0:
+                function_end = max(
+                    function_end, span_close + len(self.function_end_token)
+                )
             owns_wrapper = model_output[span_start:].startswith(
                 self.tool_call_start_token
             )
@@ -1132,9 +1141,32 @@ class Qwen3CoderToolParser(ToolParser):
                     return positions
                 i = close_pos + param_close_len
                 continue
-            positions.append(next_func)
+            if not self._header_is_prose(text, next_func):
+                positions.append(next_func)
             i = next_func + prefix_len
         return positions
+
+    def _header_is_prose(self, text: str, function_start: int) -> bool:
+        """Whether the ``<function=NAME>`` at ``function_start`` is prose.
+
+        A call's header is followed (after whitespace) by its first
+        ``<parameter=``, its ``</function>`` or a JSON body. Anything else —
+        ``I'll use <function=shell> to list the files`` — is text naming the
+        format. Read as a call it took the parameters of the REAL call after
+        it (a ``shell`` carrying ``write``'s arguments), or withheld the
+        prose to the end of the stream and lost it. False while what follows
+        has not arrived yet.
+        """
+        header_end = text.find(">", function_start + len(self.tool_call_prefix))
+        if header_end == -1:
+            return False
+        rest = text[header_end + 1 : header_end + 1 + 4096].lstrip()[:16]
+        if not rest or rest.startswith("{"):
+            return False  # not here yet / a JSON body (read as it always was)
+        for marker in (self.parameter_prefix, self.function_end_token):
+            if rest.startswith(marker) or marker.startswith(rest):
+                return False
+        return True
 
     def extract_tool_calls_streaming(
         self,
@@ -1242,7 +1274,7 @@ class Qwen3CoderToolParser(ToolParser):
                             self._streaming_request = saved_request
                             return {"content": delta_text}
                         candidate_text = current_text[header_start:]
-                        if (
+                        if self._header_is_prose(current_text, header_start) or (
                             not self._pending_tool_wrapped
                             and self.function_end_token in candidate_text
                             and self.parameter_prefix not in candidate_text
@@ -1277,6 +1309,16 @@ class Qwen3CoderToolParser(ToolParser):
         # ends use the parameter-aware scanners so a user-visible
         # ``<function=…>`` OR ``</function>`` embedded in a parameter
         # value can't corrupt the slice.
+        if not self.header_sent and self._pending_tool_start is not None:
+            pending = current_text.find(self.tool_call_prefix, self._pending_tool_start)
+            if pending >= 0 and self._header_is_prose(current_text, pending):
+                # The header completed as prose (``use <function=shell> to …``):
+                # release everything withheld since the opener as text.
+                rejected = current_text[self._pending_tool_start :]
+                saved_request = self._streaming_request
+                self._reset_streaming_state()
+                self._streaming_request = saved_request
+                return {"content": rejected}
         function_starts = self._function_start_positions(current_text)
         if self.current_tool_index >= len(function_starts):
             return None
@@ -1362,7 +1404,12 @@ class Qwen3CoderToolParser(ToolParser):
                         self._streaming_request = saved_request
                         return {"content": rejected}
                     first_param = tool_text.find(self.parameter_prefix, func_end)
-                    if first_param >= 0 and func_close_idx == -1:
+                    # Also when the whole call arrived in one delta: a raw
+                    # value's close is only certain from what FOLLOWS the call
+                    # (a value that quotes a whole call closes structurally at
+                    # the quoted close), so its arguments come from the
+                    # end-of-stream parse like any other raw call.
+                    if first_param >= 0:
                         name_end = tool_text.find(">", first_param)
                         if name_end >= 0:
                             param_name = tool_text[
@@ -1396,7 +1443,7 @@ class Qwen3CoderToolParser(ToolParser):
                     # tool call in one chunk to prevent header-only output
                     # when coarse deltas or max_tokens truncation leave no
                     # further parser calls.
-                    if func_close_idx != -1:
+                    if func_close_idx != -1 and not self._legacy_raw_stream:
                         tools = None
                         if request and isinstance(request, dict):
                             tools = request.get("tools")
