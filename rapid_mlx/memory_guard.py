@@ -97,6 +97,19 @@ SLOPE_MIN_SPAN_FRACTION = 0.25
 OBS_PER_GROUP = 16
 # A group calibrates only once this many qualifying pairs agree (median).
 SLOPE_MIN_PAIRS = 3
+# ratio: once calibrated, ONE observation moves a fitted coefficient by at
+# most this factor up or down (Gabee Q8 2026-10-14: one first-chunk step took
+# the attention coefficient 103 -> 360 and the window 207,900 -> 102,913).
+MAX_STEP_FACTOR = 1.25
+# ratio: the learned per-context-token term is capped at this many times one
+# full-attention layer's KV growth copy -- 16 = every layer of Qwen3.5-27B,
+# i.e. a whole copy of the KV.
+MAX_CONTEXT_TERM_LAYERS = 16.0
+# ratio: the advertised window (max_model_len) ignores moves within this band
+# and publishes the native window when within it of the native window (Q4
+# jittered 261,769-262,144 with a constant coefficient); a move beyond it is
+# published only when two different model states agree within the band.
+WINDOW_BAND_RATIO = 0.03
 # The residual window ignores its single largest value once it holds this
 # many observations (one noisy step does not count; a repeated peak does).
 ROBUST_MIN_OBS = 4
@@ -229,6 +242,7 @@ class PeakModel:
     def __init__(self, prior: PeakPrior) -> None:
         self.prior = prior
         self._a_learned: float | None = None
+        self._b_learned: float | None = None
         self._groups: dict[tuple[int, int], deque[_Obs]] = {}
         self._by_tokens: dict[int, deque[_Obs]] = {}
         self._envelope: list[tuple[int, float]] = []
@@ -247,19 +261,25 @@ class PeakModel:
             return self.prior.attention_bytes_per_unit
         return self._a_learned
 
-    def _residual(self, obs: _Obs, a: float) -> float:
-        s = obs.shape
-        return max(
-            0.0,
-            obs.transient
-            - a * s.units
-            - self.prior.kv_copy_bytes_per_context * s.context,
-        )
+    @property
+    def context_bytes_per_token(self) -> float:
+        """The per-context-token term ``b`` (bytes per KV token that scale
+        with the context but not with the chunk): the analytic one-layer KV
+        growth copy until two chunk sizes calibrate, then fitted."""
+        if self._b_learned is None:
+            return self.prior.kv_copy_bytes_per_context
+        return self._b_learned
 
-    def _fit_attention(self) -> float | None:
-        g = self.prior.kv_copy_bytes_per_context
-        cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
-        best: float | None = None
+    def _residual(self, obs: _Obs, a: float, b: float | None = None) -> float:
+        s = obs.shape
+        if b is None:
+            b = self.context_bytes_per_token
+        return max(0.0, obs.transient - a * s.units - b * s.context)
+
+    def _group_slopes(self) -> list[tuple[int, float]]:
+        """``(batch x chunk, median dT/dX)`` of every calibrated group: within
+        one group ``dT/dX = a * batch * chunk + b`` (the linear terms cancel)."""
+        out: list[tuple[int, float]] = []
         for (batch, chunk), group in self._groups.items():
             obs = list(group)
             slopes: list[float] = []
@@ -275,15 +295,45 @@ class PeakModel:
                     )
                     if span <= 0 or span < need:
                         continue
-                    slope = (hi.transient - lo.transient) / span
-                    slopes.append(max(0.0, slope - g) / max(1, batch * chunk))
-            if len(slopes) < SLOPE_MIN_PAIRS:
-                continue
-            estimate = _median(slopes)
-            best = estimate if best is None else max(best, estimate)
-        if best is None:
+                    slopes.append((hi.transient - lo.transient) / span)
+            if len(slopes) >= SLOPE_MIN_PAIRS:
+                out.append((batch * chunk, _median(slopes)))
+        return out
+
+    def _fit(self) -> tuple[float, float] | None:
+        """Separate ``a`` (bytes per chunk x context) from ``b`` (bytes per
+        context token) across chunk sizes: ``slope(u) = a*u + b``, least
+        squares over the calibrated groups when two or more sizes exist,
+        else ``b`` = the analytic layer copy. Clamped to ``[0, 4x prior]`` for
+        ``a`` and ``[analytic, 16 layers]`` for ``b``."""
+        g = self.prior.kv_copy_bytes_per_context
+        a_cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
+        b_cap = max(g, MAX_CONTEXT_TERM_LAYERS * g)
+        groups = self._group_slopes()
+        if not groups:
             return None
-        return min(best, cap)
+        sizes = {u for u, _s in groups}
+        a = b = None
+        if len(sizes) >= 2:
+            n = len(groups)
+            mu = sum(u for u, _s in groups) / n
+            ms = sum(sl for _u, sl in groups) / n
+            var = sum((u - mu) ** 2 for u, _s in groups)
+            if var > 0:
+                a = sum((u - mu) * (sl - ms) for u, sl in groups) / var
+                b = ms - a * mu
+            if a is None or a < 0 or b is None or b < g:
+                a = b = None  # not separable on this data: fall through
+        if a is None:
+            b = g
+            a = max(max(0.0, sl - g) / max(1, u) for u, sl in groups)
+        return min(max(0.0, a), a_cap), min(max(g, b), b_cap)
+
+    @staticmethod
+    def _bounded(new: float, old: float | None) -> float:
+        if old is None or old <= 0:
+            return new
+        return min(max(new, old / MAX_STEP_FACTOR), old * MAX_STEP_FACTOR)
 
     def _robust_residual(self, window: deque[_Obs], a: float) -> float:
         values = sorted(self._residual(o, a) for o in window)
@@ -292,7 +342,15 @@ class PeakModel:
         return values[-1]
 
     def _rebuild(self) -> None:
-        self._a_learned = self._fit_attention()
+        fitted = self._fit()
+        if fitted is not None:
+            a, b = fitted
+            if self._a_learned is not None:
+                # One observation moves a calibrated coefficient by a bounded
+                # factor; a real change converges over a few observations.
+                a = self._bounded(a, self._a_learned)
+                b = self._bounded(b, self._b_learned)
+            self._a_learned, self._b_learned = a, b
         a = self.attention_bytes_per_unit
         running = 0.0
         env: list[tuple[int, float]] = []
@@ -326,7 +384,7 @@ class PeakModel:
             return 0
         value = (
             self.attention_bytes_per_unit * shape.units
-            + self.prior.kv_copy_bytes_per_context * shape.context
+            + self.context_bytes_per_token * shape.context
             + self._linear(shape.tokens)
         )
         return int(math.ceil(value))
@@ -349,9 +407,9 @@ class PeakModel:
         self._by_tokens.setdefault(shape.tokens, deque(maxlen=OBS_PER_GROUP)).append(
             obs
         )
-        before = (self._a_learned, list(self._envelope))
+        before = (self._a_learned, self._b_learned, list(self._envelope))
         self._rebuild()
-        return before != (self._a_learned, self._envelope)
+        return before != (self._a_learned, self._b_learned, self._envelope)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -363,7 +421,10 @@ class PeakModel:
                 self.prior.attention_bytes_per_unit, 3
             ),
             "attention_cap_multiple_of_prior": MAX_PRIOR_MULTIPLE,
-            "kv_copy_bytes_per_context": round(self.prior.kv_copy_bytes_per_context, 1),
+            "context_bytes_per_token": round(self.context_bytes_per_token, 1),
+            "kv_copy_bytes_per_context_prior": round(
+                self.prior.kv_copy_bytes_per_context, 1
+            ),
             "token_bytes_prior": round(self.prior.token_bytes, 1),
             "linear_bytes_by_tokens": {str(t): int(r) for t, r in self._envelope},
             "worst_transient_mb": round(self.worst_transient / 2**20, 1),
@@ -389,6 +450,12 @@ class RowPlan:
     chunk_cap: int = 0  # per-request chunk ceiling (0 = none), E5 backstop
     chunk_floor: int = 0  # per-request floor override (0 = guard floor)
     prompt_tokens: int = 0  # the request's full prompt, for the refusal
+    # Bytes of the row's cached KV that its FIRST chunk copies: a prefix hit
+    # whose arrays its prefix entry still holds grows every layer into new
+    # buffers on the first write (Gabee Q8: +3-4 GB at 51-62k on the first
+    # chunk of each turn). Context-proportional and one-off: charged to the
+    # plan as such, never fitted as chunk x context.
+    admit_bytes: int = 0
 
 
 def step_shape(rows: Sequence[RowPlan], chunk: int) -> StepShape:
@@ -422,6 +489,11 @@ class GuardProbe:
     # one was evicted.
     evict_one: Callable[[int], bool]
     entry_count: Callable[[], int]
+    # Current first-chunk copy bytes of the rows this dispatch admits: only
+    # rows whose cached KV a prefix entry still holds pay it (once the entry
+    # is evicted, the first write frees each old layer as it grows). Re-read
+    # after every eviction. ``None``: use ``RowPlan.admit_bytes``.
+    admit: Callable[[], int] | None = None
 
 
 # The ONE prefix-cache eviction order every path uses (E1, the pressure
@@ -454,6 +526,7 @@ class GuardPlan:
     refuse: RowPlan | None = None
     needed: int = 0
     actions: list[str] = field(default_factory=list)
+    admit_bytes: int = 0
 
 
 class MemoryGuard:
@@ -491,6 +564,9 @@ class MemoryGuard:
         # prefix budget from the worst of these, which double-counted the live
         # KV and ratcheted prefix caching off for long sessions).
         self.last_step_footprint = 0
+        # The advertised window and a pending (candidate, model version).
+        self._published_window: int | None = None
+        self._pending_window: tuple[int, Any] | None = None
         # E5: [context_threshold, extra_bytes, original] decaying margins.
         self._backstop: list[list[float]] = []
 
@@ -516,6 +592,58 @@ class MemoryGuard:
         if backstop:
             transient += self.backstop_extra(shape)
         return transient, self.margin(transient, ceiling)
+
+    def plan_transient(self, shape: StepShape, *, admit_bytes: int = 0) -> int:
+        """The projected transient of one dispatch: the peak model, any live
+        backstop margin, and the first-chunk copy of rows admitted with a
+        shared prefix-cache hit."""
+        transient, _margin = self.need(shape, max(1, self.last_ceiling))
+        return transient + max(0, int(admit_bytes))
+
+    def published_window(
+        self, candidate: int, native: int | None = None, *, version: Any = None
+    ) -> int:
+        """The advertised context window (``max_model_len``): stable.
+
+        Within ``WINDOW_BAND_RATIO`` of the native window it is the native
+        window; a move within the band of the published value is ignored; a
+        larger move is published only when two DIFFERENT model states
+        (``version``, default the observation count) agree within the band.
+        goose caches this per model and compacts at 0.8x it, so a dip that
+        one noisy step causes must never reach it. Admission and refusals
+        use the exact, unpublished figure.
+        """
+        candidate = max(0, int(candidate))
+        if native and native > 0 and candidate >= native * (1 - WINDOW_BAND_RATIO):
+            candidate = int(native)
+        if version is None:
+            version = self.model.observations
+        published = self._published_window
+        if published is None:
+            self._published_window = candidate
+            self._pending_window = None
+            return candidate
+        if abs(candidate - published) <= WINDOW_BAND_RATIO * max(1, published):
+            self._pending_window = None
+            return published
+        pending = self._pending_window
+        if (
+            pending is not None
+            and pending[1] != version
+            and abs(candidate - pending[0]) <= WINDOW_BAND_RATIO * max(1, pending[0])
+        ):
+            logger.warning(
+                "[memory_guard] advertised window %d -> %d tokens (confirmed by "
+                "two model states)",
+                published,
+                candidate,
+            )
+            self._published_window = candidate
+            self._pending_window = None
+            return candidate
+        if pending is None or pending[1] != version:
+            self._pending_window = (candidate, version)
+        return published
 
     def record_backstop(self, shape: StepShape, lower_bound: int) -> int:
         """E5: a dispatch of ``shape`` hit a Metal OOM; it needed at least
@@ -572,9 +700,15 @@ class MemoryGuard:
         def footprint() -> int:
             return int(probe.active()) + int(probe.cache())
 
+        static_admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
+        admit = static_admit
+
         def fits(c: int, fp: int) -> tuple[bool, StepShape, int, int]:
+            nonlocal admit
+            admit = static_admit if probe.admit is None else max(0, int(probe.admit()))
             shape = step_shape(rows, c)
-            transient, margin = self.need(shape, ceiling)
+            transient = self.plan_transient(shape, admit_bytes=admit)
+            margin = self.margin(transient, ceiling)
             return fp + transient + margin <= ceiling, shape, transient, margin
 
         fp = footprint()
@@ -634,6 +768,8 @@ class MemoryGuard:
             # structural projection fits, so dispatch (a repeat OOM aborts
             # that request as before; the margin is never a reason to refuse).
             t_plain, m_plain = self.need(shape, ceiling, backstop=False)
+            t_plain += admit
+            m_plain = self.margin(t_plain, ceiling)
             if fp + t_plain + m_plain <= ceiling:
                 ok = True
                 actions.append(
@@ -649,6 +785,7 @@ class MemoryGuard:
             footprint=fp,
             ceiling=ceiling,
             actions=actions,
+            admit_bytes=admit,
         )
         self.last_margin = margin
         if not ok:
@@ -689,12 +826,20 @@ class MemoryGuard:
         live_beyond_base: int = 0,
         source: str = "step",
         fit: bool = True,
+        admit_bytes: int = 0,
     ) -> bool:
         """Feed one measured dispatch back. Returns True on a model change."""
         if shape.batch <= 0:
             return False
-        projected = self.model.project(shape)
+        projected = self.model.project(shape) + max(0, int(admit_bytes))
         a_before = self.model.attention_bytes_per_unit
+        # A first chunk after a shared prefix hit carries the one-off copy of
+        # the cached KV: take it out, and never fit the slope on such a step
+        # (the copy estimate is an upper bound, so the remainder is a lower
+        # one).
+        if admit_bytes > 0:
+            transient = max(0, int(transient) - int(admit_bytes))
+            fit = False
         changed = self.model.observe(shape, transient, fit=fit)
         self.last_step_footprint = max(0, int(live_beyond_base)) + max(
             0, int(transient)
@@ -792,9 +937,7 @@ class MemoryGuard:
                 "attention_bytes_per_chunk_context": round(
                     self.model.attention_bytes_per_unit, 3
                 ),
-                "kv_copy_bytes_per_context": round(
-                    self.model.prior.kv_copy_bytes_per_context, 1
-                ),
+                "context_bytes_per_token": round(self.model.context_bytes_per_token, 1),
                 "linear_bytes_by_tokens": {
                     str(t): int(r) for t, r in self.model._envelope
                 },

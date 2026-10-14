@@ -6571,14 +6571,42 @@ class Scheduler:
     def _memguard_evict_one(self, max_level: int) -> bool:
         return self._memguard_evict_ordered(max_level, reason="E1")
 
-    def _memguard_probe(self) -> GuardProbe:
+    def _memguard_probe(self, rows: list[RowPlan] | None = None) -> GuardProbe:
+        admitting = [r for r in (rows or ()) if r.admit_bytes > 0]
         return GuardProbe(
             active=self._current_metal_active_bytes,
             cache=self._current_metal_cache_bytes,
             clear_cache=mx.clear_cache,
             evict_one=self._memguard_evict_one,
             entry_count=self._memguard_prefix_entry_count,
+            admit=(
+                (lambda: self._memguard_shared_admit_bytes(admitting))
+                if admitting
+                else None
+            ),
         )
+
+    def _memguard_shared_admit_bytes(self, admitting: list[RowPlan]) -> int:
+        """First-chunk copy of each admitted row whose cached prefix a prefix
+        entry still holds (an entry covering that prefix is resident)."""
+        mac = getattr(self, "memory_aware_cache", None)
+        total = 0
+        for row in admitting:
+            request = self.running.get(row.request_id) or self.requests.get(
+                row.request_id
+            )
+            cached = int(getattr(request, "cached_tokens", 0) or 0)
+            if request is None or cached <= 0:
+                continue
+            if mac is None:
+                total += row.admit_bytes
+                continue
+            prefix = tuple(request.prompt_token_ids[:cached])
+            with mac._lock:  # noqa: SLF001
+                keys = list(mac._entries)  # noqa: SLF001
+            if any(len(k) >= cached and k[:cached] == prefix for k in keys):
+                total += row.admit_bytes
+        return total
 
     def _memguard_request_for_uid(self, uid: Any) -> Request | None:
         if uid is None:
@@ -6615,7 +6643,23 @@ class Scheduler:
         known_tokens = getattr(prompt_batch, "tokens", None) or ()
         rows: list[RowPlan] = []
 
-        def _row(uid: Any, segments: Any, offset_known: int, processed: int) -> None:
+        kv_fn = None
+
+        def _admit_bytes(offset: int) -> int:
+            nonlocal kv_fn
+            if offset <= 0:
+                return 0
+            if kv_fn is None:
+                kv_fn = self._kv_footprint_fn() or (lambda _t: 0)
+            return int(kv_fn(offset))
+
+        def _row(
+            uid: Any,
+            segments: Any,
+            offset_known: int,
+            processed: int,
+            admitting: bool = False,
+        ) -> None:
             try:
                 if not segments:
                     return
@@ -6640,6 +6684,9 @@ class Scheduler:
                     chunk_cap=int(getattr(request, "_memguard_chunk_cap", 0) or 0),
                     chunk_floor=int(getattr(request, "_memguard_chunk_floor", 0) or 0),
                     prompt_tokens=prompt_tokens,
+                    # Pulled into the prompt batch by THIS dispatch with a
+                    # prefix hit: its first write copies the cached KV.
+                    admit_bytes=_admit_bytes(offset) if admitting else 0,
                 )
             )
 
@@ -6663,7 +6710,7 @@ class Scheduler:
                 uid, segments, all_tokens = item[0], item[1], item[4]
             except (IndexError, TypeError):
                 continue
-            _row(uid, segments, len(all_tokens or ()), 0)
+            _row(uid, segments, len(all_tokens or ()), 0, admitting=True)
         return rows
 
     def _memguard_set_chunk(self, chunk: int) -> None:
@@ -6698,11 +6745,11 @@ class Scheduler:
         ceiling = self._memguard_ceiling()
         if ceiling <= 0:
             return None, refusals
-        probe = self._memguard_probe()
         for _ in range(64):
             rows = self._memguard_rows()
             if not rows:
                 return None, refusals
+            probe = self._memguard_probe(rows)
             configured = int(
                 getattr(self.batch_generator, "prefill_step_size", 0)
                 or getattr(self.config, "prefill_step_size", 2048)
@@ -6913,7 +6960,13 @@ class Scheduler:
         if guard is not None:
             # A step that also decoded other rows carries their transient: it
             # bounds the residual (safety) but never fits the attention slope.
-            guard.observe(plan.shape, transient, live_beyond_base=live, fit=not mixed)
+            guard.observe(
+                plan.shape,
+                transient,
+                live_beyond_base=live,
+                fit=not mixed,
+                admit_bytes=plan.admit_bytes,
+            )
 
     def _memguard_idle_base(self) -> int:
         """Weights + fixed runtime state: Metal active with nothing running,
@@ -6940,7 +6993,9 @@ class Scheduler:
         if applied <= 0 or abs(base - applied) > REAPPLY_RATIO * max(1, applied):
             self._memguard_apply_budgets()
 
-    def memory_guard_max_context(self, native_context: int | None = None) -> int | None:
+    def memory_guard_max_context(
+        self, native_context: int | None = None, *, stable: bool = True
+    ) -> int | None:
         """The honest largest context one sequence can hold on this device:
         idle base (weights) + its live KV/state + the floor chunk's step peak
         + margin under the ceiling, capped at ``native_context`` (or the
@@ -6959,11 +7014,21 @@ class Scheduler:
             upper = native_context
             if not (isinstance(upper, int) and upper > 0):
                 upper = self._memguard_native_context() or 8_000_000
-            return guard.max_context(
-                base=self._memguard_idle_base(),
+            base = self._memguard_idle_base()
+            exact = guard.max_context(
+                base=base,
                 kv_footprint=kv_fn,
                 ceiling=ceiling,
                 upper=upper,
+            )
+            if not stable:
+                return exact
+            # The advertised figure moves only on a change two model states
+            # agree on, and sits at the native window when within the band.
+            return guard.published_window(
+                exact,
+                upper,
+                version=(guard.model.observations, base >> 24),
             )
         except Exception:  # noqa: BLE001
             logger.debug("[memory_guard] max context probe failed", exc_info=True)
@@ -7215,7 +7280,9 @@ class Scheduler:
         lower_bound = max(peak - active_before, working_set - active_before, 0)
         deficit = 0
         if plan is not None and plan.shape.batch > 0 and lower_bound > 0:
-            deficit = guard.record_backstop(plan.shape, lower_bound)
+            deficit = guard.record_backstop(
+                plan.shape, max(0, lower_bound - plan.admit_bytes)
+            )
         logger.error(
             "[memory_guard] BACKSTOP FIRED -- a Metal OOM got past the guard "
             "(guard defect signal): %s | shape=%s active_before=%.2fGB "

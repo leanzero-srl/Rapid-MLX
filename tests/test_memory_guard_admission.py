@@ -146,6 +146,11 @@ def test_advertised_window_is_the_honest_one_and_tracks_the_peak_model(llama):
         assert advertised == honest < WINDOW
     guard = scheduler._memguard()
     guard.observe(StepShape(1, guard.floor_tokens, 1000), 30_000_000)
+    # The exact figure follows the model at once ...
+    assert scheduler.memory_guard_max_context(WINDOW, stable=False) < honest
+    # ... the advertised one only once a second model state confirms it.
+    assert scheduler.memory_guard_max_context(WINDOW) == honest
+    guard.observe(StepShape(1, guard.floor_tokens, 1100), 31_000_000)
     assert scheduler.memory_guard_max_context(WINDOW) < honest
 
 
