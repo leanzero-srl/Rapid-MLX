@@ -765,3 +765,48 @@ def test_the_same_ladder_at_64gb_makes_the_guard_act(llama, monkeypatch):
     )
     assert acted > 0
     assert counts["evictions_then_deferred"] == 0
+
+
+def test_a_handed_over_admission_is_handed_over_once(llama, monkeypatch):
+    """Hybrid models keep a fixed per-sequence state (the goose 27B's
+    GatedDeltaNet layers: 157 MB -> 1.57 MB at 1/100) that admission still
+    copies after a hand-over. f7df48332..64c1f288b took that remaining
+    charge for a reason to hand over AGAIN: Gabee Q8 k=18, the same request
+    "takes over its prefix hit (35966 cached tokens, 0.16GB, 0 entries
+    evicted)" 64 times in one step (admission_handoffs 1 -> 65), the plan
+    loop ran out, and that step dispatched UNPLANNED: 48,375.8 MiB peak over
+    the 47,775.8 MiB ceiling. Now: one hand-over per admitted request, the
+    plan converges, every step under the ceiling."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
+    device.install(monkeypatch, scheduler)
+    state = int(1.57 * MB)
+    real_kv_fn = scheduler._kv_footprint_fn
+
+    def kv_fn_with_state():
+        fn = real_kv_fn()
+        return None if fn is None else (lambda tokens: fn(tokens) + state)
+
+    monkeypatch.setattr(scheduler, "_kv_footprint_fn", kv_fn_with_state)
+    # The live case: the session's next turn is handed over while a side
+    # request is DECODING beside it, so the plan does not fit right after.
+    prompt = _new_tokens(0, 600)
+    history = []
+    for turn in range(22):
+        side = _request(f"side-{turn}", _side_prompt(turn, 1600), 120)
+        main = _request(f"main-{turn}", prompt, 4)
+        outputs = _drive(scheduler, [side], arrive={30: [main]})
+        for rid in (main.request_id, side.request_id):
+            assert not outputs[rid][-1].error, (rid, outputs[rid][-1].error)
+        history.append((turn, len(prompt), outputs[main.request_id][-1].cached_tokens))
+        prompt = prompt + _tokens(outputs[main.request_id]) + _new_tokens(turn + 1, 496)
+
+    counts = scheduler._memguard().counts
+    assert counts["admission_handoffs"] >= 1
+    # At most one per admission: a request deferred after its hand-over
+    # keeps its KV as an entry and is handed over again when re-admitted.
+    assert counts["admission_handoffs"] <= len(history) + counts["deferrals"]
+    assert counts.get("plan_exhausted", 0) == 0
+    status = scheduler.get_stats()["memory_guard"]
+    assert status["steps_over_ceiling"] == 0
+    assert device.max_seen <= device.ceiling

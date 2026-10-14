@@ -305,6 +305,10 @@ _MEMORY_GUARD_INIT_LOCK = threading.Lock()
 # When that gap is this small the second ~full-size owned copy is not worth
 # its memory: on goose's text lane each copy is ~3.7 GB at 22.5k tokens.
 _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
+# Re-plans per step before the planner gives up (algorithm bound: each
+# re-plan defers, refuses, hands over or evicts something, so a converging
+# plan needs at most one per row and entry).
+_PLAN_ATTEMPTS = 64
 
 
 def _exact_data_layers(caches: Any) -> list[Any]:
@@ -6887,7 +6891,7 @@ class Scheduler:
         ceiling = self._memguard_ceiling()
         if ceiling <= 0:
             return None, refusals
-        for _ in range(64):
+        for _ in range(_PLAN_ATTEMPTS):
             # Finding 3 (review 2026-10-14): a row that joins a DECODING batch
             # is merged into it (padded to the longest row; the singleton
             # fast path first promotes the decoding row to a batched copy).
@@ -6901,6 +6905,7 @@ class Scheduler:
             # their KV grows it holds ~2 layers of the context beyond the
             # footprint (DECODE_GROWTH_LAYERS). Charged in the same plan.
             decode = self._memguard_decode_growth(guard)
+            self._memguard_last_decode_growth = decode
             rows = self._memguard_rows()
             if not rows:
                 if decode > 0:
@@ -6956,6 +6961,39 @@ class Scheduler:
                 self._memguard_defer(row, plan, others)
                 continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
+        # Every iteration above either returns or changes the state (defer,
+        # refuse, hand over, evict) -- reaching here is a planner defect: the
+        # step would dispatch unplanned. Count it and say so.
+        guard.counts["plan_exhausted"] += 1
+        # Defence in depth: still plan the chunk for what is in the batch
+        # now (no hand-over or join checks -- the part that did not
+        # converge), so the step is at least sized to fit.
+        rows = self._memguard_rows()
+        if rows:
+            plan = guard.plan(
+                rows,
+                configured_chunk=int(
+                    getattr(self.batch_generator, "prefill_step_size", 0)
+                    or getattr(self.config, "prefill_step_size", 0)
+                    or 1
+                ),
+                ceiling=ceiling,
+                probe=self._memguard_probe(),
+                extra_bytes=self._memguard_decode_growth(guard),
+            )
+            if plan.refuse is None:
+                self._memguard_set_chunk(plan.chunk)
+                logger.error(
+                    "[memory_guard] plan did not converge in %d re-plans; "
+                    "dispatching the plain plan (guard defect signal)",
+                    _PLAN_ATTEMPTS,
+                )
+                return plan, refusals
+        logger.error(
+            "[memory_guard] plan did not converge in %d re-plans; this step "
+            "dispatches UNPLANNED (guard defect signal)",
+            _PLAN_ATTEMPTS,
+        )
         return None, refusals
 
     def _memguard_admit_handoffs(
@@ -7005,6 +7043,14 @@ class Scheduler:
             layers = _exact_data_layers(item[3]) if item is not None else []
             if not layers or not _handover_admissible(item[3]):
                 continue
+            if _handed_over(item[3]):
+                # Already handed over: its remaining admission charge is the
+                # fixed per-sequence state (hybrid recurrent layers), which a
+                # hand-over cannot remove. Handing it over AGAIN re-planned
+                # forever (Gabee Q8 64c1f288b k=18: admission_handoffs 1 ->
+                # 65 in one step = the 64-iteration plan loop exhausted, and
+                # that step dispatched UNPLANNED: +600 MB over the ceiling).
+                continue
             shared = {id(a) for layer in layers for a in (layer.keys, layer.values)}
             if any(
                 id(getattr(layer, "keys", None)) in shared
@@ -7037,7 +7083,7 @@ class Scheduler:
             handed = True
             logger.warning(
                 "[memory_guard] admission handoff: request %s takes over its "
-                "%s prefix hit (%d cached tokens, %.2fGB, %d entr%s evicted) "
+                "%s hit (%d cached tokens, %.2fGB, %d entr%s evicted) "
                 "instead of copying it",
                 row.request_id[:12],
                 getattr(request, "cache_hit_type", None),
@@ -7524,11 +7570,37 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             return None
 
-    def _memguard_step_peak_reset(self) -> None:
+    def _memguard_step_peak_reset(self, plan: GuardPlan | None = None) -> None:
         """Every dispatched step (prefill, decode, mixed) is measured: the
-        allocator's peak since this reset is the step's real peak."""
+        allocator's peak since this reset is the step's real peak. The step's
+        kind, shape and PLANNED bytes are kept so a step over the ceiling is
+        named (one WARNING line) instead of only counted."""
         if getattr(self, "_memory_guard", None) is None:
             return
+        try:
+            bg = self.batch_generator
+            prompt_rows = len(getattr(bg, "_prompt_batch", ()) or ()) + len(
+                getattr(bg, "_unprocessed_sequences", ()) or ()
+            )
+            gen_rows = len(getattr(bg, "_generation_batch", ()) or ())
+            growth = int(getattr(self, "_memguard_last_decode_growth", 0) or 0)
+            if prompt_rows and gen_rows:
+                kind = "mixed (prefill beside decoding rows)"
+            elif prompt_rows:
+                kind = "prefill"
+            else:
+                kind = "decode"
+            if growth:
+                kind += " + KV growth"
+            if plan is not None:
+                planned = plan.footprint + plan.projected_transient
+                shape = f"{plan.shape.batch}x{plan.shape.chunk}x{plan.shape.context}"
+            else:
+                planned = self._metal_footprint_bytes() + growth
+                shape = f"decode B={gen_rows}"
+            self._memguard_step_info = (kind, shape, planned, prompt_rows, gen_rows)
+        except Exception:  # noqa: BLE001
+            self._memguard_step_info = None
         try:
             self._memguard_process_peak = max(
                 getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
@@ -7547,7 +7619,32 @@ class Scheduler:
         if guard is None:
             return
         try:
-            guard.record_step_peak(int(mx.get_peak_memory()), self._memguard_ceiling())
+            ceiling = self._memguard_ceiling()
+            peak = int(mx.get_peak_memory())
+            over_before = guard.steps_over_ceiling
+            guard.record_step_peak(peak, ceiling)
+            if guard.steps_over_ceiling > over_before:
+                info = getattr(self, "_memguard_step_info", None) or (
+                    "unknown",
+                    "?",
+                    0,
+                    0,
+                    0,
+                )
+                kind, shape, planned, prompt_rows, gen_rows = info
+                logger.warning(
+                    "[memory_guard] STEP OVER CEILING: %s shape=%s prompt_rows=%d "
+                    "decoding_rows=%d planned=%.2fGB measured_peak=%.2fGB "
+                    "ceiling=%.2fGB (+%.2fGB unplanned; guard defect signal)",
+                    kind,
+                    shape,
+                    prompt_rows,
+                    gen_rows,
+                    planned / 1e9,
+                    peak / 1e9,
+                    ceiling / 1e9,
+                    (peak - max(planned, 0)) / 1e9,
+                )
         except Exception:  # noqa: BLE001
             # Reporting only: never take the step down.
             logger.debug("[memory_guard] step peak unreadable", exc_info=True)
@@ -12404,7 +12501,7 @@ class Scheduler:
                     # A refusal can empty the batch; then nothing dispatches.
                     dispatch = bool(self.running)
                     if dispatch:
-                        self._memguard_step_peak_reset()
+                        self._memguard_step_peak_reset(guard_plan)
                         guard_begin = self._memguard_measure_begin(guard_plan)
                     srpf_step = self._srpf_step_begin()
                     if not dispatch:
