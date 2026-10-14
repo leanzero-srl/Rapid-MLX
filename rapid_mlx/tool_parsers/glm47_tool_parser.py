@@ -121,15 +121,14 @@ class Glm47ToolParser(ToolParser):
                 continue
 
             if position > 0:
-                # A block followed by an orphan ``</arg_value></tool_call>``
-                # (before the next opener) is an earlier value's text: the
-                # safer reading never makes it a call, declared or not.
-                limit = (
-                    matches[position + 1].start()
-                    if position + 1 < len(matches)
-                    else len(cleaned_text)
-                )
-                if self.ORPHAN_CLOSE.search(cleaned_text, found.end(), limit):
+                # A block with an orphan ``</arg_value></tool_call>`` anywhere
+                # after it may be an earlier value's text: this parser reads
+                # each block to its FIRST close, so a value quoting two whole
+                # blocks leaves the orphan after the second, not the first
+                # (review of 7a1d93272). The safer reading never makes such a
+                # block a call, declared or not. Cost: prose AFTER real calls
+                # that quotes the close drops the later ones.
+                if self.ORPHAN_CLOSE.search(cleaned_text, found.end()):
                     logger.warning(
                         "glm47: %r is followed by a close it cannot account "
                         "for, so it is an earlier value's text; not a call",
@@ -277,6 +276,9 @@ class Glm47ToolParser(ToolParser):
         start = text.rfind("<tool_call>")
         if start < 0 or "</tool_call>" in text[start:]:
             return False
+        first_open = text.rfind("</tool_call>", 0, start)
+        if text.count("<tool_call>", first_open + 1, start) > 0:
+            return False  # more than one open block: not ONE call in progress
         header = self._CALL_HEADER.match(text, start)
         if header is None or inside_code(text, start):
             return False

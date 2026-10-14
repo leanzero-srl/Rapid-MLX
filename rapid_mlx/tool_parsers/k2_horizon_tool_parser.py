@@ -673,6 +673,8 @@ class K2HorizonToolParser(ToolParser):
         start = text.rfind(self.GROUP_START)
         if start < 0 or self.GROUP_END in text[start:] or inside_code(text, start):
             return False
+        if text.count(self.CALL_START, start) > 1:
+            return False  # not ONE call in progress (a loop is #1359's case)
         return (
             bool(self._declared_tools(request))
             and self._request_value(request, "tool_choice") != "none"
