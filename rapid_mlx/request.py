@@ -130,12 +130,20 @@ class SessionHint:
     system / tools frame (everything before the first non-system message's
     content), from the model's own chat template. ``first_end``: tokens
     through the end of the first non-system message. ``turn_start``: the
-    last message is a user message (a new turn, not a tool round)."""
+    last message is a user message (a new turn, not a tool round).
+    ``outcome``: a one-slot holder the chat route fills with the
+    completion's OpenAI ``finish_reason`` once the response is finished
+    (``"stop"`` = the turn ended with a reply; ``"tool_calls"`` / ``"length"``
+    = the conversation is mid-turn); empty while running or when unknown."""
 
     session_id: str | None = None
     frame: int = 0
     first_end: int = 0
     turn_start: bool = False
+    outcome: list | None = field(default=None, compare=False, hash=False)
+    # The request carries more than its first non-system message (a
+    # conversation, not a one-message helper call: a title, a summary).
+    multi: bool = True
 
 
 @dataclass

@@ -269,10 +269,14 @@ def _request(
     frame: int = 0,
     first_end: int = 0,
     turn_start: bool = False,
+    multi: bool = True,
+    outcome: list | None = None,
 ) -> Request:
     """``session``: the client's session id (goose's ``agent-session-id``
     header, which the chat route turns into the request's SessionHint with
-    the frame measured from the chat template)."""
+    the frame measured from the chat template). ``multi``: the request
+    carries more than its first message (False: a one-message helper call).
+    ``outcome``: the holder the chat route fills with the finish_reason."""
     request = Request(
         request_id=rid,
         prompt=list(prompt),
@@ -284,6 +288,8 @@ def _request(
             frame=frame,
             first_end=first_end,
             turn_start=turn_start,
+            multi=multi,
+            outcome=outcome,
         )
     return request
 

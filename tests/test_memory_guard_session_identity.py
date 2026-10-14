@@ -227,3 +227,99 @@ def test_the_route_hands_goose_session_header_to_the_engine():
     assert "session_id" not in _post(
         _RecordingEngine(False), {"agent-session-id": "20261014_7"}
     )
+
+
+# -- review 7: what the request says about the conversation's state ---------
+
+
+def test_a_one_message_helper_call_is_not_a_conversation(monkeypatch):
+    """goose's title and summary helpers send a system prompt and ONE user
+    message; a conversation carries more (a tool round, a later turn)."""
+    engine = _engine(monkeypatch)
+    one = [MAIN_SYSTEM, {"role": "user", "content": "fix the bug"}]
+    more = [
+        *one,
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    assert not _hint(engine, one, "s").multi
+    assert _hint(engine, more, "s").multi
+
+
+def test_the_engine_carries_the_routes_outcome_holder(monkeypatch):
+    engine = _engine(monkeypatch)
+    holder = [None]
+
+    async def run():
+        await engine.chat(
+            messages=[MAIN_SYSTEM, {"role": "user", "content": "x"}],
+            tools=TOOLS,
+            session_id="s",
+            session_outcome=holder,
+        )
+
+    asyncio.run(run())
+    assert "session_outcome" not in engine._engine.kwargs  # consumed
+    assert engine._engine.kwargs["session_hint"].outcome is holder
+
+
+def test_the_route_reports_the_finish_reason_into_the_holder():
+    """Non-streaming: the holder the engine got is filled with the
+    response's finish_reason once the response is built."""
+    engine = _RecordingEngine(True)
+    kwargs = _post(engine, {"agent-session-id": "s"})
+    assert kwargs["session_outcome"] == ["stop"]
+    # an engine that does not take a session never sees a holder
+    assert "session_outcome" not in _post(_RecordingEngine(False), {})
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected"),
+    [
+        (
+            ['data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'],
+            "tool_calls",
+        ),
+        (
+            [
+                'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                "data: [DONE]\n\n",
+            ],
+            "stop",
+        ),
+        (['data: {"choices":[{"delta":{"content":"a"}}]}\n\n'], None),
+    ],
+)
+def test_a_stream_reports_its_last_finish_reason_once_it_ends(chunks, expected):
+    from rapid_mlx.routes.chat import _memguard_stream_outcome
+
+    async def gen():
+        for c in chunks:
+            yield c
+
+    holder = [None]
+
+    async def run():
+        return [c async for c in _memguard_stream_outcome(gen(), holder)]
+
+    assert asyncio.run(run()) == chunks  # passed through unchanged
+    assert holder[0] == expected
+
+
+def test_a_stream_cut_off_reports_nothing():
+    from rapid_mlx.routes.chat import _memguard_stream_outcome
+
+    async def gen():
+        yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        raise RuntimeError("client gone")
+
+    holder = [None]
+
+    async def run():
+        async for _ in _memguard_stream_outcome(gen(), holder):
+            pass
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run())
+    assert holder[0] is None

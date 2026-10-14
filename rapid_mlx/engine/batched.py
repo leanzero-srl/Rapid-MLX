@@ -3481,6 +3481,7 @@ class BatchedEngine(BaseEngine):
             kwargs.pop("session_id", None),
             enable_thinking=enable_thinking,
             chat_template_kwargs=chat_template_kwargs,
+            outcome=kwargs.pop("session_outcome", None),
         )
 
         if tools:
@@ -3559,6 +3560,7 @@ class BatchedEngine(BaseEngine):
         *,
         enable_thinking: bool | None = None,
         chat_template_kwargs: dict | None = None,
+        outcome: list | None = None,
     ) -> Any:
         """The memory guard's ``SessionHint`` for one chat request: the
         client's session id plus the rendered frame, measured with the
@@ -3587,8 +3589,23 @@ class BatchedEngine(BaseEngine):
         except Exception as exc:  # noqa: BLE001 — a hint, never a failure
             logger.debug("[memory_guard] session frame unavailable: %s", exc)
             frame, first_end = 0, 0
+        multi = (
+            sum(
+                1
+                for m in messages or ()
+                if not (
+                    isinstance(m, dict) and m.get("role") in ("system", "developer")
+                )
+            )
+            > 1
+        )
         return SessionHint(
-            session_id=sid, frame=frame, first_end=first_end, turn_start=turn_start
+            session_id=sid,
+            frame=frame,
+            first_end=first_end,
+            turn_start=turn_start,
+            outcome=outcome if isinstance(outcome, list) and outcome else None,
+            multi=multi,
         )
 
     def _session_frame(
@@ -4450,6 +4467,7 @@ class BatchedEngine(BaseEngine):
             kwargs.pop("session_id", None),
             enable_thinking=enable_thinking,
             chat_template_kwargs=chat_template_kwargs,
+            outcome=kwargs.pop("session_outcome", None),
         )
 
         if tools:

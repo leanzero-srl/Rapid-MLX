@@ -134,6 +134,27 @@ from ..service.helpers import (
 logger = logging.getLogger(__name__)
 
 
+# LeanZero memory guard: the finish_reason a chat SSE stream ended with.
+_SSE_FINISH_REASON = re.compile(r'"finish_reason":\s*"([A-Za-z_]+)"')
+
+
+async def _memguard_stream_outcome(stream, outcome: list | None):
+    """Pass an SSE chat stream through unchanged and, once it has ENDED,
+    put its last ``finish_reason`` into the memory guard's outcome holder
+    (``SessionHint.outcome``): whether the conversation's turn ended with a
+    reply ("stop") or is mid-turn ("tool_calls", "length"). A stream that
+    is cut off (disconnect, error) leaves it empty: unknown = mid-turn."""
+    last = None
+    async for chunk in stream:
+        if isinstance(chunk, str) and "finish_reason" in chunk:
+            found = _SSE_FINISH_REASON.findall(chunk)
+            if found:
+                last = found[-1]
+        yield chunk
+    if outcome is not None and last is not None:
+        outcome[0] = last
+
+
 def _new_stream_request_id() -> str:
     """Return an unguessable public identity suitable for scheduler admission."""
 
@@ -4868,6 +4889,12 @@ async def _create_chat_completion_impl(
         )
         if session_id:
             chat_kwargs["session_id"] = session_id
+        # Filled with the completion's finish_reason when the response ends
+        # (a turn that ended with a reply vs one waiting on a tool call).
+        session_outcome: list | None = [None]
+        chat_kwargs["session_outcome"] = session_outcome
+    else:
+        session_outcome = None
 
     # Context-length pre-check (DoS defense + UX, rapid-desktop#273 / #463).
     # See ``service/helpers.py::enforce_context_length_for_messages`` for
@@ -5504,15 +5531,18 @@ async def _create_chat_completion_impl(
             _commit_state[0] = True
             return StreamingResponse(
                 _disconnect_guard(
-                    stream_chat_completion_guided(
-                        engine,
-                        messages,
-                        request,
-                        json_schema,
-                        response_id=response_id,
-                        strict_mode=strict_mode,
-                        caller_agent=_caller_ua,
-                        **chat_kwargs,
+                    _memguard_stream_outcome(
+                        stream_chat_completion_guided(
+                            engine,
+                            messages,
+                            request,
+                            json_schema,
+                            response_id=response_id,
+                            strict_mode=strict_mode,
+                            caller_agent=_caller_ua,
+                            **chat_kwargs,
+                        ),
+                        session_outcome,
                     ),
                     raw_request,
                     engine=engine,
@@ -5542,15 +5572,18 @@ async def _create_chat_completion_impl(
             _commit_state[0] = True
             return StreamingResponse(
                 _disconnect_guard(
-                    stream_chat_completion_strict_postgen(
-                        engine,
-                        messages,
-                        request,
-                        json_schema,
-                        response_id=response_id,
-                        request_id=response_id,
-                        caller_agent=_caller_ua,
-                        **chat_kwargs,
+                    _memguard_stream_outcome(
+                        stream_chat_completion_strict_postgen(
+                            engine,
+                            messages,
+                            request,
+                            json_schema,
+                            response_id=response_id,
+                            request_id=response_id,
+                            caller_agent=_caller_ua,
+                            **chat_kwargs,
+                        ),
+                        session_outcome,
                     ),
                     raw_request,
                     engine=engine,
@@ -5597,7 +5630,7 @@ async def _create_chat_completion_impl(
         _commit_state[0] = True
         return StreamingResponse(
             _disconnect_guard(
-                _chat_stream,
+                _memguard_stream_outcome(_chat_stream, session_outcome),
                 raw_request,
                 engine=engine,
                 request_id_holder=request_id_holder,
@@ -6707,6 +6740,8 @@ async def _create_chat_completion_impl(
         usage=_build_usage(output, reasoning_text),
         metrics=_build_response_metrics(output),
     )
+    if session_outcome is not None:
+        session_outcome[0] = finish_reason
     # ── Response cache — STORE ───────────────────────────────────────
     #
     # Store the assembled response under the key computed at the lookup
