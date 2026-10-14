@@ -6726,11 +6726,15 @@ class Scheduler:
         storing: tuple[Any, int] | None = None,
         finished: str | None = None,
         storing_line: tuple[Any, Any] | None = None,
+        recency: bool = False,
     ) -> list[tuple[tuple, int, int]]:
         """``(key, level, bytes)`` of every prefix entry in EVICTION order:
         lowest level first, then the cheapest to re-prefill (fewest tokens --
         a short side-request entry goes before a 36k session's), then LRU.
-        Caller holds the cache lock.
+        ``recency``: LRU within a level instead (the hybrid entry-count
+        bound: no memory pressure, so re-prefill cost is no reason to drop
+        the live chat's short entries before old chats' long ones -- review
+        6, item 2). Caller holds the cache lock.
 
         Levels (``memory_guard.EVICT_*``): UNUSED (also a head its own
         conversation has since diverged from: compacted, re-rendered),
@@ -6847,7 +6851,10 @@ class Scheduler:
                 level = EVICT_NEEDED if key in protected else EVICT_HEAD
             cost = int(getattr(entry, "memory_bytes", 0) or 0)
             ranked.append((level, len(key), position, key, cost))
-        ranked.sort(key=lambda item: item[:3])
+        if recency:
+            ranked.sort(key=lambda item: (item[0], item[2]))
+        else:
+            ranked.sort(key=lambda item: item[:3])
         return [(key, level, cost) for level, _n, _p, key, cost in ranked]
 
     def _memguard_bound_order(self) -> list[tuple]:
@@ -6855,7 +6862,10 @@ class Scheduler:
         count bound calls it with its lock held); empty with the guard off."""
         if getattr(self, "_memory_guard", None) is None:
             return []
-        return [key for key, _level, _cost in self._memguard_ranked_entries()]
+        return [
+            key
+            for key, _level, _cost in self._memguard_ranked_entries(recency=True)
+        ]
 
     def _memguard_evictable_bytes(self, max_level: int) -> int:
         """Bytes the ONE policy could free evicting up to ``max_level``."""

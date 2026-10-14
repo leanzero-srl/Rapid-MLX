@@ -167,3 +167,31 @@ def test_main_waiting_on_a_subagent_stays_protected(cpu):
         sp = nxt + _GEN_PROMPT
         assert _levels(s)[head] == EVICT_NEEDED, j
     assert ("session", "main") not in {o[0] for o in s._memguard_outlived_lines()}
+
+
+# -- item 2: the hybrid entry-count bound, NO memory pressure -------------
+
+
+@pytest.mark.parametrize("cap", [8, 24])
+@pytest.mark.parametrize("header", [True, False])
+def test_the_count_bound_keeps_the_live_chat_after_finished_chats(cpu, cap, header):
+    """Item 2 (HIGH, the owner's hard rule): the hybrid entry-count bound is
+    not memory pressure (the cap here is 10**12). After cap/2+1 finished
+    chats their NEEDED heads filled the bound and, shortest first, the LIVE
+    chat's entries went: its next turn cached 0 of 811 on b06acd8ea (plain
+    LRU on 45e157bab: 507). Within a level the bound now evicts LRU."""
+    s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False), entries=cap)
+    frame = _hybrid_tokens(1, 300)
+    for c in range(cap // 2 + 1):
+        kw = {"session": f"old{c}", "frame": 300} if header else {"first_end": 2800}
+        user = frame + _hybrid_tokens(50 + c, 2500)
+        prompt, _s, _l = _hybrid_tool_loop(s, user, f"old{c}", **kw)
+        _hybrid_run(s, f"old{c}-final", prompt, len(prompt) - 3, **kw)
+    kw = {"session": "live", "frame": 300} if header else {"first_end": 500}
+    user = frame + _hybrid_tokens(900, 200)
+    prompt = user + _GEN_PROMPT
+    _c, out = _hybrid_run(s, "live-0", prompt, len(user), turn_start=True, **kw)
+    line = prompt + out
+    nxt = line + [904] + _hybrid_tokens(901, 300) + _GEN_PROMPT
+    cached, _o = _hybrid_run(s, "live-1", nxt, len(nxt) - 3, **kw)
+    assert cached >= len(line) - 8, (cached, len(line))
