@@ -128,8 +128,27 @@ class _Device:
         att = 1.6 * b * n * (x**1.15) / 8.0
         return int((att + 700 * b * n + 30 * x + 40_000) * noise)
 
+    def _first_write_copy(self, batch) -> int:
+        s = self.scheduler
+        mac = s.memory_aware_cache
+        extra = 0
+        for uid in list(getattr(batch, "uids", ())):
+            if uid in self._seen_uids:
+                continue
+            self._seen_uids.add(uid)
+            rid = s.uid_to_request_id.get(uid)
+            req = s.requests.get(rid) if rid else None
+            cached = int(getattr(req, "cached_tokens", 0) or 0)
+            if not cached or mac is None:
+                continue
+            prefix = tuple(req.prompt_token_ids[:cached])
+            if any(len(k) >= cached and k[:cached] == prefix for k in mac._entries):
+                extra += 512 * cached
+        return extra
+
     def install(self, monkeypatch, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
+        self._seen_uids: set = set()
         device = self
 
         def prompt(batch, tokens):
@@ -139,6 +158,10 @@ class _Device:
                 x = _context_of(batch, n)
                 before = device.active()
                 transient = device._transient(b, n, x)
+                # The first write of a row whose cached KV a prefix entry
+                # still holds grows every layer into new buffers: a one-off
+                # copy of the cached KV (Gabee Q8: +3-4 GB at 51-62k).
+                transient += device._first_write_copy(batch)
                 device.peak = max(device.peak, before + transient)
                 if device.fail_next > 0 or before + transient > device.physical:
                     device.fail_next = max(0, device.fail_next - 1)
@@ -242,6 +265,7 @@ def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
     prompt = _new_tokens(0, 600)
     delta = 500
     history = []
+    windows = []
     for turn in range(17):
         rid = f"turn-{turn}"
         # The route's admission check runs first (it also measures the idle
@@ -251,6 +275,7 @@ def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
         assert outs[-1].finished and not outs[-1].error, outs[-1].error
         cached = outs[-1].cached_tokens
         history.append((turn, len(prompt), cached))
+        windows.append(scheduler.memory_guard_max_context(16384))
         prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, delta - 4)
 
     assert device.ooms == 0
@@ -258,6 +283,10 @@ def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
         reprefilled = length - cached
         assert reprefilled <= delta + 8, history
     assert history[-1][1] > 8000  # well past where the old E3 stopped storing
+    # The advertised window never dips on the first-chunk copy spikes (goose
+    # compacts at 0.8x it).
+    for before, after in zip(windows, windows[1:], strict=False):
+        assert after >= 0.9 * before, windows
 
 
 def test_a_refusal_while_another_request_runs_defers_instead(llama, monkeypatch):
