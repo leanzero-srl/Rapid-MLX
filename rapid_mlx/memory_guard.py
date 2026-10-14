@@ -325,8 +325,11 @@ class PeakModel:
             if a is None or a < 0 or b is None or b < g:
                 a = b = None  # not separable on this data: fall through
         if a is None:
+            # Not separable: b = the analytic copy, a = the MEDIAN over chunk
+            # sizes (the first guard took the max, so one size's noise -- or
+            # chunk-256's non-linearity in context -- set the coefficient).
             b = g
-            a = max(max(0.0, sl - g) / max(1, u) for u, sl in groups)
+            a = _median([max(0.0, sl - g) / max(1, u) for u, sl in groups])
         return min(max(0.0, a), a_cap), min(max(g, b), b_cap)
 
     @staticmethod
@@ -450,12 +453,14 @@ class RowPlan:
     chunk_cap: int = 0  # per-request chunk ceiling (0 = none), E5 backstop
     chunk_floor: int = 0  # per-request floor override (0 = guard floor)
     prompt_tokens: int = 0  # the request's full prompt, for the refusal
-    # Bytes of the row's cached KV that its FIRST chunk copies: a prefix hit
-    # whose arrays its prefix entry still holds grows every layer into new
-    # buffers on the first write (Gabee Q8: +3-4 GB at 51-62k on the first
-    # chunk of each turn). Context-proportional and one-off: charged to the
-    # plan as such, never fitted as chunk x context.
+    # Bytes of the row's cached KV its admission copies (copy-on-admit /
+    # batched merge; the source stays alive until the copy is evaluated in
+    # this very dispatch). Gabee Q8: +3-4 GB at 51-62k on the first chunk of
+    # each turn. Context-proportional and one-off: charged to the plan as
+    # such, never fitted as chunk x context.
     admit_bytes: int = 0
+    # Pulled into the prompt batch by THIS dispatch (first chunk).
+    admitting: bool = False
 
 
 def step_shape(rows: Sequence[RowPlan], chunk: int) -> StepShape:
@@ -489,11 +494,6 @@ class GuardProbe:
     # one was evicted.
     evict_one: Callable[[int], bool]
     entry_count: Callable[[], int]
-    # Current first-chunk copy bytes of the rows this dispatch admits: only
-    # rows whose cached KV a prefix entry still holds pay it (once the entry
-    # is evicted, the first write frees each old layer as it grows). Re-read
-    # after every eviction. ``None``: use ``RowPlan.admit_bytes``.
-    admit: Callable[[], int] | None = None
 
 
 # The ONE prefix-cache eviction order every path uses (E1, the pressure
@@ -552,6 +552,10 @@ class MemoryGuard:
             "calibrations": 0,
             "deferrals": 0,
             "store_skips": 0,
+            # Of which end-of-turn (prompt + output) entries: the one a
+            # session's next turn fetches. Mid-turn prompt/boundary entries
+            # are skipped first under pressure, by design.
+            "turn_store_skips": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
@@ -566,6 +570,7 @@ class MemoryGuard:
         self.last_step_footprint = 0
         # The advertised window and a pending (candidate, model version).
         self._published_window: int | None = None
+        self._published_calibrated = False
         self._pending_window: tuple[int, Any] | None = None
         # E5: [context_threshold, extra_bytes, original] decaying margins.
         self._backstop: list[list[float]] = []
@@ -619,11 +624,30 @@ class MemoryGuard:
         if version is None:
             version = self.model.observations
         published = self._published_window
-        if published is None:
+        if published is None or (
+            not self._published_calibrated and self.model.calibrated
+        ):
+            # The first figure, and the first CALIBRATED figure (the prior is
+            # conservative), publish at once; after that only confirmed
+            # decreases move it.
+            if published != candidate and published is not None:
+                logger.warning(
+                    "[memory_guard] advertised window %d -> %d tokens (first "
+                    "calibrated figure)",
+                    published,
+                    candidate,
+                )
             self._published_window = candidate
+            self._published_calibrated = self.model.calibrated
             self._pending_window = None
             return candidate
         if abs(candidate - published) <= WINDOW_BAND_RATIO * max(1, published):
+            self._pending_window = None
+            return published
+        if candidate > published and self._published_calibrated:
+            # Never RISES once a calibrated figure is out: goose caches the
+            # first figure it reads (real Metal 124,440 -> 155,476 -> 140,512
+            # -> 145,647 before this rule).
             self._pending_window = None
             return published
         pending = self._pending_window
@@ -639,6 +663,7 @@ class MemoryGuard:
                 candidate,
             )
             self._published_window = candidate
+            self._published_calibrated = self.model.calibrated
             self._pending_window = None
             return candidate
         if pending is None or pending[1] != version:
@@ -700,12 +725,9 @@ class MemoryGuard:
         def footprint() -> int:
             return int(probe.active()) + int(probe.cache())
 
-        static_admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
-        admit = static_admit
+        admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
 
         def fits(c: int, fp: int) -> tuple[bool, StepShape, int, int]:
-            nonlocal admit
-            admit = static_admit if probe.admit is None else max(0, int(probe.admit()))
             shape = step_shape(rows, c)
             transient = self.plan_transient(shape, admit_bytes=admit)
             margin = self.margin(transient, ceiling)
@@ -921,8 +943,9 @@ class MemoryGuard:
     def idle_room(*, ceiling: int, base: int, fraction: float) -> int:
         """Bytes the prefix entries (and the allocator cache) may hold while
         the engine is IDLE: ``fraction x ceiling - idle base``. ``fraction``
-        is the pressure evictor's own trigger (0.9), so an idle engine never
-        sits above it and nothing is evicted between turns. Live KV is NOT
+        is the pressure evictor's own trigger (under the guard 1 - the static
+        margin), so an idle engine never sits above it and nothing is
+        evicted between turns. Live KV is NOT
         charged here: during a turn the guard makes room on demand (E1 evicts
         the entry the turn was fetched from, then halves the chunk)."""
         return int(fraction * ceiling - base)

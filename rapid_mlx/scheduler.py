@@ -161,6 +161,7 @@ from .memory_guard import (  # noqa: E402
     RowPlan,
     guard_enabled,
     is_metal_oom,
+    step_shape,
 )
 from .memory_guard import GUARD_ENV as MEMORY_GUARD_ENV  # noqa: E402
 from .paged_cache import PagedCacheManager
@@ -300,6 +301,33 @@ _MEMORY_GUARD_INIT_LOCK = threading.Lock()
 # When that gap is this small the second ~full-size owned copy is not worth
 # its memory: on goose's text lane each copy is ~3.7 GB at 22.5k tokens.
 _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
+
+
+def _exact_data_layers(caches: Any) -> list[Any]:
+    """Leaf layers that carry K/V arrays (wrappers such as CacheList
+    recursed), i.e. the layers copy-on-admit would copy."""
+    out: list[Any] = []
+    for c in caches or ():
+        sub = getattr(c, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            out.extend(_exact_data_layers(sub))
+        elif getattr(c, "keys", None) is not None:
+            out.append(c)
+    return out
+
+
+def _mark_handed_over(caches: Any) -> None:
+    """Flag a loan whose prefix entry was evicted as the sole owner of its
+    buffers: the singleton admission skips its copy-on-admit."""
+    for layer in _exact_data_layers(caches):
+        layer._lz_sole_owner = True
+
+
+def _handed_over(caches: Any) -> bool:
+    """True when every K/V layer of a queued loan was handed over (and
+    there is at least one), so admission copies nothing."""
+    layers = _exact_data_layers(caches)
+    return bool(layers) and all(getattr(c, "_lz_sole_owner", False) for c in layers)
 
 
 @dataclass
@@ -6508,6 +6536,7 @@ class Scheduler:
         *,
         keep_last: bool = False,
         storing: tuple[Any, int] | None = None,
+        finished: str | None = None,
         reason: str = "memory_guard",
         count: bool = True,
     ) -> bool:
@@ -6516,8 +6545,10 @@ class Scheduler:
         the LOWEST eviction level present, if that level is <= ``max_level``.
         ``keep_last`` never takes the last entry. ``storing`` is the
         ``(tokens, fetched)`` of a request whose entry is being stored (it is
-        live for classification even if it already left ``running``).
-        Non-memory-aware caches fall back to their own LRU."""
+        live for classification even if it already left ``running``);
+        ``finished`` names a request still in ``running`` whose turn is over
+        (its ``storing`` tuple replaces its live one). Non-memory-aware
+        caches fall back to their own LRU."""
         mac = getattr(self, "memory_aware_cache", None)
         if mac is None:
             # Legacy / paged variants (not the text lane's cache): their own
@@ -6529,6 +6560,7 @@ class Scheduler:
             live: list[tuple[Any, int]] = [
                 (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
                 for r in list(getattr(self, "running", {}).values())
+                if finished is None or r.request_id != finished
             ]
             if storing is not None:
                 live.append(storing)
@@ -6571,42 +6603,14 @@ class Scheduler:
     def _memguard_evict_one(self, max_level: int) -> bool:
         return self._memguard_evict_ordered(max_level, reason="E1")
 
-    def _memguard_probe(self, rows: list[RowPlan] | None = None) -> GuardProbe:
-        admitting = [r for r in (rows or ()) if r.admit_bytes > 0]
+    def _memguard_probe(self) -> GuardProbe:
         return GuardProbe(
             active=self._current_metal_active_bytes,
             cache=self._current_metal_cache_bytes,
             clear_cache=mx.clear_cache,
             evict_one=self._memguard_evict_one,
             entry_count=self._memguard_prefix_entry_count,
-            admit=(
-                (lambda: self._memguard_shared_admit_bytes(admitting))
-                if admitting
-                else None
-            ),
         )
-
-    def _memguard_shared_admit_bytes(self, admitting: list[RowPlan]) -> int:
-        """First-chunk copy of each admitted row whose cached prefix a prefix
-        entry still holds (an entry covering that prefix is resident)."""
-        mac = getattr(self, "memory_aware_cache", None)
-        total = 0
-        for row in admitting:
-            request = self.running.get(row.request_id) or self.requests.get(
-                row.request_id
-            )
-            cached = int(getattr(request, "cached_tokens", 0) or 0)
-            if request is None or cached <= 0:
-                continue
-            if mac is None:
-                total += row.admit_bytes
-                continue
-            prefix = tuple(request.prompt_token_ids[:cached])
-            with mac._lock:  # noqa: SLF001
-                keys = list(mac._entries)  # noqa: SLF001
-            if any(len(k) >= cached and k[:cached] == prefix for k in keys):
-                total += row.admit_bytes
-        return total
 
     def _memguard_request_for_uid(self, uid: Any) -> Request | None:
         if uid is None:
@@ -6645,10 +6649,12 @@ class Scheduler:
 
         kv_fn = None
 
-        def _admit_bytes(offset: int) -> int:
+        def _admit_bytes(offset: int, caches: Any = None) -> int:
             nonlocal kv_fn
             if offset <= 0:
                 return 0
+            if _handed_over(caches):
+                return 0  # handed over: no copy at admission
             if kv_fn is None:
                 kv_fn = self._kv_footprint_fn() or (lambda _t: 0)
             return int(kv_fn(offset))
@@ -6659,6 +6665,7 @@ class Scheduler:
             offset_known: int,
             processed: int,
             admitting: bool = False,
+            caches: Any = None,
         ) -> None:
             try:
                 if not segments:
@@ -6685,8 +6692,11 @@ class Scheduler:
                     chunk_floor=int(getattr(request, "_memguard_chunk_floor", 0) or 0),
                     prompt_tokens=prompt_tokens,
                     # Pulled into the prompt batch by THIS dispatch with a
-                    # prefix hit: its first write copies the cached KV.
-                    admit_bytes=_admit_bytes(offset) if admitting else 0,
+                    # prefix hit: admission copies the cached KV (the singleton
+                    # fast path's copy-on-admit, or the batched merge), and
+                    # the source stays alive until the copy is evaluated.
+                    admit_bytes=_admit_bytes(offset, caches) if admitting else 0,
+                    admitting=admitting,
                 )
             )
 
@@ -6708,9 +6718,10 @@ class Scheduler:
         ]:
             try:
                 uid, segments, all_tokens = item[0], item[1], item[4]
+                caches = item[3]
             except (IndexError, TypeError):
                 continue
-            _row(uid, segments, len(all_tokens or ()), 0, admitting=True)
+            _row(uid, segments, len(all_tokens or ()), 0, admitting=True, caches=caches)
         return rows
 
     def _memguard_set_chunk(self, chunk: int) -> None:
@@ -6746,10 +6757,30 @@ class Scheduler:
         if ceiling <= 0:
             return None, refusals
         for _ in range(64):
+            # Finding 3 (review 2026-10-14): a row that joins a DECODING batch
+            # is merged into it (padded to the longest row; the singleton
+            # fast path first promotes the decoding row to a batched copy).
+            # That merge runs inside this very next(), outside the prefill
+            # projection -- at goose's scale (a 100k session decoding while a
+            # subagent finishes its prefill) ~+16 GB. Charge it, and defer
+            # the JOINER when it does not fit (never the decoding rows).
+            if self._memguard_check_generation_merge(guard, ceiling):
+                continue
             rows = self._memguard_rows()
             if not rows:
                 return None, refusals
-            probe = self._memguard_probe(rows)
+            if self._memguard_admit_handoffs(guard, ceiling, rows):
+                continue
+            deferred_joiner = False
+            for row in rows:
+                if row.admitting and not self._memguard_joiner_fits(
+                    guard, ceiling, row
+                ):
+                    deferred_joiner = True
+                    break
+            if deferred_joiner:
+                continue
+            probe = self._memguard_probe()
             configured = int(
                 getattr(self.batch_generator, "prefill_step_size", 0)
                 or getattr(self.config, "prefill_step_size", 2048)
@@ -6781,6 +6812,210 @@ class Scheduler:
                 continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
         return None, refusals
+
+    def _memguard_admit_handoffs(
+        self, guard: MemoryGuard, ceiling: int, rows: list[RowPlan]
+    ) -> bool:
+        """Admission side of the session handoff. A request admitted with a
+        prefix hit is copied into the batch while its prefix entry still
+        holds the same buffers (copy-on-admit): the session twice. When that
+        does not fit, the entry hands its buffers over instead -- it is
+        evicted (it is the redundant fetched-from entry) and the loan, a deep
+        copy with its own array objects, becomes the sole owner, so the copy
+        is skipped. Only for exact/prefix loans (deep-copied; LCP and
+        supersequence loans share array objects) and only when no other
+        queued request holds a loan. Returns True when it handed over."""
+        admitting = [r for r in rows if r.admitting and r.admit_bytes > 0]
+        if not admitting:
+            return False
+        configured = int(getattr(self.batch_generator, "prefill_step_size", 0) or 0)
+        shape = step_shape(rows, max(1, configured))
+        need = guard.plan_transient(
+            shape, admit_bytes=sum(r.admit_bytes for r in rows if r.segment > 0)
+        )
+        need += guard.margin(need, ceiling)
+        if self._metal_footprint_bytes(reclaim_over=ceiling - need) + need <= ceiling:
+            return False
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return False
+        if any(
+            getattr(r, "prompt_cache", None) is not None for r in list(self.waiting)
+        ):
+            return False
+        bg = self.batch_generator
+        # The singleton pass-through (which honours the hand-over) only runs
+        # when the row is admitted ALONE into an empty prompt batch; any
+        # padded merge copies regardless, so the copy stays charged there.
+        unprocessed = list(getattr(bg, "_unprocessed_sequences", ()) or ())
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if len(unprocessed) != 1 or (
+            prompt_batch is not None and len(prompt_batch) > 0
+        ):
+            return False
+        handed = False
+        for row in admitting:
+            request = self.running.get(row.request_id)
+            if request is None or getattr(request, "cache_hit_type", None) not in (
+                "exact",
+                "prefix",
+            ):
+                continue
+            uid = self.request_id_to_uid.get(row.request_id)
+            item = next((it for it in unprocessed if it and it[0] == uid), None)
+            if item is None or not item[3]:
+                continue
+            cached = int(request.cached_tokens or 0)
+            keys = {
+                tuple(request.prompt_token_ids[:cached]),
+                tuple(request.prompt_token_ids[: cached + 1]),
+            }
+            with mac._lock:  # noqa: SLF001
+                owners = [k for k in mac._entries if k in keys]  # noqa: SLF001
+                for key in owners:
+                    mac._evict_entry_locked(key, reason="handoff")  # noqa: SLF001
+            if not owners:
+                # The loaning entry is gone or keyed differently: an entry
+                # we cannot name may still hold the buffers, and skipping
+                # the copy would then save nothing. Keep the copy charged.
+                continue
+            _mark_handed_over(item[3])
+            handed = True
+            logger.warning(
+                "[memory_guard] admission handoff: request %s takes over its "
+                "prefix entry (%d cached tokens, %.2fGB) instead of copying it",
+                row.request_id[:12],
+                cached,
+                row.admit_bytes / 1e9,
+            )
+        return handed
+
+    def _memguard_generation_lengths(self) -> list[int]:
+        """Context length of every row in mlx-lm's generation (decode) batch."""
+        bg = self.batch_generator
+        gen = getattr(bg, "_generation_batch", None)
+        lengths: list[int] = []
+        for uid in list(getattr(gen, "uids", None) or ()):
+            request = self._memguard_request_for_uid(uid)
+            if request is None:
+                continue
+            lengths.append(
+                len(request.prompt_token_ids or ()) + int(request.num_output_tokens)
+            )
+        return lengths
+
+    def _memguard_merge_bytes(
+        self, gen_lengths: list[int], join_lengths: list[int], kv_fn: Any
+    ) -> int:
+        """Bytes a join allocates: the merged batch buffers (every row padded
+        to the longest), plus -- when the decoding batch is one singleton row
+        -- the promotion copy of that row (measured on Metal: an 82 MB row
+        joined by a 50-token row = +205 MB active, +246 MB peak = 3 x 82)."""
+        if not gen_lengths or not join_lengths:
+            return 0
+        longest = max(gen_lengths + join_lengths)
+        merged = (len(gen_lengths) + len(join_lengths)) * int(kv_fn(longest))
+        promote = int(kv_fn(gen_lengths[0])) if len(gen_lengths) == 1 else 0
+        return merged + promote
+
+    def _memguard_make_room(self, extra: int, ceiling: int, max_level: int) -> bool:
+        """Footprint + ``extra`` + margin under the ceiling, clearing the
+        allocator cache and evicting with the ONE policy up to ``max_level``."""
+        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        footprint = self._metal_footprint_bytes(reclaim_over=ceiling - extra - margin)
+        while footprint + extra + margin > ceiling:
+            if not self._memguard_evict_ordered(max_level, reason="join"):
+                return False
+            mx.clear_cache()
+            footprint = self._metal_footprint_bytes()
+        return True
+
+    def _memguard_check_generation_merge(
+        self, guard: MemoryGuard, ceiling: int
+    ) -> bool:
+        """Rows whose prefill ends now move to the decoding batch in this
+        next(). Returns True when one was deferred (the caller re-plans)."""
+        bg = self.batch_generator
+        gen_lengths = self._memguard_generation_lengths()
+        if not gen_lengths:
+            return False
+        completion = int(getattr(bg, "completion_batch_size", 0) or 0)
+        if completion and len(gen_lengths) >= completion:
+            return False  # mlx-lm moves nothing to generation this step
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        uids = list(getattr(prompt_batch, "uids", None) or ())
+        joiners: list[Request] = []
+        for index, item in enumerate(getattr(bg, "_currently_processing", ()) or ()):
+            try:
+                segments = item[0]
+                moving = len(segments) == 1 and len(segments[0]) == 1
+            except (IndexError, TypeError):
+                continue
+            if moving and index < len(uids):
+                request = self._memguard_request_for_uid(uids[index])
+                if request is not None:
+                    joiners.append(request)
+        if not joiners:
+            return False
+        kv_fn = self._kv_footprint_fn()
+        if kv_fn is None:
+            return False
+        extra = self._memguard_merge_bytes(
+            gen_lengths, [len(r.prompt_token_ids or ()) for r in joiners], kv_fn
+        )
+        if self._memguard_make_room(extra, ceiling, EVICT_NEEDED):
+            return False
+        for request in joiners:
+            self._memguard_defer_request(
+                request, extra, ceiling, reason="join the decoding batch"
+            )
+        return True
+
+    def _memguard_joiner_fits(
+        self, guard: MemoryGuard, ceiling: int, row: RowPlan
+    ) -> bool:
+        """A request admitted while others decode will, at the end of its
+        prefill, hold its whole KV AND merge into the decoding batch. If that
+        cannot fit even after evicting what no live session needs, it waits
+        (deferred) -- it is never refused for a peak the others cause."""
+        gen_lengths = self._memguard_generation_lengths()
+        kv_fn = self._kv_footprint_fn()
+        if not gen_lengths or kv_fn is None:
+            return True
+        final = max(row.prompt_tokens, row.offset + row.segment)
+        extra = (
+            int(kv_fn(final))
+            + row.admit_bytes
+            + self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+        )
+        if self._memguard_make_room(extra, ceiling, EVICT_REDUNDANT):
+            return True
+        request = self.running.get(row.request_id)
+        if request is None:
+            return True
+        self._memguard_defer_request(
+            request, extra, ceiling, reason="prefill beside the decoding batch"
+        )
+        return False
+
+    def _memguard_defer_request(
+        self, request: Request, needed: int, ceiling: int, *, reason: str
+    ) -> None:
+        guard = self._memguard()
+        if guard is not None:
+            guard.counts["deferrals"] += 1
+        request._memguard_wait_for_idle = True
+        others = [rid for rid in self.running if rid != request.request_id]
+        self._memguard_requeue(request)
+        logger.warning(
+            "[memory_guard] deferred request %s (%s needs %.2fGB more, ceiling "
+            "%.2fGB): waits until %d running request(s) finish",
+            request.request_id[:12],
+            reason,
+            needed / 1e9,
+            ceiling / 1e9,
+            len(others),
+        )
 
     def _memguard_requeue(self, request: Request) -> None:
         """Put a tokenless running request back at the head of the queue:
@@ -6980,6 +7215,14 @@ class Scheduler:
         prefix = self._cache_self_pressure_current_bytes()
         base = max(0, active - prefix)
         if not running:
+            # The MINIMUM since the model loaded: an idle moment can still
+            # hold a finished request's KV (its responses / lazy extract
+            # copies outlive the step, more so when its store was skipped).
+            # Real Metal (review 2026-10-14): 35.26 GB recorded vs 30.00 GB
+            # of weights at 80k -> prefix budget 11.76 -> 6.50 GB -> "Cache
+            # entry too large" from 101k and a full re-prefill every turn.
+            if stored > 0:
+                base = min(stored, base)
             self._memguard_idle_base_bytes = base
         return base
 
@@ -7092,8 +7335,8 @@ class Scheduler:
     def _memguard_apply_budgets(self) -> None:
         """E2 + E3 from what the IDLE engine holds -- never from live KV.
 
-        Idle room = pressure fraction (0.9) x ceiling - idle base (weights +
-        fixed state). E3: the prefix budget in force is min(configured, idle
+        Idle room = pressure fraction (0.98 under the guard) x ceiling - idle
+        base (weights + fixed state). E3: the prefix budget in force is min(configured, idle
         room): entries that fit beside the weights while idle are kept, and
         the operator's --cache-memory-percent / --cache-memory-mb stay upper
         bounds. During a turn the guard makes room on demand (E1 evicts the
@@ -7120,7 +7363,7 @@ class Scheduler:
             guard.idle_room(
                 ceiling=ceiling,
                 base=base,
-                fraction=self._resolve_pressure_evict_fraction(),
+                fraction=self._memguard_pressure_fraction(),
             ),
         )
 
@@ -7133,6 +7376,13 @@ class Scheduler:
             )
             guard.configured_prefix_budget = configured
             effective = min(configured, room)
+            # Never below the newest entry: the session's next-turn base must
+            # stay storable (it fits by construction at idle; a budget
+            # squeezed under it turns every later turn into a re-prefill).
+            with mac._lock:  # noqa: SLF001
+                newest = next(reversed(mac._entries.values()), None)  # noqa: SLF001
+            if newest is not None:
+                effective = max(effective, min(configured, int(newest.memory_bytes)))
             previous = guard.effective_prefix_budget
             if previous is None or abs(effective - previous) > REAPPLY_RATIO * max(
                 1, previous
@@ -7148,7 +7398,7 @@ class Scheduler:
                         effective / 1e9,
                         configured / 1e9,
                         room / 1e9,
-                        self._resolve_pressure_evict_fraction(),
+                        self._memguard_pressure_fraction(),
                         ceiling / 1e9,
                         base / 1e9,
                         evicted,
@@ -7183,7 +7433,14 @@ class Scheduler:
                 (effective or 0) / 1e9,
             )
 
-    def _memguard_room_for_store(self, request: Request | None, cache: Any) -> bool:
+    def _memguard_room_for_store(
+        self,
+        request: Request | None,
+        cache: Any,
+        *,
+        handoff: bool = False,
+        turn_end: bool = False,
+    ) -> bool:
         """Before a prefix entry is copied in (E3 store-time): the copy must
         fit beside everything resident now. Make room with the ONE eviction
         policy up to the redundant level (never an entry a live session still
@@ -7198,12 +7455,33 @@ class Scheduler:
         try:
             from .memory_cache import estimate_kv_cache_memory
 
-            need = int(estimate_kv_cache_memory(cache))
+            if handoff:
+                # Layer-by-layer takeover of a finished request's cache whose
+                # source buffers die as each copy lands: one layer of room.
+                need = max(
+                    (int(estimate_kv_cache_memory([layer])) for layer in cache),
+                    default=0,
+                )
+            else:
+                need = int(estimate_kv_cache_memory(cache))
         except Exception:  # noqa: BLE001
             return True
         margin = int(MARGIN_CEILING_RATIO * ceiling)
         storing = None
-        if request is not None:
+        finished = None
+        if request is not None and turn_end:
+            # The turn is over: the request can no longer be requeued to
+            # re-fetch, and the entry being stored covers everything it
+            # holds. Its own shorter entries (this turn's prompt/boundary
+            # snapshots, the entry it fetched) are REDUNDANT now, so the
+            # end-of-turn entry -- the one the next turn needs -- wins the
+            # room over them.
+            sequence = list(request.prompt_token_ids) + list(
+                getattr(request, "output_token_ids", ()) or ()
+            )
+            storing = (sequence, len(sequence))
+            finished = request.request_id
+        elif request is not None:
             storing = (
                 request.prompt_token_ids,
                 int(getattr(request, "cached_tokens", 0) or 0),
@@ -7211,7 +7489,10 @@ class Scheduler:
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - need - margin)
         while footprint + need + margin > ceiling:
             if not self._memguard_evict_ordered(
-                EVICT_REDUNDANT, storing=storing, reason="store-room"
+                EVICT_REDUNDANT,
+                storing=storing,
+                finished=finished,
+                reason="store-room",
             ):
                 break
             mx.clear_cache()
@@ -7219,6 +7500,8 @@ class Scheduler:
         if footprint + need + margin <= ceiling:
             return True
         guard.counts["store_skips"] += 1
+        if turn_end:
+            guard.counts["turn_store_skips"] += 1
         logger.warning(
             "[memory_guard] skipped storing a %.2fGB prefix entry: resident "
             "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB",
@@ -8309,6 +8592,21 @@ class Scheduler:
             raw_fraction = 1.0
         return raw_fraction
 
+    def _memguard_pressure_fraction(self) -> float:
+        """The pressure evictors' trigger as a fraction of the cap.
+
+        Guard off: the operator's ``metal_pressure_evict_fraction`` (0.9),
+        lz.10 exactly. Guard on: the guard's own static margin
+        (1 - MARGIN_CEILING_RATIO). Every allocation is planned against the
+        ceiling at dispatch (E1) and store time, so an IDLE engine may hold
+        entries up to the margin; a 10% idle reserve capped the largest
+        storable session at 0.9 x ceiling - weights, below the context the
+        guard itself admits, and every later turn re-prefilled (session sim,
+        2026-10-14: entries vanished at 18.6k with a 22.9k window)."""
+        if getattr(self, "_memory_guard", None) is None and not guard_enabled():
+            return self._resolve_pressure_evict_fraction()
+        return 1.0 - MARGIN_CEILING_RATIO
+
     def _cache_self_pressure_threshold_bytes(self) -> int:
         """Return the prefix-cache memory threshold above which the
         scheduler proactively evicts, INDEPENDENT of ``gpu_memory_utilization``.
@@ -8346,7 +8644,7 @@ class Scheduler:
         max_memory = int(getattr(cache, "_max_memory", 0) or 0)
         if max_memory <= 0:
             return 0
-        return int(max_memory * self._resolve_pressure_evict_fraction())
+        return int(max_memory * self._memguard_pressure_fraction())
 
     def _cache_self_pressure_current_bytes(self) -> int:
         """Snapshot of memory_aware_cache's current ledger in bytes.
@@ -8430,7 +8728,7 @@ class Scheduler:
         # trie-based PrefixCacheManager engines).
         if metal_cap <= 0 and cache_self_threshold <= 0:
             return 0
-        fraction = self._resolve_pressure_evict_fraction()
+        fraction = self._memguard_pressure_fraction()
         metal_threshold = int(metal_cap * fraction) if metal_cap > 0 else 0
         evicted = 0
         # Track which trigger fired at least once during this tick so
@@ -8465,7 +8763,11 @@ class Scheduler:
             # the next-turn entries go too. The first guard ran plain LRU
             # here and twice left 0 entries mid-session on Gabee (61k, 74k),
             # so the next turn re-prefilled everything (361 s, 465 s).
-            if not self._memguard_evict_ordered(
+            if getattr(self, "_memory_guard", None) is None and not guard_enabled():
+                # RAPID_MLX_MEMORY_GUARD=0 restores the lz.10 evictor exactly.
+                if not self._evict_one_prefix_cache_entry():
+                    break
+            elif not self._memguard_evict_ordered(
                 EVICT_NEEDED if hard else EVICT_REDUNDANT,
                 keep_last=not hard,
                 reason="pressure",
@@ -10304,7 +10606,10 @@ class Scheduler:
                     self.waiting.appendleft(request)
                 break
             if any(
+                # Only while it prefills: once its first token is out it is an
+                # ordinary decoding row (review 2026-10-14, item 7).
                 getattr(r, "_memguard_wait_for_idle", False)
+                and int(r.num_output_tokens) == 0
                 for r in self.running.values()
             ):
                 if not shortest_tail:
@@ -11359,13 +11664,31 @@ class Scheduler:
                             import time as _time
 
                             _store_t0 = _time.monotonic()
+                            # Memory guard: the end-of-turn entry TAKES OVER
+                            # the finished request's KV layer by layer (the
+                            # request lets go of it first), so the store never
+                            # holds two copies of the session. With no other
+                            # row left in the generation batch the source
+                            # buffers die as each layer's copy lands: the room
+                            # needed is one layer, not the whole entry.
+                            handed = request._extracted_cache
+                            request._extracted_cache = None
+                            gen = getattr(
+                                self.batch_generator, "_generation_batch", None
+                            )
+                            try:
+                                solo = gen is None or len(gen) == 0
+                            except TypeError:
+                                solo = False
                             stored = self._memguard_room_for_store(
-                                request, request._extracted_cache
+                                request, handed, handoff=solo, turn_end=True
                             ) and self.memory_aware_cache.store(
                                 full_token_sequence,
-                                request._extracted_cache,
+                                handed,
                                 evict_prefixes=False,
+                                handoff=True,
                             )
+                            del handed
                             _store_dt = _time.monotonic() - _store_t0
                             # NOTE: We intentionally do NOT store a prompt-only
                             # cache entry.  Hybrid Mamba+Transformer models
@@ -11714,6 +12037,11 @@ class Scheduler:
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
+                    # mlx-lm's responses carry the finished rows' caches; drop
+                    # them now so a skipped store frees the session at once
+                    # (not at the end of the step, after the idle re-measure).
+                    responses = None
+                    raw_next = None
 
                 # #558 PR-3: reconcile grammar processors when idle. The realign
                 # guard (which scrubs leaked slots AND flushes tombstones) only

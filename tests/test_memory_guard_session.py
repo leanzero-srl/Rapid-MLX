@@ -9,20 +9,24 @@ pressure evictor emptied the store) re-prefilled everything (361 s, 465 s
 vs ~30 s on a hit), then an OOM every step from ~76k.
 
 These tests run the REAL scheduler, the memory-aware prefix cache and
-mlx-lm's BatchGenerator on a tiny Llama on the CPU device. The Metal
-allocator is SIMULATED and its cost deliberately does NOT have the guard's
-model form (a context**1.15 term, a per-step constant, and +-6% noise), so
-calibration cannot pass by construction:
+mlx-lm's BatchGenerator on a tiny KV-heavy Llama on the CPU device, whose
+allocator is REAL: resident memory is every buffer the engine actually
+holds (live batch, prefix entries, a finished request's extracted cache,
+admission copies, padded merges), not the engine's own ledger of them.
+Only the weights (an offset) and a big model's attention scratch are
+simulated; the scratch deliberately does NOT have the guard's model form,
+so calibration cannot pass by construction:
 
-  active  = weights + the live batch caches' bytes + the prefix-cache ledger
-  step    = (0.2*B*C*X**1.15 + 700*B*C + 30*X + 40 kB) * (1 +- 6%)
+  step = (0.2*B*C*X**1.15 + 700*B*C + 30*X + 40 kB) * (1 +- 6%)
 
+Sizes are Gabee's 64 GB Mac at 1/100 (30 GB weights, 50.1 GB ceiling).
 The engine's pressure evictor (engine_core runs it every 16 steps) is called
 after every step here, which is stricter.
 """
 
 from __future__ import annotations
 
+import gc
 import importlib
 import math
 from types import SimpleNamespace
@@ -46,7 +50,10 @@ OOM_TEXT = (
     "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
 )
 MB = 1_000_000
-BASE = 1 * MB  # simulated weights
+# measured: Gabee (M3 Max 64 GB, Q8 AREX-2) 30.0 GB weights, 50.1 GB
+# ceiling; here at 1/100 (the ceiling is 0.97 x physical).
+BASE = 300 * MB
+GABEE_PHYSICAL = int(501.0 / 0.97 * MB)
 CHUNK = 64
 FLOOR = 8
 
@@ -72,14 +79,18 @@ def llama(cpu):
     model = Model(
         ModelArgs(
             model_type="llama",
-            hidden_size=64,
-            num_hidden_layers=2,
-            intermediate_size=128,
-            num_attention_heads=4,
+            # KV-heavy on purpose: 8 KB of KV per token (8 layers x K+V x
+            # 2 heads x 64 x fp32) against ~0.5 KB of score per context token
+            # per chunk row, so the session's KV dominates the real
+            # allocator the way it does at 100k+ on a 30 GB model.
+            hidden_size=128,
+            num_hidden_layers=8,
+            intermediate_size=256,
+            num_attention_heads=2,
             rms_norm_eps=1e-6,
             vocab_size=128,
             num_key_value_heads=2,
-            max_position_embeddings=16384,
+            max_position_embeddings=65536,
         )
     )
     mx.eval(model.parameters())
@@ -98,57 +109,68 @@ def _context_of(batch, n: int) -> int:
 
 
 class _Device:
-    """Simulated Metal allocator over the real scheduler's live objects."""
+    """A simulated Metal device whose RESIDENT memory is the real allocator.
+
+    ``active`` is the CPU device's real ``mx.get_active_memory()`` above the
+    reading at install, plus a simulated weights offset: every buffer the
+    engine really holds counts -- the live batch, prefix entries, a finished
+    request's extracted cache still referenced by its response, admission
+    copies, padded merges -- whether or not the engine knows about it. Only
+    the attention scratch of a big model is simulated, and its cost
+    deliberately does NOT have the guard's model form (a context**1.15 term,
+    a per-step constant, +-6% noise), so calibration cannot pass by
+    construction::
+
+        step = (0.2*B*C*X**1.15 + 700*B*C + 30*X + 40 kB) * (1 +- 6%)
+
+    An allocation the guard did not plan is caught twice: before a prompt
+    step (resident + the simulated scratch over ``physical`` raises the
+    real Metal OOM text, as on Gabee) and after the fact (``max_seen``, the
+    larger of the real peak and resident + simulated scratch, folded in at
+    every peak reset and after every step; the tests assert it never
+    crossed ``physical``).
+    """
 
     def __init__(self, physical: int):
         self.physical = physical
-        self.peak = BASE
         self.ooms = 0
         self.fail_next = 0
         self.steps = 0
+        self.scratch_peak = 0
+        self.max_seen = BASE
         self.scheduler: Scheduler | None = None
 
     def active(self) -> int:
-        s = self.scheduler
-        live = 0
-        bg = getattr(s, "batch_generator", None)
-        if bg is not None:
-            try:
-                live = int(bg.prompt_cache_nbytes)
-            except Exception:
-                live = 0
-        ledger = s.memory_aware_cache._current_memory if s.memory_aware_cache else 0
-        return BASE + live + ledger
+        return BASE + max(0, self._real_active() - self._baseline)
+
+    def peak(self) -> int:
+        real = BASE + max(0, self._real_peak() - self._baseline)
+        return max(real, self.scratch_peak)
+
+    def fold(self) -> None:
+        self.max_seen = max(self.max_seen, self.peak())
+
+    def reset(self) -> None:
+        self.fold()
+        self._real_reset()
+        self.scratch_peak = 0
 
     def _transient(self, b: int, n: int, x: int) -> int:
-        # NOT the guard's form: x**1.15 attention, a per-step constant, and
-        # deterministic +-6% noise.
         self.steps += 1
         noise = 1.0 + 0.06 * math.sin(self.steps * 1.7)
         att = 1.6 * b * n * (x**1.15) / 8.0
         return int((att + 700 * b * n + 30 * x + 40_000) * noise)
 
-    def _first_write_copy(self, batch) -> int:
-        s = self.scheduler
-        mac = s.memory_aware_cache
-        extra = 0
-        for uid in list(getattr(batch, "uids", ())):
-            if uid in self._seen_uids:
-                continue
-            self._seen_uids.add(uid)
-            rid = s.uid_to_request_id.get(uid)
-            req = s.requests.get(rid) if rid else None
-            cached = int(getattr(req, "cached_tokens", 0) or 0)
-            if not cached or mac is None:
-                continue
-            prefix = tuple(req.prompt_token_ids[:cached])
-            if any(len(k) >= cached and k[:cached] == prefix for k in mac._entries):
-                extra += 512 * cached
-        return extra
-
     def install(self, monkeypatch, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
-        self._seen_uids: set = set()
+        scheduler._test_device = self
+        self._real_active = mx.get_active_memory
+        self._real_peak = mx.get_peak_memory
+        self._real_reset = mx.reset_peak_memory
+        gc.collect()
+        mx.clear_cache()
+        self._baseline = self._real_active()
+        self._real_reset()
         device = self
 
         def prompt(batch, tokens):
@@ -158,36 +180,34 @@ class _Device:
                 x = _context_of(batch, n)
                 before = device.active()
                 transient = device._transient(b, n, x)
-                # The first write of a row whose cached KV a prefix entry
-                # still holds grows every layer into new buffers: a one-off
-                # copy of the cached KV (Gabee Q8: +3-4 GB at 51-62k).
-                transient += device._first_write_copy(batch)
-                device.peak = max(device.peak, before + transient)
                 if device.fail_next > 0 or before + transient > device.physical:
                     device.fail_next = max(0, device.fail_next - 1)
                     device.ooms += 1
                     raise RuntimeError(OOM_TEXT)
+                device.scratch_peak = max(device.scratch_peak, before + transient)
+                return _REAL_PROMPT(batch, tokens)
             return _REAL_PROMPT(batch, tokens)
 
         monkeypatch.setattr(_GEN.PromptProcessingBatch, "prompt", prompt)
-        monkeypatch.setattr(mx, "get_peak_memory", lambda: device.peak)
-
-        def reset():
-            device.peak = device.active()
-
-        monkeypatch.setattr(mx, "reset_peak_memory", reset)
+        monkeypatch.setattr(mx, "get_active_memory", device.active)
+        monkeypatch.setattr(mx, "get_peak_memory", device.peak)
+        monkeypatch.setattr(mx, "reset_peak_memory", device.reset)
         scheduler._current_metal_active_bytes = device.active
         scheduler._current_metal_cache_bytes = lambda: 0
         scheduler._current_process_resident_bytes = device.active
         cap = int(device.physical * 0.97)
         scheduler._resolve_metal_cap_bytes = lambda: cap
         # A near-truth prior so these tests pin the eviction / budget /
-        # deferral POLICY, not the calibration (tested separately).
+        # deferral / handoff POLICY, not the calibration (tested separately).
+        # The KV growth copy (one layer, mlx-lm KVCache grows by
+        # concatenation) is the engine's own analytic term.
         scheduler._memory_guard = MemoryGuard(
             PeakPrior(
                 attention_bytes_per_unit=6.0,
                 token_bytes=1500.0,
-                kv_copy_bytes_per_context=64.0,
+                kv_copy_bytes_per_context=(
+                    scheduler._memguard_prior().kv_copy_bytes_per_context
+                ),
             ),
             floor_tokens=FLOOR,
         )
@@ -238,6 +258,9 @@ def _drive(scheduler: Scheduler, requests, steps: int = 4000, arrive=None):
             scheduler.add_request(r)
         out = scheduler.step()
         scheduler.evict_prefix_cache_under_pressure()
+        device = getattr(scheduler, "_test_device", None)
+        if device is not None:
+            device.fold()
         for o in out.outputs:
             outputs.setdefault(o.request_id, []).append(o)
         if step >= max(arrive, default=0) and not scheduler.has_requests():
@@ -253,69 +276,121 @@ def _new_tokens(turn: int, n: int) -> list[int]:
     return [(turn * 37 + i * 11) % 120 + 1 for i in range(n)]
 
 
-def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
-    """RED on the branch head: the E3 budget derived from the live KV + step
-    peak ratchets down below one entry around ~7.5k tokens here; from then
-    on every turn re-prefills the whole prompt. GREEN: each turn re-prefills
-    only the new tokens, with no OOM, to the end of the session."""
-    device = _Device(physical=int(10.5 * MB))
-    scheduler = _scheduler(llama)
-    device.install(monkeypatch, scheduler)
-
+def _session(scheduler, device, turns: int, delta: int, native: int):
     prompt = _new_tokens(0, 600)
-    delta = 500
     history = []
     windows = []
-    for turn in range(17):
+    for turn in range(turns):
         rid = f"turn-{turn}"
         # The route's admission check runs first (it also measures the idle
         # base, as in production).
-        assert scheduler.device_memory_admission(len(prompt)) is None
+        assert scheduler.device_memory_admission(len(prompt)) is None, turn
         outs = _drive(scheduler, [_request(rid, prompt)])[rid]
-        assert outs[-1].finished and not outs[-1].error, outs[-1].error
-        cached = outs[-1].cached_tokens
-        history.append((turn, len(prompt), cached))
-        windows.append(scheduler.memory_guard_max_context(16384))
+        assert outs[-1].finished and not outs[-1].error, (turn, outs[-1].error)
+        history.append((turn, len(prompt), outs[-1].cached_tokens))
+        windows.append(scheduler.memory_guard_max_context(native))
         prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, delta - 4)
+    return history, windows
 
+
+def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
+    """Every turn of a session re-prefills only its new tokens, to ~90% of
+    the honest window (goose compacts at 80%), with every end-of-turn entry stored and no
+    allocation over the device. The end-of-turn entry TAKES OVER the
+    finished request's KV (no second copy), the next turn takes it over in
+    turn when copying it would not fit, and the turn's own prompt entry is
+    redundant once the end-of-turn entry is in.
+
+    RED on 605548ef6 (same device): end-of-turn stores skipped from 8.1k,
+    0 prefix entries left from 10.1k, every later turn a full re-prefill."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _scheduler(llama)
+    device.install(monkeypatch, scheduler)
+
+    delta = 500
+    history, windows = _session(scheduler, device, turns=37, delta=delta, native=65536)
+
+    guard = scheduler._memguard()
     assert device.ooms == 0
-    for turn, length, cached in history[1:]:
-        reprefilled = length - cached
-        assert reprefilled <= delta + 8, history
-    assert history[-1][1] > 8000  # well past where the old E3 stopped storing
-    # The advertised window never dips on the first-chunk copy spikes (goose
-    # compacts at 0.8x it).
+    assert device.max_seen <= device.physical, device.max_seen
+    assert guard.counts["turn_store_skips"] == 0
+    for _turn, length, cached in history[1:]:
+        assert length - cached <= delta + 8, history
+    last_length = history[-1][1]
+    assert last_length >= 0.85 * windows[-1], (last_length, windows[-1])
+    # The advertised window never dips (goose compacts at 0.8x it).
     for before, after in zip(windows, windows[1:], strict=False):
-        assert after >= 0.9 * before, windows
+        assert after >= 0.97 * before, windows
 
 
-def test_a_refusal_while_another_request_runs_defers_instead(llama, monkeypatch):
-    """B fits this Mac alone but not beside A: it waits for A, then runs.
-    RED on the branch head: B is refused with context_length_exceeded."""
-    device = _Device(physical=int(4.2 * MB))
+def _timeline(scheduler: Scheduler) -> dict[str, list[int]]:
+    """Wrap ``scheduler.step`` to record the steps each request emitted on."""
+    steps: dict[str, list[int]] = {}
+    real_step = scheduler.step
+    count = [0]
+
+    def step():
+        out = real_step()
+        count[0] += 1
+        for o in out.outputs:
+            if o.new_token_ids:
+                steps.setdefault(o.request_id, []).append(count[0])
+        return out
+
+    scheduler.step = step
+    return steps
+
+
+def _three_requests(llama, monkeypatch, physical: int):
+    """A decodes a 6000-token context; B (6000) and C (2000) arrive while it
+    does. Joining a row into the decoding batch allocates the merged batch
+    buffers (every row padded to the longest) and, when the batch is one
+    promoted singleton row, a copy of that row (measured on Metal: an 82 MB
+    row joined by a 50-token row = +246 MB peak = 3 x 82)."""
+    device = _Device(physical=physical)
     scheduler = _scheduler(llama, max_num_seqs=4, enable_prefix_cache=False)
     device.install(monkeypatch, scheduler)
-    a = _request("a", _new_tokens(1, 3000), max_tokens=200)
-    b = _request("b", _new_tokens(2, 3000), max_tokens=4)
-    # B arrives while A decodes; B's prefill beside A's KV runs out of room.
-    outputs = _drive(scheduler, [a], arrive={50: [b]})
-
-    assert device.ooms == 0
-    for rid in ("a", "b"):
+    steps = _timeline(scheduler)
+    a = _request("a", _new_tokens(1, 6000), max_tokens=300)
+    b = _request("b", _new_tokens(2, 6000), max_tokens=60)
+    c = _request("c", _new_tokens(3, 2000), max_tokens=20)
+    outputs = _drive(scheduler, [a], arrive={120: [b], 140: [c]})
+    for rid, n in (("a", 300), ("b", 60), ("c", 20)):
         assert outputs[rid][-1].finished, rid
         assert not outputs[rid][-1].error, (rid, outputs[rid][-1].error)
-        assert _tokens(outputs[rid]), rid
+        assert len(_tokens(outputs[rid])) == n, rid
+    assert device.ooms == 0
+    assert device.max_seen <= device.physical, (device.max_seen, device.physical)
     guard = scheduler.get_stats()["memory_guard"]
     assert guard["actions"]["refusals"] == 0
+    return steps, guard
+
+
+def test_joining_the_decoding_batch_is_charged_and_deferred(llama, monkeypatch):
+    """B and C fit this Mac alone, never merged beside A's 6000-token row:
+    each waits and runs, and nothing is allocated over the device.
+    RED on 605548ef6: B joins A unplanned (real peak 483 MB on a 440 MB
+    device -- a Metal OOM) and B is refused."""
+    steps, guard = _three_requests(llama, monkeypatch, physical=440 * MB)
     assert guard["actions"]["deferrals"] >= 1
-    # B ran after A finished.
-    assert outputs["a"][-1] is not None
+    assert steps["b"][0] > steps["a"][-1]  # B ran after A
+
+
+def test_a_deferred_request_stops_gating_once_it_decodes(llama, monkeypatch):
+    """B waits for A; once B has its first token it is an ordinary decoding
+    row, so C (which fits beside B) runs beside it instead of waiting for
+    B to finish (review 2026-10-14, item 7). Negative control for the
+    test above: here C does join a decoding batch."""
+    steps, guard = _three_requests(llama, monkeypatch, physical=555 * MB)
+    assert guard["actions"]["deferrals"] >= 1
+    assert steps["b"][0] > steps["a"][-1]  # B still waited for A
+    assert steps["c"][0] < steps["b"][-1]  # C ran beside B
 
 
 def test_a_prompt_that_cannot_fit_even_alone_is_still_refused(llama, monkeypatch):
     # Negative control for the deferral: alone and still too big -> the
     # typed refusal, with n_ctx below the prompt.
-    device = _Device(physical=int(2.0 * MB))
+    device = _Device(physical=320 * MB)
     scheduler = _scheduler(llama, enable_prefix_cache=False)
     device.install(monkeypatch, scheduler)
     outs = _drive(scheduler, [_request("r", _new_tokens(3, 3000))])["r"]
@@ -323,6 +398,7 @@ def test_a_prompt_that_cannot_fit_even_alone_is_still_refused(llama, monkeypatch
     detail = outs[-1].error_detail
     assert detail["n_ctx"] < detail["n_prompt_tokens"] == 3000
     assert device.ooms == 0
+    assert device.max_seen <= device.physical
 
 
 def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
@@ -334,13 +410,13 @@ def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
     window. RED on the branch head: every entry is evicted, cached_tokens is
     zeroed (full re-prefill), and the working-set lower bound poisons the
     slope."""
-    device = _Device(physical=int(64 * MB))
+    device = _Device(physical=1000 * MB)
     scheduler = _scheduler(llama)
     device.install(monkeypatch, scheduler)
-    # A Metal device with a 60 MB working set: the backstop's lower bound
+    # A Metal device with a 960 MB working set: the backstop's lower bound
     # (working set - active) is far above any real step.
     monkeypatch.setattr(
-        mx, "device_info", lambda: {"max_recommended_working_set_size": 60 * MB}
+        mx, "device_info", lambda: {"max_recommended_working_set_size": 960 * MB}
     )
     first = _new_tokens(0, 1500)
     outs = _drive(scheduler, [_request("t0", first)])["t0"]
@@ -365,31 +441,31 @@ def test_max_model_len_is_the_same_idle_figure_under_load(llama, monkeypatch):
     """/v1/models max_model_len is the STABLE idle window: identical with 0
     and with 3 concurrent running requests (goose compacts at 0.8x it and
     caches it per model; load is handled by deferral, never by shrinking it).
-    The peak model is held fixed so only load differs. RED on the branch
-    head: the figure was min(KV-only priced from LIVE residency, guard)."""
-    # Tight enough that the load's KV is a large share of the device: the
-    # old KV-only figure, priced from LIVE residency, drops under it.
-    device = _Device(physical=int(8.15 * MB))
+    The peak model keeps observing the loaded steps (mixed batches feed its
+    residual window) -- the published figure must not move on them."""
+    device = _Device(physical=440 * MB)
     scheduler = _scheduler(llama, max_num_seqs=4)
     device.install(monkeypatch, scheduler)
     monkeypatch.setattr(mx.metal, "is_available", lambda: True)  # /v1/models path
     monkeypatch.setattr(
-        mx, "device_info", lambda: {"max_recommended_working_set_size": int(8.8 * MB)}
+        mx, "device_info", lambda: {"max_recommended_working_set_size": 460 * MB}
     )
-    monkeypatch.setattr(mx, "get_active_memory", device.active)
-    # Warm up once so the idle base is measured, then freeze the model.
-    _drive(scheduler, [_request("warm", _new_tokens(9, 200))])
+    # Warm up once so the idle base is measured and the model calibrates.
+    _drive(scheduler, [_request("warm", _new_tokens(9, 1500))])
     guard = scheduler._memguard()
-    monkeypatch.setattr(guard, "observe", lambda *a, **k: False)
     idle = scheduler.projected_memory_max_context(16384)
     assert idle and 0 < idle < 16384  # memory-bound, not the native window
     assert scheduler.get_stats()["memory_guard"]["max_context_idle"] == idle
+    observed = guard.model.observations
 
     for i in range(3):
-        scheduler.add_request(_request(f"c{i}", _new_tokens(10 + i, 2000), 200))
-    for _ in range(45):  # all three prefilled, decoding
+        scheduler.add_request(_request(f"c{i}", _new_tokens(10 + i, 1000), 200))
+    for _ in range(60):  # all three prefilled, decoding
         scheduler.step()
+        device.fold()
     assert len(scheduler.running) == 3
-    assert device.active() > BASE + 3 * MB  # the load is real
+    assert guard.model.observations > observed  # the model kept learning
+    assert device.active() > BASE + 20 * MB  # the load is real
+    assert device.max_seen <= device.physical
     assert scheduler.projected_memory_max_context(16384) == idle
     assert scheduler.get_stats()["memory_guard"]["max_context_idle"] == idle
