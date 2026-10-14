@@ -119,6 +119,25 @@ class SamplingParams:
             self.stop_token_ids = []
 
 
+@dataclass(frozen=True)
+class SessionHint:
+    """Who a request belongs to, for the memory guard's per-session
+    decisions (which prefix entries a conversation still needs).
+
+    ``session_id``: the client's own name for the conversation (goose's
+    ``agent-session-id`` header: every chat request carries it, a subagent
+    has its own, a compaction keeps it). ``frame``: tokens of the rendered
+    system / tools frame (everything before the first non-system message's
+    content), from the model's own chat template. ``first_end``: tokens
+    through the end of the first non-system message. ``turn_start``: the
+    last message is a user message (a new turn, not a tool round)."""
+
+    session_id: str | None = None
+    frame: int = 0
+    first_end: int = 0
+    turn_start: bool = False
+
+
 @dataclass
 class Request:
     """
@@ -173,6 +192,9 @@ class Request:
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: list[int] | None = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
+    # Memory guard: the conversation this request belongs to (``SessionHint``;
+    # None for raw-prompt callers).
+    session_hint: SessionHint | None = None
 
     # Routing hints used by PFlash to decide whether to compress (#287).
     has_tools: bool = False

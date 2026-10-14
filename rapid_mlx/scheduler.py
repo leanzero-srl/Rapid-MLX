@@ -310,6 +310,9 @@ _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
 # re-plan defers, refuses, hands over or evicts something, so a converging
 # plan needs at most one per row and entry).
 _PLAN_ATTEMPTS = 64
+# The memory guard's line for requests that carry no SessionHint (raw
+# prompts): one conversation, as before per-session identity existed.
+_ANONYMOUS_LINE = ("anonymous",)
 
 
 def _exact_data_layers(caches: Any) -> list[Any]:
@@ -6557,6 +6560,113 @@ class Scheduler:
             return False
         return tuple(tokens[:n]) == key
 
+    @staticmethod
+    def _memguard_seq_prefix(a: Any, b: Any) -> bool:
+        """``a`` is a prefix of ``b`` (tuples or lists, cheap checks first)."""
+        n = len(a)
+        if n > len(b):
+            return False
+        if n == 0:
+            return True
+        if a[n - 1] != b[n - 1] or a[0] != b[0]:
+            return False
+        return tuple(a) == tuple(b[:n])
+
+    @property
+    def _memguard_entry_meta(self) -> dict[tuple, tuple[Any, Any]]:
+        """Prefix-entry key -> ``(line, frame)`` of the request that stored
+        it (see ``_memguard_line``). Unknown keys are anonymous."""
+        meta = self.__dict__.get("_memguard_entry_meta_store")
+        if meta is None:
+            meta = self.__dict__["_memguard_entry_meta_store"] = {}
+        return meta
+
+    def _memguard_line(self, request: Any) -> tuple[Any, Any]:
+        """``(line, frame)``: the conversation a request continues, from its
+        ``SessionHint`` (set by the chat route from the model's own chat
+        template and the client's session header). Session id present: the
+        line is the session, the frame is the rendered system/tools frame
+        (its length and a hash of its tokens) -- a helper call of the same
+        session (title, summary) renders another frame. No id: the line is
+        the frame plus the first message (goose swarm workers carry their
+        task in it). No hint at all (raw prompts): one anonymous line --
+        never a fixed token count."""
+        cached = getattr(request, "_memguard_line_key", None)
+        if cached is not None:
+            return cached
+        hint = getattr(request, "session_hint", None)
+        prompt = getattr(request, "prompt_token_ids", None) or ()
+        line: tuple[Any, Any] = (_ANONYMOUS_LINE, (0, 0))
+        if hint is not None:
+            sid = getattr(hint, "session_id", None)
+            frame = min(int(getattr(hint, "frame", 0) or 0), len(prompt))
+            first_end = min(int(getattr(hint, "first_end", 0) or 0), len(prompt))
+            if sid:
+                signature = (frame, hash(tuple(prompt[:frame])))
+                line = (("session", sid), signature)
+            elif first_end > 0:
+                signature = (first_end, hash(tuple(prompt[:first_end])))
+                line = (("frame", *signature), signature)
+        try:
+            request._memguard_line_key = line
+        except AttributeError:
+            pass
+        return line
+
+    def _memguard_tag(self, request: Any, tokens: Any) -> None:
+        """Record which line an entry about to be stored belongs to (before
+        the store: the cache's own count bound ranks it during the store)."""
+        if getattr(self, "_memory_guard", None) is None or request is None:
+            return
+        meta = self._memguard_entry_meta
+        tagged = tuple(tokens)
+        meta[tagged] = self._memguard_line(request)
+        self._memguard_line_activity(request)
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None and len(meta) > 2 * (len(mac._entries) + 1):  # noqa: SLF001
+            live = set(mac._entries)  # noqa: SLF001
+            for key in [k for k in meta if k not in live and k != tagged]:
+                meta.pop(key, None)
+
+    def _memguard_line_activity(self, request: Any) -> None:
+        """A line's first and latest activity (admission, store), in one
+        monotonic sequence: what ``_memguard_outlived_lines`` reads."""
+        line = self._memguard_line(request)[0]
+        seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
+        self._memguard_seq = seq
+        lines = self.__dict__.setdefault("_memguard_lines", {})
+        if line in lines:
+            lines[line][1] = seq
+        else:
+            lines[line] = [seq, seq]
+
+    def _memguard_outlived_lines(self) -> set[Any]:
+        """Lines an OLDER line outlived: it started before this one and ran
+        again after this one's latest activity. goose's shape: the main
+        session waits while a subagent (its own session) runs, then the main
+        session's next turn -- the subagent is finished; likewise a helper
+        call the main turn followed. A line that runs again stops being
+        outlived. Lines with no entry and no request are forgotten."""
+        lines = self.__dict__.get("_memguard_lines")
+        if not lines:
+            return set()
+        meta = self._memguard_entry_meta
+        mac = getattr(self, "memory_aware_cache", None)
+        present = {meta.get(k, (_ANONYMOUS_LINE, None))[0] for k in mac._entries} if mac is not None else set()  # noqa: SLF001
+        for r in list(getattr(self, "running", {}).values()) + list(
+            getattr(self, "waiting", ())
+        ):
+            present.add(self._memguard_line(r)[0])
+        for line in [k for k in lines if k not in present]:
+            lines.pop(line, None)
+        outlived: set[Any] = set()
+        latest_older = 0
+        for line, (first, last) in sorted(lines.items(), key=lambda kv: kv[1][0]):
+            if latest_older > last:
+                outlived.add(line)
+            latest_older = max(latest_older, last)
+        return outlived
+
     def _memguard_entry_level(
         self, key: tuple, live: list[tuple[Any, int]], waiting: list[Any]
     ) -> int:
@@ -6581,6 +6691,7 @@ class Scheduler:
         self,
         storing: tuple[Any, int] | None = None,
         finished: str | None = None,
+        storing_line: tuple[Any, Any] | None = None,
     ) -> list[tuple[tuple, int, int]]:
         """``(key, level, bytes)`` of every prefix entry in EVICTION order:
         lowest level first, then the cheapest to re-prefill (fewest tokens --
@@ -6625,48 +6736,54 @@ class Scheduler:
                 only_leaves and getattr(entries[key], "message_boundary", False)
             ):
                 heads.add(key)
-        # Every LOGICAL SESSION keeps its newest head until the floor; a head
-        # is abandoned only when something newer of the same session --
-        # same system-prompt prefix (at least one KV block: KVCache.step
-        # tokens) -- diverges from it: a running / queued request or a newer
-        # head. That is goose compaction (the pre-compaction head is never
-        # continued). goose subagents run their own system prompt, so the
-        # main session's head stays protected while one runs alone (review 4:
-        # with "nothing may run" as the test the main session missed 14 of
-        # 15 turns behind a 60k subagent). Abandoned heads go before any
-        # chunk reduction, cheapest to re-prefill first (review 3: a dead
-        # 32k head made a new session's chunk 2048 -> 1784).
-        block = kv_growth_step()
-
-        def same_session(a: Any, b: Any) -> bool:
-            # Keys are tuples, live prompts lists: compare as tuples.
-            return (
-                len(a) >= block
-                and len(b) >= block
-                and tuple(a[:block]) == tuple(b[:block])
-            )
-
-        newest: list[Any] = [
-            t for t, _f in live if storing is None or t is not storing[0]
-        ] + list(waiting)
+        # Every conversation LINE keeps its newest heads until the floor (see
+        # ``_memguard_line``: the client's session id, else the rendered
+        # system/tools frame + first message, measured with the model's own
+        # template -- review 5: tools-first templates (Qwen3.5, Qwen3.8)
+        # put 500+ identical tokens BEFORE goose's system prompt, so a fixed
+        # first block merged the main session with its subagents). A head
+        # is abandoned only when something NEWER of the same line that
+        # shares its frame (a running / queued request, a newer head)
+        # neither continues it nor is continued by it: goose compaction.
+        # A helper call of the session (a title, a summary) has its own
+        # frame and abandons nothing. A line another, OLDER line outlived
+        # (the older one ran again after this one's last request: a
+        # finished subagent, a helper call the main turn followed) is
+        # abandoned as a whole. Abandoned heads go before any chunk
+        # reduction, cheapest to re-prefill first (review 3: a dead 32k head
+        # made a new session's chunk 2048 -> 1784).
+        meta = self._memguard_entry_meta
+        reps: list[tuple[Any, Any, Any]] = []
         if storing is not None:
-            newest.insert(0, storing[0])
+            reps.append((*(storing_line or (_ANONYMOUS_LINE, (0, 0))), storing[0]))
+        for r in list(getattr(self, "running", {}).values()):
+            if (finished is None or r.request_id != finished) and (
+                storing is None or r.prompt_token_ids is not storing[0]
+            ):
+                reps.append((*self._memguard_line(r), r.prompt_token_ids))
+        for r in list(getattr(self, "waiting", ())):
+            reps.append((*self._memguard_line(r), r.prompt_token_ids))
+        outlived = self._memguard_outlived_lines()
         protected: set[tuple] = set()
         for key in reversed(list(entries)):  # MRU -> LRU
             if key not in heads:
                 continue
-            rep = next((r for r in newest if same_session(key, r)), None)
-            if rep is None:
-                newest.append(key)  # the newest head of its session
+            line, frame = meta.get(key, (_ANONYMOUS_LINE, (0, 0)))
+            dead = line in outlived or any(
+                rep_line == line
+                and rep_frame == frame
+                and not self._memguard_seq_prefix(key, tokens)
+                and not self._memguard_seq_prefix(tokens, key)
+                for rep_line, rep_frame, tokens in reps
+            )
+            if not dead:
                 protected.add(key)
-            elif tuple(rep[: len(key)]) == key and (
-                not isinstance(rep, tuple) or rep in protected
-            ):
-                protected.add(key)  # on the newest path (its boundary)
+            reps.append((line, frame, key))  # a newer head for older ones
+        protected |= self._memguard_kept_turn_boundaries(outlived)
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
-            if key in heads and (
+            if (key in heads or key in protected) and (
                 level == EVICT_UNUSED
                 or (
                     finished is not None

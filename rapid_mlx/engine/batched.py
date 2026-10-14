@@ -2863,6 +2863,7 @@ class BatchedEngine(BaseEngine):
                 if processor is not None
             ]
             prefix_boundary = kwargs.pop("prefix_boundary", 0)
+            kwargs.pop("session_hint", None)  # the text lane's memory guard only
             try:
                 output = await mllm_scheduler.generate(
                     prompt=prompt,
@@ -2927,6 +2928,7 @@ class BatchedEngine(BaseEngine):
         # snapshot at the message boundary (#427). Set by ``chat()`` after
         # message-aware boundary computation; absent for raw-prompt callers.
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        session_hint = kwargs.pop("session_hint", None)
         # PFlash routing hints (#287). chat()/stream_chat() set these
         # from tools / response_format; raw-prompt callers default to
         # the safe (un-protected) values.
@@ -2967,6 +2969,7 @@ class BatchedEngine(BaseEngine):
                 prompt=prompt,
                 sampling_params=sampling_params,
                 prefix_boundary=prefix_boundary,
+                session_hint=session_hint,
                 has_tools=has_tools,
                 requires_prompt_integrity=requires_prompt_integrity,
                 grammar_logits_processor=grammar_logits_processor,
@@ -3117,6 +3120,7 @@ class BatchedEngine(BaseEngine):
                 if processor is not None
             ]
             prefix_boundary = kwargs.pop("prefix_boundary", 0)
+            kwargs.pop("session_hint", None)  # the text lane's memory guard only
             try:
                 request_id = await mllm_scheduler.add_request_async(
                     request_id=request_id,
@@ -3199,6 +3203,7 @@ class BatchedEngine(BaseEngine):
             )
 
             prefix_boundary = kwargs.pop("prefix_boundary", 0)
+            session_hint = kwargs.pop("session_hint", None)
             # PFlash routing hints (#287) — parity with generate().
             has_tools = bool(kwargs.pop("has_tools", False))
             requires_prompt_integrity = bool(
@@ -3215,6 +3220,7 @@ class BatchedEngine(BaseEngine):
                 prompt=prompt,
                 sampling_params=sampling_params,
                 prefix_boundary=prefix_boundary,
+                session_hint=session_hint,
                 has_tools=has_tools,
                 requires_prompt_integrity=requires_prompt_integrity,
                 grammar_logits_processor=grammar_logits_processor,
@@ -3469,6 +3475,13 @@ class BatchedEngine(BaseEngine):
                 )
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary
+        kwargs["session_hint"] = self._session_hint(
+            messages,
+            tools,
+            kwargs.pop("session_id", None),
+            enable_thinking=enable_thinking,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         if tools:
             kwargs["has_tools"] = True
@@ -3532,6 +3545,130 @@ class BatchedEngine(BaseEngine):
             )
         except (TypeError, ValueError):
             return False
+
+    # The client's name for a conversation (goose: every chat request in a
+    # session; a subagent has its own; a compaction keeps it).
+    SESSION_ID_HEADER = "agent-session-id"
+    ACCEPTS_SESSION_ID = True
+
+    def _session_hint(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        session_id: str | None,
+        *,
+        enable_thinking: bool | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> Any:
+        """The memory guard's ``SessionHint`` for one chat request: the
+        client's session id plus the rendered frame, measured with the
+        model's own chat template -- never a fixed token count. ``frame``
+        ends where the first non-system message's CONTENT starts (system
+        prompt, tool JSON, whatever the template puts first: Qwen3.5 /
+        Qwen3.8 render the tools BEFORE the system prompt); ``first_end``
+        where that message ends. Each is the common prefix of two renders
+        that differ only in that content. Memoized per (system, first
+        message, tools): one pair of renders per conversation."""
+        from ..request import SessionHint
+
+        sid = session_id if isinstance(session_id, str) and session_id else None
+        turn_start = bool(messages) and isinstance(messages[-1], dict) and (
+            messages[-1].get("role") == "user"
+        )
+        try:
+            frame, first_end = self._session_frame(
+                messages,
+                tools,
+                enable_thinking=enable_thinking,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — a hint, never a failure
+            logger.debug("[memory_guard] session frame unavailable: %s", exc)
+            frame, first_end = 0, 0
+        return SessionHint(
+            session_id=sid, frame=frame, first_end=first_end, turn_start=turn_start
+        )
+
+    def _session_frame(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        *,
+        enable_thinking: bool | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> tuple[int, int]:
+        import hashlib
+
+        first = next(
+            (
+                i
+                for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") not in ("system", "developer")
+            ),
+            None,
+        )
+        if first is None:
+            return 0, 0
+        head = list(messages[:first])
+        message = messages[first]
+        digest = hashlib.sha256(
+            json.dumps(
+                [head, message, tools, enable_thinking, chat_template_kwargs],
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
+        memo = getattr(self, "_session_frame_memo", None)
+        if memo is None:
+            from collections import OrderedDict
+
+            memo = self._session_frame_memo = OrderedDict()
+        if digest in memo:
+            memo.move_to_end(digest)
+            return memo[digest]
+        template_tools = convert_tools_for_template(tools) if tools else None
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "tokenizer"):
+            tokenizer = tokenizer.tokenizer
+
+        def tokens(msgs: list[dict[str, Any]]) -> list[int]:
+            rendered = self._apply_chat_template(
+                msgs,
+                template_tools,
+                add_generation_prompt=False,
+                enable_thinking=enable_thinking,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            if isinstance(rendered, list):
+                return list(rendered)
+            return list(tokenizer.encode(rendered))
+
+        def common(a: list[int], b: list[int]) -> int:
+            n = 0
+            for x, y in zip(a, b, strict=False):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        role = message.get("role") or "user"
+        probes = ("zq7 session frame a", "qx3 session frame b")
+        frame = common(
+            *(tokens([*head, {"role": role, "content": probe}]) for probe in probes)
+        )
+        after = "assistant" if role == "user" else "user"
+        first_end = common(
+            *(
+                tokens([*head, message, {"role": after, "content": probe}])
+                for probe in probes
+            )
+        )
+        result = (frame, max(frame, first_end))
+        memo[digest] = result
+        # A memo, not a budget: one entry per live conversation is plenty.
+        while len(memo) > 256:
+            memo.popitem(last=False)
+        return result
 
     def _compute_prefix_boundary(
         self,
@@ -4305,6 +4442,13 @@ class BatchedEngine(BaseEngine):
                 )
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary
+        kwargs["session_hint"] = self._session_hint(
+            messages,
+            tools,
+            kwargs.pop("session_id", None),
+            enable_thinking=enable_thinking,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         if tools:
             kwargs["has_tools"] = True
