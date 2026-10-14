@@ -22,14 +22,58 @@ What this module holds (pure Python, no MLX import, unit-testable):
   scheduler resets MLX's peak counter before each prefill chunk and feeds the
   measured ``peak - active_before`` back here. It starts from a conservative
   analytic prior derived from the model config and never decays.
-* :class:`MemoryGuard` -- the decision procedure run before EVERY prefill
-  chunk (clear the allocator cache, evict prefix entries oldest-first, halve
-  the chunk to a floor, refuse), the honest max context, the admission
-  check, the derived prefix-cache budget and allocator cache limit, and the
-  counters ``/v1/status`` reports.
+* :class:`MemoryGuard` -- the decision procedure run before EVERY dispatch
+  (feasibility first; clear the allocator cache, evict prefix entries in the
+  one order, take the LARGEST chunk that fits, defer the latest arrival or
+  refuse), the honest max context, the admission check, the derived
+  prefix-cache budget and allocator cache limit, and the counters
+  ``/v1/status`` reports.
 
 Every number is derived from the device (the scheduler's Metal cap), the
-model config, or measurement. The ratios below carry their receipts.
+model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
+"you should not build hard coded solutions"):
+
+  constant                      value  class
+  ----------------------------  -----  ----------------------------------------
+  MARGIN_CEILING_RATIO          0.02   ratio of the device ceiling (cap gap)
+  MARGIN_TRANSIENT_RATIO        0.10   measured (2x the 5% run-to-run spread)
+  CACHE_LIMIT_FLOOR_RATIO       0.02   ratio of the device ceiling
+  ALLOCATOR_CACHE_SHARE         0.25   ratio of the device ceiling (lz boot)
+  DECODE_GROWTH_LAYERS          2.0    measured (2.12 layers, real allocator)
+  WINDOW_BAND_RATIO             0.03   measured (Q4 window jitter)
+  MAX_STEP_FACTOR               1.25   measured motive (Gabee 103->360 jump)
+  MAX_PRIOR_MULTIPLE            4.0    ratio of the analytic prior
+  PRIOR_SCORE_COPIES            4      measured (M4 Max SDPA peak ladder)
+  PRIOR_HIDDEN_COPIES           8      ratio of model dims; prior only, the
+  PRIOR_MLP_COPIES              3        linear term is measured after it
+  REAPPLY_RATIO                 0.05   algorithm (setter hysteresis)
+  SLOPE_MIN_SPAN_CHUNKS / _FRACTION, SLOPE_MIN_PAIRS, OBS_PER_GROUP,
+  ROBUST_MIN_OBS                4 / 0.25, 3, 16, 4   algorithm (statistics)
+  BACKSTOP_CONTEXT_FRACTION / _DECAY / _DROP_FRACTION
+                                0.75 / 0.97 / 0.01   algorithm (decay)
+  EVICT_UNUSED..EVICT_NEEDED    1..4   enumeration (eviction order)
+  floor chunk                   KVCache.step (mlx-lm, read at runtime;
+                                256) unless the operator sets one
+  normal (largest) chunk        the engine's prefill_step_size; the guard
+                                derives the largest that fits, never more
+  idle line / Metal trigger     1 - MARGIN_CEILING_RATIO under the guard
+  KV growth step                KVCache.step (mlx-lm, read at runtime)
+  per-context term cap          the model's whole KV per token (was a typed
+                                "16 layers" -- removed)
+  window version bucket         MARGIN_CEILING_RATIO x ceiling (was a typed
+                                16 MiB -- removed)
+  auto-cap headroom floor       1% of the device budget (memory_budget; was
+                                a typed 512 MiB -- removed)
+  prefix budget                 the guard's idle room unless the operator
+                                chose one (the 20%-of-RAM heuristic and its
+                                100 MiB floor only seed the cache)
+
+Absolutes that remain, and why: the unknown-shape prior (64 query heads,
+8192 hidden) when the model config cannot be read -- it governs only the
+first chunks, then measurement replaces it; and the GUARD-OFF policies
+(adaptive-prefill ladder 0.70/0.80/0.88 -> 1024/512/256, its 32,768-token
+trigger, the 0.9 pressure fraction, memory_budget's 2/32 GiB cache clamps),
+which the guard bypasses -- they exist only for RAPID_MLX_MEMORY_GUARD=0.
 """
 
 from __future__ import annotations
@@ -81,6 +125,10 @@ MARGIN_TRANSIENT_RATIO = 0.10
 # ceiling, so decode's per-step buffer churn is still served from the cache
 # (a B=1 decode step's transient is tens of MB).
 CACHE_LIMIT_FLOOR_RATIO = 0.02
+# ratio: the allocator cache's ceiling share under the guard -- lz's boot
+# share (memory_budget.compute_metal_cache_limit: 25% of the soft limit),
+# without its 2 GiB floor / 32 GiB cap (absolutes).
+ALLOCATOR_CACHE_SHARE = 0.25
 # Re-apply the allocator cache limit / prefix budget only when it moves by
 # more than this fraction (avoids a setter call per chunk while a ladder of
 # observations nudges the model up).
@@ -101,10 +149,6 @@ SLOPE_MIN_PAIRS = 3
 # most this factor up or down (Gabee Q8 2026-10-14: one first-chunk step took
 # the attention coefficient 103 -> 360 and the window 207,900 -> 102,913).
 MAX_STEP_FACTOR = 1.25
-# ratio: the learned per-context-token term is capped at this many times one
-# full-attention layer's KV growth copy -- 16 = every layer of Qwen3.5-27B,
-# i.e. a whole copy of the KV.
-MAX_CONTEXT_TERM_LAYERS = 16.0
 # ratio: the advertised window (max_model_len) ignores moves within this band
 # and publishes the native window when within it of the native window (Q4
 # jittered 261,769-262,144 with a constant coefficient); a move beyond it is
@@ -187,6 +231,10 @@ class PeakPrior:
     # (mlx-lm KVCache grows by concatenation, so old + new buffer of the
     # layer being extended are live for a moment). Analytic, never learned.
     kv_copy_bytes_per_context: float
+    # bytes per token of the whole KV/state (every layer): the learned
+    # per-context term is capped at a whole copy of the KV. 0: unknown (the
+    # cap is then MAX_PRIOR_MULTIPLE x one layer's copy).
+    kv_bytes_per_token: float = 0.0
 
     @classmethod
     def from_dims(
@@ -210,6 +258,7 @@ class PeakPrior:
             attention_bytes_per_unit=float(attention),
             token_bytes=float(token),
             kv_copy_bytes_per_context=float(max(0, int(layer_kv_bytes_per_token))),
+            kv_bytes_per_token=float(max(0, int(kv_bytes_per_token))),
         )
 
 
@@ -325,10 +374,11 @@ class PeakModel:
         context token) across chunk sizes: ``slope(u) = a*u + b``, least
         squares over the calibrated groups when two or more sizes exist,
         else ``b`` = the analytic layer copy. Clamped to ``[0, 4x prior]`` for
-        ``a`` and ``[analytic, 16 layers]`` for ``b``."""
+        ``a`` and ``[analytic, a whole copy of the KV]`` for ``b``."""
         g = self.prior.kv_copy_bytes_per_context
         a_cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
-        b_cap = max(g, MAX_CONTEXT_TERM_LAYERS * g)
+        whole = self.prior.kv_bytes_per_token or MAX_PRIOR_MULTIPLE * g
+        b_cap = max(g, whole)
         groups = self._group_slopes()
         if not groups:
             return None

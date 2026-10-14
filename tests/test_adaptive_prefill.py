@@ -11,8 +11,14 @@ from types import SimpleNamespace
 from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
 
-def _scheduler(*, prompt_tokens=100_000, active=0, rss=0, cap=100_000, cache=0):
+def _scheduler(
+    *, prompt_tokens=100_000, active=0, rss=0, cap=100_000, cache=0, guard=False
+):
+    """The ratio ladder is the GUARD-OFF policy (RAPID_MLX_MEMORY_GUARD=0);
+    with the memory guard on it defers to the guard's plan."""
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._memory_guard_disabled = not guard
+    scheduler._memory_guard = object() if guard else None
     scheduler.config = SchedulerConfig(
         prefill_step_size=2048,
         adaptive_prefill=True,
@@ -131,3 +137,14 @@ def test_zero_minimum_threshold_restores_on_idle():
     scheduler.batch_generator._currently_processing = []
     scheduler.batch_generator._prompt_batch.tokens = []
     assert scheduler._apply_adaptive_prefill_size() == 2048
+
+
+def test_with_the_memory_guard_the_ladder_never_cuts_the_chunk():
+    # The guard derives the chunk from the measured headroom (the largest
+    # that fits); the fixed 0.70/0.80/0.88 bands would cut it on any Mac
+    # whose weights + session cross 70% of the cap, however much headroom
+    # the step has. RED on 6beea5c18 (1024 / 512 / 256 here).
+    for active in (70_000, 80_000, 88_000):
+        scheduler = _scheduler(active=active, guard=True)
+        assert scheduler._select_adaptive_prefill_size() == 2048
+        assert scheduler._apply_adaptive_prefill_size() == 2048

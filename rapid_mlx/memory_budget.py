@@ -49,10 +49,12 @@ MAX_UTILIZATION = 1.0 - 1e-9
 
 # Runtime headroom charged on top of the measured weight footprint in auto
 # mode: KV cache for in-flight requests, activation workspace, Metal heap
-# fragmentation. Fractional so big models reserve proportionally more, with an
-# absolute floor so tiny models still get a workable slice.
+# fragmentation. Fractional so big models reserve proportionally more, with a
+# floor so tiny models still get a workable slice.
 _AUTO_HEADROOM_FRACTION = 0.08
-_AUTO_HEADROOM_MIN_BYTES = 512 * 1024**2
+# ratio: of the device budget -- 512 MiB (the old absolute floor) on a 64 GB
+# Mac's 51.5 GB working set; it binds only where 8% of the weights is less.
+_AUTO_HEADROOM_MIN_FRACTION = 0.01
 
 
 # ── Process-wide utilization ratchet (codex round 2 BLOCKING #2) ──
@@ -174,7 +176,8 @@ def plan_metal_limit(
         mode = "auto"
     else:
         headroom = max(
-            int(weights_bytes * _AUTO_HEADROOM_FRACTION), _AUTO_HEADROOM_MIN_BYTES
+            int(weights_bytes * _AUTO_HEADROOM_FRACTION),
+            int(device_budget_bytes * _AUTO_HEADROOM_MIN_FRACTION),
         )
         needed = (weights_bytes + headroom) / device_budget_bytes
         resolved = min(max(needed, AUTO_UTILIZATION_FLOOR), AUTO_UTILIZATION_CEILING)
