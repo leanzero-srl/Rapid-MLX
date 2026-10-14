@@ -51,6 +51,23 @@ _NETWORK_OPT_IN_MARKER = "requires_network"
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_system_memory_pressure(monkeypatch):
+    """The memory guard reads the HOST's kernel memory-pressure level
+    (``memory_budget.system_memory_pressure``). On a CI box that is running
+    MLX models it can be WARN or CRITICAL at any moment, and the guard then
+    gives the prefix cache back -- every test would be at the mercy of the
+    host. Pinned to NORMAL here; a test that exercises pressure patches it
+    in its own body (that patch runs after this fixture)."""
+    try:
+        import rapid_mlx.memory_budget as memory_budget
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: 1)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_model_performance_registry():
     """Keep process-owned per-model ledgers isolated between unit tests."""
     from rapid_mlx.runtime.model_performance import (
