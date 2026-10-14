@@ -867,7 +867,9 @@ class EngineCore:
                         step_outputs
                     ):
                         try:
-                            active_mem = mx.get_active_memory()
+                            # Memory guard E2: the allocator cache is GPU
+                            # memory too; count it beside active.
+                            active_mem = mx.get_active_memory() + mx.get_cache_memory()
                             if active_mem > _memory_pressure_threshold:
                                 mx.clear_cache()
                                 logger.warning(

@@ -320,10 +320,15 @@ def test_parks_nest_and_every_answer_is_its_solo_answer(hybrid):
     assert first["short"] < first["long"] < first["mid"], first
 
 
-def test_a_park_is_refused_unless_the_measured_memory_holds_both(hybrid):
+def test_a_park_is_refused_unless_the_measured_memory_holds_both(hybrid, monkeypatch):
     """Q-110: nothing opens unless the memory holds it. The need is priced
     from the live row's own cache bytes (parked copy + the jumper at its
     horizon); a cap it does not fit under — or no cap at all — keeps FIFO."""
+    # The world here is "Metal is one byte short of its cap": the step-peak
+    # memory guard would (correctly) refuse the prefill itself before SRPF is
+    # ever consulted. This test pins SRPF's own refusal reasons, so it runs
+    # with the guard's A/B switch off.
+    monkeypatch.setenv("RAPID_MLX_MEMORY_GUARD", "0")
     for cap, active, reason in (
         (10**12, 10**12 - 1, "kv_budget"),
         (0, 0, "no_memory_cap"),

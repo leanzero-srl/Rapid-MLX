@@ -449,6 +449,9 @@ async def status():
             or stats.get("prefix_cache")
             or {"enabled": False}
         ),
+        # Memory guard (LeanZero fork): ceiling, margin, peak-model
+        # coefficients, action counts, refusals and backstop firings.
+        "memory_guard": stats.get("memory_guard", {"enabled": False}),
         "requests": stats.get("requests", []),
     }
 
