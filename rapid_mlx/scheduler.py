@@ -7756,6 +7756,19 @@ class Scheduler:
         field absent rather than advertising a fabricated cap.
         """
         try:
+            # Memory guard (LeanZero fork): the advertised window is the
+            # STABLE idle figure -- the context ONE request can hold when
+            # nothing else runs (idle base + its KV/state + the floor chunk's
+            # step peak + margin under the ceiling). It does not move with
+            # concurrent requests, prefix-cache contents or the allocator
+            # cache: goose compacts at 0.8x it and caches it per model, and
+            # load-dependent pressure is handled by DEFERRING a request, never
+            # by shrinking this number. By construction it is never above the
+            # KV-only figure priced from the same idle base.
+            honest = self.memory_guard_max_context(native_context)
+            if honest is not None:
+                return honest if honest > 0 else None
+
             _footprint = self._kv_footprint_fn()
             if _footprint is None:
                 return None
@@ -7809,13 +7822,6 @@ class Scheduler:
                     else:
                         hi = mid - 1
                 kv_only = lo
-            # Memory guard (LeanZero fork): the KV-only figure ignores the
-            # prefill's step peak. The honest window is the largest context
-            # whose live KV/state + floor-chunk step peak + margin fits beside
-            # the weights -- never larger than the KV-only figure.
-            honest = self.memory_guard_max_context(upper)
-            if honest is not None:
-                kv_only = min(kv_only, honest)
             return kv_only if kv_only > 0 else None
         except Exception:  # noqa: BLE001
             # Never let a memory-probe failure break the models endpoint.
@@ -12340,10 +12346,16 @@ class Scheduler:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
         guard = getattr(self, "_memory_guard", None)
         if guard is not None:
-            stats["memory_guard"] = guard.snapshot()
-            stats["memory_guard"]["idle_base_mb"] = round(
+            snap = guard.snapshot()
+            snap["idle_base_mb"] = round(
                 getattr(self, "_memguard_idle_base_bytes", 0) / 2**20, 1
             )
+            snap["ceiling_bytes"] = int(self._memguard_ceiling())
+            # The stable idle window /v1/models advertises as max_model_len.
+            snap["max_context_idle"] = self.memory_guard_max_context(
+                self._memguard_native_context()
+            )
+            stats["memory_guard"] = snap
         else:
             stats["memory_guard"] = {
                 "enabled": guard_enabled(),

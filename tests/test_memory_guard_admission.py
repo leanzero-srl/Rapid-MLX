@@ -200,8 +200,7 @@ QWEN_27B_TEXT = {
     "hidden_size": 5120,
     "intermediate_size": 17408,
     "layer_types": [
-        "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
-        for i in range(64)
+        "full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(64)
     ],
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,

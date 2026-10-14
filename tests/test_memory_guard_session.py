@@ -331,3 +331,36 @@ def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
     assert guard.model.attention_bytes_per_unit == slope_before
     assert scheduler.memory_guard_max_context(16384) >= 0.9 * window_before
 
+
+def test_max_model_len_is_the_same_idle_figure_under_load(llama, monkeypatch):
+    """/v1/models max_model_len is the STABLE idle window: identical with 0
+    and with 3 concurrent running requests (goose compacts at 0.8x it and
+    caches it per model; load is handled by deferral, never by shrinking it).
+    The peak model is held fixed so only load differs. RED on the branch
+    head: the figure was min(KV-only priced from LIVE residency, guard)."""
+    # Tight enough that the load's KV is a large share of the device: the
+    # old KV-only figure, priced from LIVE residency, drops under it.
+    device = _Device(physical=int(8.15 * MB))
+    scheduler = _scheduler(llama, max_num_seqs=4)
+    device.install(monkeypatch, scheduler)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)  # /v1/models path
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": int(8.8 * MB)}
+    )
+    monkeypatch.setattr(mx, "get_active_memory", device.active)
+    # Warm up once so the idle base is measured, then freeze the model.
+    _drive(scheduler, [_request("warm", _new_tokens(9, 200))])
+    guard = scheduler._memguard()
+    monkeypatch.setattr(guard, "observe", lambda *a, **k: False)
+    idle = scheduler.projected_memory_max_context(16384)
+    assert idle and 0 < idle < 16384  # memory-bound, not the native window
+    assert scheduler.get_stats()["memory_guard"]["max_context_idle"] == idle
+
+    for i in range(3):
+        scheduler.add_request(_request(f"c{i}", _new_tokens(10 + i, 2000), 200))
+    for _ in range(45):  # all three prefilled, decoding
+        scheduler.step()
+    assert len(scheduler.running) == 3
+    assert device.active() > BASE + 3 * MB  # the load is real
+    assert scheduler.projected_memory_max_context(16384) == idle
+    assert scheduler.get_stats()["memory_guard"]["max_context_idle"] == idle
