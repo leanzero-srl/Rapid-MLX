@@ -6625,25 +6625,39 @@ class Scheduler:
                 only_leaves and getattr(entries[key], "message_boundary", False)
             ):
                 heads.add(key)
-        # Only the MOST RECENTLY USED session keeps its head until the floor
-        # (a running or queued request that extends a head already makes it
-        # NEEDED above). Any other head -- an abandoned session, a finished
-        # side request, the pre-compaction head of a session goose compacted
-        # -- goes before the chunk is reduced, cheapest to re-prefill first.
-        # Review 3 (real Metal, half Gabee scale): a dead 32k head stayed
-        # protected as the "costliest" while a NEW session's chunk was cut
-        # 2048 -> 1968 -> 1784 at 27k; without it the chunk stays 2048.
-        # While a request runs or waits, IT is the most recent session (its
-        # own heads are NEEDED through ``live`` / ``waiting`` above): no other
-        # head is protected. A head the new session handed over must not
-        # leave an abandoned one as "most recent" (the review-3 case).
-        recent = None
-        if not waiting and not [
+        # Every LOGICAL SESSION keeps its newest head until the floor; a head
+        # is abandoned only when something newer of the same session --
+        # same system-prompt prefix (at least one KV block: KVCache.step
+        # tokens) -- diverges from it: a running / queued request or a newer
+        # head. That is goose compaction (the pre-compaction head is never
+        # continued). goose subagents run their own system prompt, so the
+        # main session's head stays protected while one runs alone (review 4:
+        # with "nothing may run" as the test the main session missed 14 of
+        # 15 turns behind a 60k subagent). Abandoned heads go before any
+        # chunk reduction, cheapest to re-prefill first (review 3: a dead
+        # 32k head made a new session's chunk 2048 -> 1784).
+        block = kv_growth_step()
+
+        def same_session(a: Any, b: Any) -> bool:
+            return len(a) >= block and len(b) >= block and a[:block] == b[:block]
+
+        newest: list[Any] = [
             t for t, _f in live if storing is None or t is not storing[0]
-        ]:
-            for key in entries:  # LRU -> MRU
-                if key in heads:
-                    recent = key
+        ] + list(waiting)
+        if storing is not None:
+            newest.insert(0, storing[0])
+        protected: set[tuple] = set()
+        for key in reversed(list(entries)):  # MRU -> LRU
+            if key not in heads:
+                continue
+            rep = next((r for r in newest if same_session(key, r)), None)
+            if rep is None:
+                newest.append(key)  # the newest head of its session
+                protected.add(key)
+            elif tuple(rep[: len(key)]) == key and (
+                rep in protected or not isinstance(rep, tuple)
+            ):
+                protected.add(key)  # on the newest path (its boundary)
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
@@ -6655,10 +6669,7 @@ class Scheduler:
                     and getattr(entry, "message_boundary", False)
                 )
             ):
-                same_session = recent is not None and (
-                    recent[: len(key)] == key or key[: len(recent)] == recent
-                )
-                level = EVICT_NEEDED if same_session else EVICT_HEAD
+                level = EVICT_NEEDED if key in protected else EVICT_HEAD
             cost = int(getattr(entry, "memory_bytes", 0) or 0)
             ranked.append((level, len(key), position, key, cost))
         ranked.sort(key=lambda item: item[:3])
