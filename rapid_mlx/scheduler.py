@@ -6677,10 +6677,13 @@ class Scheduler:
             nonlocal kv_fn
             if offset <= 0:
                 return 0
-            if _handed_over(caches):
-                return 0  # handed over: no copy at admission
             if kv_fn is None:
                 kv_fn = self._kv_footprint_fn() or (lambda _t: 0)
+            if _handed_over(caches):
+                # Handed over: the K/V layers are admitted as they are; the
+                # fixed per-sequence state (hybrid recurrent layers, which
+                # admission still deep-copies) is all that is copied.
+                return int(kv_fn(0))
             return int(kv_fn(offset))
 
         def _row(
