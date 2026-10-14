@@ -43,7 +43,7 @@ from rapid_mlx.memory_guard import (  # noqa: E402
     MemoryGuard,
     PeakPrior,
 )
-from rapid_mlx.request import Request, SamplingParams  # noqa: E402
+from rapid_mlx.request import Request, SamplingParams, SessionHint  # noqa: E402
 from rapid_mlx.scheduler import Scheduler, SchedulerConfig  # noqa: E402
 
 _GEN = importlib.import_module("mlx_lm.generate")
@@ -261,12 +261,31 @@ def _scheduler(model, **config) -> Scheduler:
     )
 
 
-def _request(rid: str, prompt: list[int], max_tokens: int = 4) -> Request:
-    return Request(
+def _request(
+    rid: str,
+    prompt: list[int],
+    max_tokens: int = 4,
+    session: str | None = None,
+    frame: int = 0,
+    first_end: int = 0,
+    turn_start: bool = False,
+) -> Request:
+    """``session``: the client's session id (goose's ``agent-session-id``
+    header, which the chat route turns into the request's SessionHint with
+    the frame measured from the chat template)."""
+    request = Request(
         request_id=rid,
         prompt=list(prompt),
         sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0),
     )
+    if session is not None or first_end:
+        request.session_hint = SessionHint(
+            session_id=session,
+            frame=frame,
+            first_end=first_end,
+            turn_start=turn_start,
+        )
+    return request
 
 
 def _drive(
@@ -631,8 +650,10 @@ def _session_with_side_requests(scheduler, turns: int, side_tokens: int):
     history = []
     windows = []
     for turn in range(turns):
-        main = _request(f"main-{turn}", prompt, 4)
-        side = _request(f"side-{turn}", _side_prompt(turn, side_tokens), 8)
+        main = _request(f"main-{turn}", prompt, 4, session="main")
+        side = _request(
+            f"side-{turn}", _side_prompt(turn, side_tokens), 8, session=f"side-{turn}"
+        )
         assert scheduler.device_memory_admission(len(prompt)) is None
         outputs = _drive(scheduler, [main], arrive={3: [side]}, admit_check=True)
         windows.append(scheduler.memory_guard_max_context(65536))
@@ -756,16 +777,29 @@ def _one_arm(
     last: dict[str, int] = {}
     for turn in range(turns):
         device.max_seen = 0
-        main = _request(f"main-{turn}", prompt, 4)
+        main = _request(f"main-{turn}", prompt, 4, session="main")
         arrive = (
-            {3: [_request(f"side-{turn}", _side_prompt(turn, side), 8)]} if side else {}
+            {
+                3: [
+                    _request(
+                        f"side-{turn}",
+                        _side_prompt(turn, side),
+                        8,
+                        session=f"side-{turn}",
+                    )
+                ]
+            }
+            if side
+            else {}
         )
         ooms = device.ooms
         if after:
             # goose's real pattern: the main turn ends in a tool call, its
             # subagent runs ALONE, then the main session's next turn.
             outputs = _drive(scheduler, [main])
-            sub = _request(f"sub-{turn}", _side_prompt(turn, side), 8)
+            sub = _request(
+                f"sub-{turn}", _side_prompt(turn, side), 8, session=f"sub-{turn}"
+            )
             sub_out = _drive(scheduler, [sub])[sub.request_id][-1]
             if sub_out.error:
                 outputs[main.request_id][-1].error = sub_out.error
@@ -890,8 +924,10 @@ def test_a_handed_over_admission_is_handed_over_once(llama, monkeypatch):
     prompt = _new_tokens(0, 600)
     history = []
     for turn in range(22):
-        side = _request(f"side-{turn}", _side_prompt(turn, 1600), 120)
-        main = _request(f"main-{turn}", prompt, 4)
+        side = _request(
+            f"side-{turn}", _side_prompt(turn, 1600), 120, session=f"side-{turn}"
+        )
+        main = _request(f"main-{turn}", prompt, 4, session="main")
         outputs = _drive(scheduler, [side], arrive={30: [main]})
         for rid in (main.request_id, side.request_id):
             assert not outputs[rid][-1].error, (rid, outputs[rid][-1].error)
@@ -914,16 +950,17 @@ def test_an_abandoned_session_head_goes_before_a_new_session_slows(llama, monkey
     head stayed protected as the "costliest" while a NEW session's chunk was
     cut 2048 -> 1968 -> 1784 at 27k (control without it: 2048). That is
     exactly goose compaction: the pre-compaction head is never continued.
-    A head is abandoned when something newer of the SAME session (same
-    system-prompt prefix) diverges from it -- here the new session after
-    compaction -- and goes before any chunk is reduced. RED on 4ac506f7d."""
+    A head is abandoned when something newer of the SAME session (goose's
+    session id, the same rendered frame) diverges from it -- here the
+    conversation after compaction -- and goes before any chunk is reduced.
+    RED on 4ac506f7d."""
     device = _Device(physical=GABEE_PHYSICAL, scratch_scale=600.0)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, scheduler)
     # The pre-compaction session: the SAME system prompt as the new one,
     # then a conversation the new session never continues.
     abandoned = _new_tokens(0, 320) + [3 + (i * 5) % 97 for i in range(5680)]
-    _drive(scheduler, [_request("abandoned", abandoned, 4)])
+    _drive(scheduler, [_request("abandoned", abandoned, 4, session="main", frame=320)])
     mac = scheduler.memory_aware_cache
     heads = [k for k in mac._entries if k[: len(abandoned)] == tuple(abandoned)]
     assert heads
@@ -946,7 +983,8 @@ def test_an_abandoned_session_head_goes_before_a_new_session_slows(llama, monkey
     scheduler.step = step
     prompt = _new_tokens(0, 600)
     for turn in range(10):
-        outs = _drive(scheduler, [_request(f"new-{turn}", prompt, 4)])[f"new-{turn}"]
+        new = _request(f"new-{turn}", prompt, 4, session="main", frame=320)
+        outs = _drive(scheduler, [new])[f"new-{turn}"]
         assert not outs[-1].error
         prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, 496)
     assert reduced_while_abandoned_kept == 0
@@ -1000,46 +1038,57 @@ def test_a_side_branch_does_not_supersede_the_main_line(
     device.install(monkeypatch, scheduler)
     prompt = _new_tokens(0, 600)
     for turn in range(4):
-        outs = _drive(scheduler, [_request(f"main-{turn}", prompt, 4)])[f"main-{turn}"]
+        main = _request(f"main-{turn}", prompt, 4, session="main")
+        outs = _drive(scheduler, [main])[f"main-{turn}"]
         line = prompt + _tokens(outs)
         if branch_first and turn == 2:
-            branch = _request("branch", line + _new_tokens(50, 120), 8)
+            branch = _request("branch", line + _new_tokens(50, 120), 8, session="main")
             assert not _drive(scheduler, [branch])["branch"][-1].error
         prompt = line + _new_tokens(turn + 1, 496)
         if turn >= 2:
-            nxt = _drive(scheduler, [_request(f"next-{turn}", prompt, 4)])
+            nxt = _drive(
+                scheduler, [_request(f"next-{turn}", prompt, 4, session="main")]
+            )
             cached = nxt[f"next-{turn}"][-1].cached_tokens
             assert cached >= len(line) - 8, (turn, len(line), cached)
             prompt = prompt + _tokens(nxt[f"next-{turn}"]) + _new_tokens(9, 64)
     assert scheduler._memguard().counts["superseded"] > 0
 
 
-def _two_sessions(llama, monkeypatch):
+def _three_sessions(llama, monkeypatch):
+    """Main ``a`` (its first turn), its subagent ``s`` (own session, runs
+    alone), main's next turn, then a second conversation ``b``."""
     device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, scheduler)
-    _drive(scheduler, [_request("a", _new_tokens(1, 900), 4)])
-    _drive(scheduler, [_request("b", _side_prompt(2, 900), 4)])
+    main = _new_tokens(1, 900)
+    outs = _drive(scheduler, [_request("a", main, 4, session="a")])["a"]
+    _drive(scheduler, [_request("s", _side_prompt(2, 900), 4, session="s")])
+    main = main + _tokens(outs) + _new_tokens(5, 200)
+    _drive(scheduler, [_request("a2", main, 4, session="a")])
+    _drive(scheduler, [_request("b", _new_tokens(7, 900), 4, session="b")])
     return scheduler
 
 
-@pytest.mark.parametrize(("level", "left"), [(1, 2), (2, 1), (4, 1)])
+@pytest.mark.parametrize(("level", "left"), [(1, 3), (2, 2), (4, 1)])
 def test_the_cache_yields_to_machine_memory_pressure(llama, monkeypatch, level, left):
     """Device-aware is system-aware: other apps and other MLX engines show
     up as the kernel's memory-pressure level. NORMAL (1): nothing given
-    back (control). WARN (2): everything but the most recently used
-    session's head. CRITICAL (4): all but the last entry."""
+    back (control). WARN (2): everything but each live conversation's
+    newest head -- the finished subagent (outlived by its main session)
+    goes. CRITICAL (4): all but the last entry."""
     import rapid_mlx.memory_budget as memory_budget
 
-    scheduler = _two_sessions(llama, monkeypatch)
+    scheduler = _three_sessions(llama, monkeypatch)
     mac = scheduler.memory_aware_cache
-    sessions = {key[0] for key in mac._entries}
-    assert len(sessions) == 2
+    assert len({key[0] for key in mac._entries}) == 3
     monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: level)
     scheduler._memguard_yield_to_system()
-    assert len({key[0] for key in mac._entries}) == left
-    if left == 1:
-        assert {key[0] for key in mac._entries} == {_side_prompt(2, 1)[0]}
+    firsts = {key[0] for key in mac._entries}
+    assert len(firsts) == left
+    if level == 2:
+        assert firsts == {_new_tokens(1, 1)[0], _new_tokens(7, 1)[0]}
+    if left < 3:
         assert scheduler._memguard().counts["system_pressure_evictions"] > 0
     else:
         assert scheduler._memguard().counts["system_pressure_evictions"] == 0
@@ -1064,11 +1113,14 @@ def test_the_main_session_hits_after_its_subagent_runs_alone(
     prompt = _new_tokens(0, 600)
     misses = []
     for turn in range(16):
-        outs = _drive(scheduler, [_request(f"main-{turn}", prompt, 4)])[f"main-{turn}"]
+        main = _request(f"main-{turn}", prompt, 4, session="main")
+        outs = _drive(scheduler, [main])[f"main-{turn}"]
         assert not outs[-1].error, (turn, outs[-1].error)
         if turn and len(prompt) - outs[-1].cached_tokens > 508:
             misses.append((turn, len(prompt), outs[-1].cached_tokens))
-        sub = _request(f"sub-{turn}", _side_prompt(turn, SUBAGENT_TOKENS), 8)
+        sub = _request(
+            f"sub-{turn}", _side_prompt(turn, SUBAGENT_TOKENS), 8, session=f"sub-{turn}"
+        )
         assert not _drive(scheduler, [sub])[sub.request_id][-1].error, turn
         prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, 496)
     assert misses == []
@@ -1130,32 +1182,34 @@ def test_an_admission_spike_counts_in_its_own_step_peak(llama, monkeypatch):
 
 
 def test_machine_pressure_keeps_the_waiting_main_session_head(llama, monkeypatch):
-    """Review 4 (C2): at WARN the cache keeps what live / queued requests
-    need and the most recently used session's head -- also while a request
-    RUNS: the main session's head survives its subagent's run, and its next
-    turn hits."""
+    """Review 4 (C2) + review 5 (item 5): at WARN the cache keeps what live
+    / queued requests need and every live conversation's newest head --
+    while the subagent RUNS and after it FINISHES (244d8de5c..45e157bab kept
+    only the most recently used finished session: the subagent, then the
+    main session's head went), and the main session's next turn hits."""
     import rapid_mlx.memory_budget as memory_budget
 
     device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
     device.install(monkeypatch, scheduler)
     main = _new_tokens(0, 1200)
-    outs = _drive(scheduler, [_request("main", main, 4)])["main"]
+    outs = _drive(scheduler, [_request("main", main, 4, session="main")])["main"]
     main_next = main + _tokens(outs)
     monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: 2)
-    scheduler.add_request(_request("sub", _side_prompt(0, 900), 40))
+    scheduler.add_request(_request("sub", _side_prompt(0, 900), 40, session="sub"))
     for _ in range(25):  # the subagent prefills and decodes under WARN
         scheduler.step()
         scheduler.evict_prefix_cache_under_pressure()
     assert scheduler.running
     entries = scheduler.memory_aware_cache._entries
     assert any(list(key) == main_next[: len(key)] for key in entries)
-    # (Once the subagent FINISHES under WARN it is the most recent session
-    # and the main head would go: the pressure clears first here.)
-    monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: 1)
-    while scheduler.has_requests():
+    while scheduler.has_requests():  # the subagent finishes, still WARN
         scheduler.step()
-    outs = _drive(scheduler, [_request("main-2", main_next + _new_tokens(5, 300), 4)])
+        scheduler.evict_prefix_cache_under_pressure()
+    scheduler._memguard_yield_to_system()
+    assert any(list(key) == main_next[: len(key)] for key in entries)
+    nxt = _request("main-2", main_next + _new_tokens(5, 300), 4, session="main")
+    outs = _drive(scheduler, [nxt])
     assert outs["main-2"][-1].cached_tokens >= len(main_next) - 8
 
 
@@ -1210,10 +1264,12 @@ class _Tokenizer(SimpleNamespace):
     pass
 
 
-def _tiny_tokenizer(strips: bool | None):
-    """A test tokenizer. ``strips`` None: no chat template (unknown);
-    True: renders like classic Qwen3 (earlier reasoning DROPPED once a new
-    user message follows); False: renders like AREX-2 (kept)."""
+def _tiny_tokenizer(strips):
+    """A test tokenizer. ``strips`` None: no chat template (unknown); True:
+    the rendering drops a whole earlier TOOL LOOP's reasoning once a new
+    user message follows; "final": only the final reply's (Rapid-MLX keeps
+    tool-loop reasoning on the Qwen-family templates); False: keeps all of
+    it (AREX-2)."""
     tok = _Tokenizer(
         encode=lambda text: list(text),
         decode=lambda ids, **_: "",
@@ -1226,9 +1282,13 @@ def _tiny_tokenizer(strips: bool | None):
             last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
             parts = []
             for i, m in enumerate(messages):
-                text = m["content"]
+                text = m.get("content") or ""
                 reasoning = m.get("reasoning_content")
-                if reasoning and not (strips and i < last_user):
+                tool_row = bool(m.get("tool_calls"))
+                dropped = i < last_user and (
+                    strips is True or (strips == "final" and not tool_row)
+                )
+                if reasoning and not dropped:
                     text = f"<think>{reasoning}</think>{text}"
                 parts.append(f"<{m['role']}>{text}")
             return "".join(parts)
@@ -1237,7 +1297,7 @@ def _tiny_tokenizer(strips: bool | None):
     return tok
 
 
-def _hybrid_scheduler(model, tokenizer):
+def _hybrid_scheduler(model, tokenizer, entries=24):
     scheduler = Scheduler(
         model=model,
         tokenizer=tokenizer,
@@ -1248,7 +1308,7 @@ def _hybrid_scheduler(model, tokenizer):
             enable_prefix_cache=True,
             use_memory_aware_cache=True,
             use_paged_cache=False,
-            hybrid_cache_entries=24,
+            hybrid_cache_entries=entries,
             cache_memory_mb=2048,
         ),
     )
@@ -1271,82 +1331,129 @@ def _hybrid_tokens(seed, n):
 
 
 _GEN_PROMPT = [901, 902, 903]
+# The main conversation's rendered frame and first message (what the chat
+# route measures from the template): a session id + these.
+_MAIN = {"session": "main", "frame": 300, "first_end": 1000}
 
 
-def _hybrid_run(scheduler, rid, prompt, boundary):
-    request = _request(rid, prompt, 4)
+def _hybrid_run(scheduler, rid, prompt, boundary, turn_start=False, **session):
+    request = _request(rid, prompt, 4, turn_start=turn_start, **session)
     request.prefix_boundary = boundary
     outs = _drive(scheduler, [request])[rid]
     assert not outs[-1].error, outs[-1].error
     return outs[-1].cached_tokens, _tokens(outs)
 
 
-def _hybrid_tool_loop(scheduler, user, rid):
+def _hybrid_tool_loop(scheduler, user, rid, **session):
     """A user message, then a 4-request tool loop that keeps its reasoning
     (each prompt extends the previous end-of-turn entry). Returns the
-    loop's last prompt and where the loop started."""
+    loop's next prompt, where the loop started, and the last request's
+    prompt (the final reply's)."""
+    session = session or _MAIN
     prompt = user + _GEN_PROMPT
     boundary = len(user)
     loop_start = len(prompt)
+    last = prompt
     for k in range(4):
-        _cached, out = _hybrid_run(scheduler, f"{rid}-loop{k}", prompt, boundary)
+        last = prompt
+        _cached, out = _hybrid_run(
+            scheduler, f"{rid}-loop{k}", prompt, boundary, turn_start=k == 0, **session
+        )
         nxt = prompt + out + [904] + _hybrid_tokens(10 + k, 700)
         boundary = len(nxt)
         prompt = nxt + _GEN_PROMPT
-    return prompt, loop_start
+    return prompt, loop_start, last
 
 
 def _strip_loop(prompt, user, loop_start, seed):
-    """The new user message under a stripping template: the loop's
-    reasoning (the first generated tokens) is gone; the rest re-rendered."""
+    """The new user message when the rendering drops the whole loop's
+    reasoning (the first generated tokens) -- the rest re-rendered."""
     return (
         user + _GEN_PROMPT + [905] + prompt[loop_start + 4 :] + _hybrid_tokens(seed, 50)
     )
 
 
-@pytest.mark.parametrize("strips", [True, None], ids=["stripping", "unknown"])
-def test_a_new_user_message_on_a_hybrid_resumes_from_its_boundary(
+@pytest.mark.parametrize("strips", [True, None], ids=["probed", "observed"])
+def test_a_new_user_message_on_a_hybrid_resumes_from_its_turn_boundary(
     monkeypatch, cpu, strips
 ):
-    """Review 4 (C3): a non-trimmable (hybrid) cache cannot rewind. A tool
-    loop keeps its reasoning (each prompt extends the previous end-of-turn
-    entry), then a NEW USER MESSAGE: the template strips the loop's
-    reasoning and the prompt diverges right after the boundary before the
-    loop. 244d8de5c superseded that boundary entry: cached 0 (at goose
-    scale a ~100k re-prefill on every new user message); 4ac506f7d resumed
-    at the boundary. A template that strips (probed by rendering) keeps the
-    boundary entries from the start; an unknown one keeps them once the
-    session has been OBSERVED to diverge (its first new user message pays
-    once). Superseding still happens either way."""
+    """Review 4 (C3), review 5 (items 2-4): a non-trimmable (hybrid) cache
+    cannot rewind. When the rendering drops a whole tool loop's reasoning
+    on a new user message, the prompt diverges right after the boundary
+    its turn started at. A template probed to do that (rendered with a
+    tool-call row and its response) keeps that ONE boundary per line from
+    the start; an unknown one keeps it once the line was OBSERVED to rewrite
+    (its first new user message pays once). Superseding still happens."""
     scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(strips))
     first = _hybrid_tokens(1, 1500)
-    prompt, loop_start = _hybrid_tool_loop(scheduler, first, "a")
+    prompt, loop_start, _last = _hybrid_tool_loop(scheduler, first, "a")
     assert scheduler._memguard().counts["superseded"] > 0  # the win stays
     new_user = _strip_loop(prompt, first, loop_start, 77)
-    cached, out = _hybrid_run(scheduler, "new-user", new_user, len(new_user) - 3)
+    cached, out = _hybrid_run(
+        scheduler, "new-user", new_user, len(new_user) - 3, turn_start=True, **_MAIN
+    )
     if strips:
         assert cached >= len(first)
     second = new_user + out + [906] + _hybrid_tokens(78, 40)
-    prompt, loop_start = _hybrid_tool_loop(scheduler, second, "b")
+    prompt, loop_start, _last = _hybrid_tool_loop(scheduler, second, "b")
     new_user = _strip_loop(prompt, second, loop_start, 79)
-    cached, _out = _hybrid_run(scheduler, "new-user-2", new_user, len(new_user) - 3)
+    cached, _out = _hybrid_run(
+        scheduler, "new-user-2", new_user, len(new_user) - 3, turn_start=True, **_MAIN
+    )
     assert cached >= len(second)
 
 
-def test_a_template_that_keeps_reasoning_keeps_superseding_boundaries(cpu):
-    """Negative control (AREX-2, measured live: a new user message just
-    extends the prefix): the template probe says it does not strip, no
-    session diverges, and message-boundary entries are superseded."""
-    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
-    assert scheduler._memguard_template_strips() is False
-    first = _hybrid_tokens(1, 1500)
-    prompt, _loop_start = _hybrid_tool_loop(scheduler, first, "a")
-    # The loop's next prompt: the last reply + a 700-token tool result.
-    cached, _out = _hybrid_run(scheduler, "next", prompt, len(prompt) - 3)
-    assert cached >= len(prompt) - len(_GEN_PROMPT) - 701 - 8
-    entries = scheduler.memory_aware_cache._entries
-    assert tuple(first) not in entries  # the loop's first boundary went
-    assert not getattr(scheduler, "_memguard_divergent_sessions", set())
+@pytest.mark.parametrize("strips", ["final", False], ids=["final-reply", "keeps"])
+def test_a_template_that_keeps_tool_loops_keeps_superseding_boundaries(cpu, strips):
+    """Negative controls. "final-reply" (the Qwen-family templates once
+    Rapid-MLX re-renders tool-loop reasoning): a new user message drops only
+    the final reply's reasoning and resumes from the NEWEST boundary, which
+    superseding always keeps -- nothing is flagged, nothing extra kept.
+    "keeps" (AREX-2, measured live): the prompt just extends. Review 5:
+    the old detector marked lines on ordinary traffic and kept every
+    boundary (24 entries / 445.7 MB vs 3 / 82.9 MB)."""
+    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(strips))
+    assert scheduler._memguard_template_rewrites_tool_loops() is False
+    user = _hybrid_tokens(1, 1500)
+    for turn in range(4):
+        prompt, _loop_start, last = _hybrid_tool_loop(scheduler, user, f"t{turn}")
+        if strips == "final":
+            new_user = last + [905] + _hybrid_tokens(90 + turn, 50)
+        else:
+            new_user = prompt + [905] + _hybrid_tokens(90 + turn, 50)
+        cached, out = _hybrid_run(
+            scheduler,
+            f"u{turn}",
+            new_user,
+            len(new_user) - 3,
+            turn_start=True,
+            **_MAIN,
+        )
+        assert cached >= len(last) - len(_GEN_PROMPT) - 8, (turn, cached, len(last))
+        user = new_user + out + [906] + _hybrid_tokens(78 + turn, 40)
+    assert not scheduler.__dict__.get("_memguard_rewriting_lines")
+    assert scheduler._memguard().counts["superseded"] > 0
+    assert len(scheduler.memory_aware_cache._entries) <= 4
+
+
+def test_a_rewriting_template_keeps_one_boundary_per_conversation(cpu):
+    """Review 5 (item 3): on a template that drops tool-loop reasoning the
+    cache keeps the boundary each turn started at -- ONE per conversation,
+    not every boundary: over four user turns the idle entry count stays
+    flat."""
+    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(True))
+    user = _hybrid_tokens(1, 1500)
+    counts = []
+    for turn in range(4):
+        prompt, loop_start, _last = _hybrid_tool_loop(scheduler, user, f"t{turn}")
+        new_user = _strip_loop(prompt, user, loop_start, 77 + turn)
+        cached, out = _hybrid_run(
+            scheduler, f"u{turn}", new_user, len(new_user) - 3, turn_start=True, **_MAIN
+        )
+        assert cached >= len(user), (turn, cached, len(user))
+        counts.append(len(scheduler.memory_aware_cache._entries))
+        user = new_user + out + [906] + _hybrid_tokens(78 + turn, 40)
+    assert max(counts) <= 4 and counts[-1] <= counts[1], counts
 
 
 def test_a_side_branch_on_a_hybrid_does_not_supersede_the_main_line(cpu):
@@ -1355,11 +1462,11 @@ def test_a_side_branch_on_a_hybrid_does_not_supersede_the_main_line(cpu):
     message), then main's next turn must still resume from main's entry."""
     scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
     first = _hybrid_tokens(1, 1500)
-    prompt, _loop_start = _hybrid_tool_loop(scheduler, first, "a")
-    _cached, out = _hybrid_run(scheduler, "main", prompt, len(prompt) - 3)
+    prompt, _loop_start, _last = _hybrid_tool_loop(scheduler, first, "a")
+    _cached, out = _hybrid_run(scheduler, "main", prompt, len(prompt) - 3, **_MAIN)
     line = prompt + out
     branch = line + [907] + _hybrid_tokens(81, 120) + _GEN_PROMPT
-    _hybrid_run(scheduler, "branch", branch, len(branch) - 3)
+    _hybrid_run(scheduler, "branch", branch, len(branch) - 3, **_MAIN)
     nxt = line + [904] + _hybrid_tokens(82, 300) + _GEN_PROMPT
-    cached, _out = _hybrid_run(scheduler, "main-next", nxt, len(nxt) - 3)
+    cached, _out = _hybrid_run(scheduler, "main-next", nxt, len(nxt) - 3, **_MAIN)
     assert cached >= len(line) - 8, (len(line), cached)

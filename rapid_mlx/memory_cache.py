@@ -1256,6 +1256,9 @@ class _CacheEntry:
     # Live-STORE entries are always ``protected=False`` (the opportunistic path
     # the bound governs). The bound governs OPPORTUNISTIC (unprotected) entries.
     protected: bool = False
+    # LeanZero memory guard: an opaque tag the storing caller attaches (the
+    # conversation the entry belongs to). Never persisted; None = unknown.
+    owner: Any = None
     # Exact message-boundary snapshots are the reusable restart frontier for
     # hybrid caches that cannot be trimmed.  Keep this semantic marker across
     # persistence cycles so a deadline-limited shutdown saves the latest
@@ -2444,9 +2447,13 @@ class MemoryAwarePrefixCache:
         *,
         message_boundary: bool = False,
         handoff: bool = False,
+        owner: Any = None,
     ) -> bool:
         """
         Store KV cache for future reuse.
+
+        ``owner`` (memory guard): an opaque tag kept on the entry
+        (``_CacheEntry.owner``), the conversation it belongs to.
 
         ``handoff=True`` (memory guard): ``cache`` belongs to a FINISHED
         request; it is made owned layer by layer in place
@@ -2553,6 +2560,7 @@ class MemoryAwarePrefixCache:
 
         # Create entry and estimate memory (pure compute, no shared state).
         entry = _CacheEntry.create(tokens, cache, message_boundary=message_boundary)
+        entry.owner = owner
 
         # Check if single entry exceeds limit
         if entry.memory_bytes > self._max_memory:
@@ -2786,8 +2794,9 @@ class MemoryAwarePrefixCache:
 
         * ``hybrid_reuse_max_entries <= 0`` (disabled, the default) → drop ALL
           evictable non-trimmable entries (``keep = max(limit, 0) == 0``).
-        * ``> 0`` → LRU-evict the oldest evictable non-trimmable entries until
-          at most N remain. ``_entries`` is an ``OrderedDict`` in LRU order, so
+        * ``> 0`` → evict evictable non-trimmable entries until at most N
+          remain: in ``bound_order`` (the memory guard's eviction order) when
+          the scheduler set one, else oldest first. ``_entries`` is an ``OrderedDict`` in LRU order, so
           the head of the filtered list is the least-recently-used.
 
         Called UNCONDITIONALLY at BOTH sites (live-store after inserting a
@@ -2812,6 +2821,22 @@ class MemoryAwarePrefixCache:
         # on a large persisted snapshot).
         keep = max(limit, 0)
         n_evict = max(0, len(evictable_non_trimmable_keys) - keep)
+        order = getattr(self, "bound_order", None)
+        if n_evict and callable(order):
+            # LeanZero memory guard: the count bound evicts in the guard's
+            # ONE eviction order (dead branches and abandoned heads first,
+            # the conversations' newest heads last), not plain LRU -- review
+            # 5: a 6-request subagent loop pushed the main session's head out
+            # at the default bound (main cached 512 of 4,643).
+            try:
+                candidates = set(evictable_non_trimmable_keys)
+                ranked = [k for k in order() if k in candidates]
+                seen = set(ranked)
+                evictable_non_trimmable_keys = ranked + [
+                    k for k in evictable_non_trimmable_keys if k not in seen
+                ]
+            except Exception:  # noqa: BLE001 — the plain LRU bound still holds
+                logger.debug("[hybrid_bound] guard order failed", exc_info=True)
         victims = evictable_non_trimmable_keys[:n_evict]
         for oldest in victims:
             self._evict_entry_locked(oldest, reason="hybrid_bound")
