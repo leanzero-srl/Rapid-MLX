@@ -120,8 +120,11 @@ def test_no_credit_for_a_smaller_chunk_until_one_is_observed():
 )
 def test_every_observation_stays_covered(a, k, c, seed):
     """Property: after any sequence of observations (any truth with
-    non-negative coefficients, plus multiplicative noise), the model projects
-    at least the measured transient of every observation it recorded."""
+    non-negative coefficients, plus +-10% multiplicative noise), every
+    recorded observation is covered by its projection plus the guard's own
+    transient margin (10%), except at most ONE per residual window -- the
+    single largest residual a window ignores so that one noisy step cannot
+    move the model (review 2026-10-14; the margin and E5 absorb it)."""
     rng = random.Random(seed)
     truth = _truth(a=a, k=k, g=QWEN35_27B.kv_copy_bytes_per_context, c=c)
     model = PeakModel(QWEN35_27B)
@@ -135,13 +138,16 @@ def test_every_observation_stays_covered(a, k, c, seed):
         t = int(truth(s) * rng.uniform(0.9, 1.1))
         model.observe(s, t)
         seen.append((s, t))
-    groups: dict = {}
+    by_tokens: dict = {}
     for s, t in seen:
-        groups.setdefault((s.batch, s.chunk), []).append((s, t))
-    for (_b, _c), obs in groups.items():
-        # The last OBS_PER_GROUP of each group are stored; all must be covered.
-        for s, t in obs[-16:]:
-            assert model.project(s) >= t, (s, t, model.snapshot())
+        by_tokens.setdefault(s.tokens, []).append((s, t))
+    for _tokens, obs in by_tokens.items():
+        uncovered = [
+            (s, t)
+            for s, t in obs[-16:]
+            if (1 + MARGIN_TRANSIENT_RATIO) * model.project(s) < t
+        ]
+        assert len(uncovered) <= 1, (uncovered, model.snapshot())
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +175,16 @@ GB = 10**9
 
 
 class _World:
-    """A fake device: active bytes, allocator cache, prefix entries."""
+    """A fake device: active bytes, allocator cache, prefix entries.
+
+    ``entries``: (bytes, eviction level) oldest first; level 1 = no live
+    session needs it, 2 = a running request already copied it, 3 = a live
+    session still needs it (see ``memory_guard.EVICT_*``)."""
 
     def __init__(self, *, active, cache=0, entries=()):
         self.active = active
         self.cache = cache
-        self.entries = list(entries)  # oldest first, bytes each
+        self.entries = [e if isinstance(e, tuple) else (e, 1) for e in entries]
         self.log: list[str] = []
 
     def probe(self) -> GuardProbe:
@@ -183,11 +193,16 @@ class _World:
                 self.log.append("clear")
             self.cache = 0
 
-        def evict(keep_newest: bool) -> bool:
-            if not self.entries or (keep_newest and len(self.entries) <= 1):
+        def evict(max_level: int) -> bool:
+            if not self.entries:
                 return False
-            self.active -= self.entries.pop(0)
-            self.log.append("evict")
+            lowest = min(level for _b, level in self.entries)
+            if lowest > max_level:
+                return False
+            i = next(i for i, (_b, lv) in enumerate(self.entries) if lv == lowest)
+            nbytes, level = self.entries.pop(i)
+            self.active -= nbytes
+            self.log.append(f"evict{level}")
             return True
 
         return GuardProbe(
@@ -229,31 +244,36 @@ def test_the_allocator_cache_goes_first():
     assert guard.counts["clear_cache"] == 1 and guard.counts["evictions"] == 0
 
 
-def test_order_is_cache_then_old_entries_then_halving_then_the_last_entry():
+def test_order_is_cache_then_unneeded_entries_then_halving_then_needed_ones():
     guard = _guard()
-    # 3 entries of 3 GB, active 41 GB incl. them; a 2048 chunk needs 12.7 GB.
-    world = _World(active=41 * GB, cache=1 * GB, entries=[3 * GB] * 3)
+    # Active 41 GB incl. 3 entries of 3 GB: the one the next turn needs
+    # (level 3, stored this turn) is the OLDEST, then the fetched-from one a
+    # running request already copied (2), then an unused one (1). A 2048
+    # chunk needs 12.7 GB.
+    world = _World(
+        active=41 * GB, cache=1 * GB, entries=[(3 * GB, 3), (3 * GB, 2), (3 * GB, 1)]
+    )
     plan = guard.plan(ROW, configured_chunk=2048, ceiling=48 * GB, probe=world.probe())
-    # cache, then the two OLDER entries (the newest kept): 35 GB + 12.7 GB
-    # step + margin is still over 48 GB, so the chunk halves; at 1024 (6.4 GB
-    # step + margins) it fits, and the newest entry survives.
-    assert world.log == ["clear", "evict", "evict"]
+    # cache, then level 1, then level 2 (never by age): 35 GB + 12.7 GB step
+    # + margin is still over 48 GB, so the chunk halves; at 1024 it fits and
+    # the entry the next turn needs survives.
+    assert world.log == ["clear", "evict1", "evict2"]
     assert plan.chunk == 1024 and plan.refuse is None
-    assert len(world.entries) == 1
+    assert world.entries == [(3 * GB, 3)]
     assert guard.counts["chunk_halvings"] == 1
 
 
-def test_last_entry_evicted_before_refusing():
+def test_a_needed_entry_goes_only_after_halving_to_the_floor():
     guard = _guard()
-    world = _World(active=int(48.5 * GB), entries=[4 * GB])
+    world = _World(active=int(48.5 * GB), entries=[(4 * GB, 3)])
     plan = guard.plan(ROW, configured_chunk=2048, ceiling=50 * GB, probe=world.probe())
     # Halving to the floor (256: 1.5 GB step + 1.2 GB margin) is not enough
-    # at 48.5 GB; the last entry goes, then it fits.
+    # at 48.5 GB; the needed entry goes, then it fits.
     assert plan.chunk == 256
-    assert world.log == ["evict"] and plan.refuse is None
+    assert world.log == ["evict3"] and plan.refuse is None
 
 
-def test_refuses_at_the_floor_before_allocating():
+def test_cannot_dispatch_at_the_floor_reports_the_longest_row():
     guard = _guard()
     world = _World(active=49 * GB)
     rows = ROW + [RowPlan("req-short", offset=100, segment=50, prompt_tokens=150)]
@@ -261,7 +281,8 @@ def test_refuses_at_the_floor_before_allocating():
     assert plan.chunk == 256
     assert plan.refuse is not None and plan.refuse.request_id == "req-long"
     assert plan.needed > 50 * GB
-    assert guard.counts["refusals"] == 1
+    # The scheduler decides defer vs refuse (and counts it).
+    assert guard.counts["refusals"] == 0
 
 
 def test_per_request_floor_override_lets_the_backstop_go_lower():
@@ -347,3 +368,80 @@ def test_metal_oom_text_is_recognised():
         )
     )
     assert not is_metal_oom(RuntimeError("shape mismatch"))
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-10-14: calibration must not ratchet on one noisy observation
+# ---------------------------------------------------------------------------
+
+GOOSE_CEILING = int(50.1e9)  # the 64 GB M3 Max's Metal cap
+GOOSE_BASE = int(30.5e9)  # Q8 27B weights + fixed state
+
+
+def _goose_kv(tokens: int) -> int:
+    return 156_893_184 + 65_536 * tokens
+
+
+def _calibrated_guard(seed: int = 7) -> MemoryGuard:
+    rng = random.Random(seed)
+    guard = MemoryGuard(QWEN35_27B, floor_tokens=256)
+    truth = _truth(a=104.0, k=280_000.0, g=QWEN35_27B.kv_copy_bytes_per_context)
+    for chunk in (2048, 256):
+        for x in range(chunk, 90_000, 2048 if chunk == 2048 else 1536):
+            s = StepShape(1, chunk, x)
+            guard.observe(s, int(truth(s) * rng.uniform(0.97, 1.03)))
+    return guard
+
+
+def _window(guard: MemoryGuard) -> int:
+    return guard.max_context(
+        base=GOOSE_BASE, kv_footprint=_goose_kv, ceiling=GOOSE_CEILING, upper=262_144
+    )
+
+
+@pytest.mark.parametrize(
+    "outlier",
+    [StepShape(1, 2048, 40_000), StepShape(1, 256, 4096), StepShape(1, 256, 60_000)],
+)
+def test_one_1gb_outlier_moves_the_window_by_at_most_5_percent(outlier):
+    """RED on the first guard: the attention coefficient was the MAX pair
+    slope, so one +1 GB observation at a small chunk took it from ~104 to
+    ~2000 B/unit and the honest window from ~147k to ~26k tokens, forever."""
+    guard = _calibrated_guard()
+    before = _window(guard)
+    a_before = guard.model.attention_bytes_per_unit
+    guard.observe(outlier, guard.model.project(outlier) + 1_000_000_000)
+    after = _window(guard)
+    assert abs(after - before) <= 0.05 * before, (before, after)
+    assert guard.model.attention_bytes_per_unit <= 1.10 * a_before
+
+
+def test_the_attention_coefficient_is_capped_at_a_multiple_of_the_prior():
+    guard = MemoryGuard(QWEN35_27B, floor_tokens=256)
+    for x in range(2048, 40_000, 2048):
+        s = StepShape(1, 2048, x)
+        guard.observe(s, int(5000.0 * s.units))  # an absurd device
+    assert (
+        guard.model.attention_bytes_per_unit <= 4 * QWEN35_27B.attention_bytes_per_unit
+    )
+
+
+def test_a_backstop_lower_bound_never_enters_the_fit():
+    """A system-pressure OOM records 'needed >= working set - active' (tens
+    of GB). It becomes a decaying safety margin on that shape, never a slope:
+    RED on the first guard (coefficient -> ~12,864 B/unit, window -> ~4k)."""
+    guard = _calibrated_guard()
+    before = _window(guard)
+    a_before = guard.model.attention_bytes_per_unit
+    shape = StepShape(1, 2048, 30_000)
+    guard.record_backstop(shape, 25_000_000_000)
+    assert guard.model.attention_bytes_per_unit == a_before
+    assert _window(guard) == before
+    # The plan at that shape now carries the extra margin ...
+    t0, _ = guard.need(StepShape(1, 2048, 31_000), GOOSE_CEILING)
+    assert t0 >= guard.model.project(StepShape(1, 2048, 31_000)) + 1e9
+    # ... which decays with successful dispatches.
+    for _ in range(200):
+        guard.note_dispatch_ok(StepShape(1, 2048, 31_000))
+    t1, _ = guard.need(StepShape(1, 2048, 31_000), GOOSE_CEILING)
+    assert t1 == guard.model.project(StepShape(1, 2048, 31_000))

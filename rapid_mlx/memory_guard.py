@@ -91,8 +91,28 @@ REAPPLY_RATIO = 0.05
 # peak (a few hundred MB) cannot dominate the fitted attention coefficient.
 SLOPE_MIN_SPAN_CHUNKS = 4
 SLOPE_MIN_SPAN_FRACTION = 0.25
-# Observations kept per (batch, chunk) group for pair slopes.
+# Observations kept per (batch, chunk) group for pair slopes, and per
+# prefill-token count for the residual window: older ones age out, so the
+# model follows the device instead of ratcheting on its worst moment.
 OBS_PER_GROUP = 16
+# A group calibrates only once this many qualifying pairs agree (median).
+SLOPE_MIN_PAIRS = 3
+# The residual window ignores its single largest value once it holds this
+# many observations (one noisy step does not count; a repeated peak does).
+ROBUST_MIN_OBS = 4
+# ratio: the fitted attention coefficient never exceeds this multiple of the
+# analytic prior (itself 4 score copies per query head, above every measured
+# graph). 4x = 16 live score copies: a device beyond that is not a fit, it
+# is a measurement defect (another lane allocating during the step).
+MAX_PRIOR_MULTIPLE = 4.0
+# E5 backstop: an OOM's lower bound becomes an extra margin on shapes at or
+# above this fraction of the failed context, multiplied by BACKSTOP_DECAY per
+# successful dispatch there (half-life ~23 chunks) and dropped once below
+# BACKSTOP_DROP_FRACTION of its original size (~150 dispatches) -- a decaying
+# safety term, never a fit.
+BACKSTOP_CONTEXT_FRACTION = 0.75
+BACKSTOP_DECAY = 0.97
+BACKSTOP_DROP_FRACTION = 0.01
 
 
 def guard_enabled() -> bool:
@@ -166,34 +186,51 @@ class _Obs:
     transient: int
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
 class PeakModel:
     """Projected transient bytes of one prefill dispatch.
 
     ``project(s) = a * s.units + g * s.context + linear(s.tokens)``
 
-    * ``a`` (attention): the prior until two observations of the same
-      ``(batch, chunk)`` lie far enough apart in context; then the WORST
-      (largest) pair slope ``(T_j - T_i) / (X_j - X_i)`` less the analytic
-      ``g``, per ``batch x chunk``. Within one group the linear terms cancel,
-      so the slope is not inflated by activations. It never decays.
+    * ``a`` (attention): the prior until one ``(batch, chunk)`` group holds
+      at least ``SLOPE_MIN_PAIRS`` pairs of observations far enough apart in
+      context; then the MEDIAN pair slope ``(T_j - T_i) / (X_j - X_i)`` less
+      the analytic ``g``, per ``batch x chunk`` (within one group the linear
+      terms cancel). Robust by construction: one noisy observation moves a
+      median of many pairs by little, and only the last ``OBS_PER_GROUP``
+      observations of each group count, so an outlier ages out. Capped at
+      ``MAX_PRIOR_MULTIPLE`` x the analytic prior. (The first guard used the
+      MAX pair slope and never forgot: one +1 GB observation at a small chunk
+      took the coefficient 104 -> ~2000 B/unit for the life of the process.)
     * ``g``: one layer's KV growth copy, analytic.
     * ``linear``: model-free. For every observed ``L = batch x chunk`` the
-      residual ``R = T - a*U - g*X`` (clipped at 0) is kept as a running max,
-      made monotone in ``L``; between observed sizes the bound is
-      ``min(R(next larger L), R(next smaller L) * L / L_smaller)`` -- both are
-      valid upper bounds for any non-negative ``k*L + c``. Below the smallest
-      observed size no credit is taken for a smaller chunk; above the largest
-      it scales linearly. Before any observation: the prior ``k0 * L``.
+      residual ``R = T - a*U - g*X`` (clipped at 0) of its last
+      ``OBS_PER_GROUP`` observations, the largest after dropping the single
+      largest once ``ROBUST_MIN_OBS`` exist (one outlier does not count; a
+      repeated high peak does); monotone in ``L``; between observed sizes
+      ``min(R(next larger L), R(next smaller L) * L / L_smaller)`` -- both
+      valid upper bounds for any non-negative ``k*L + c``. No credit for a
+      chunk smaller than any observed; linear above the largest. Before any
+      observation: the prior ``k0 * L``.
 
-    By construction every observation is covered: ``project(obs) >= T``.
-    Projection cost is O(number of distinct observed L), a handful.
+    Only ``fit=True`` observations (a prefill that ran alone in its step)
+    enter the slope; mixed steps (other rows decoding beside it) feed only
+    the residual window. Backstop (OOM) lower bounds never enter the model:
+    see :meth:`MemoryGuard.record_backstop`.
     """
 
     def __init__(self, prior: PeakPrior) -> None:
         self.prior = prior
         self._a_learned: float | None = None
-        self._residual_by_tokens: dict[int, float] = {}
         self._groups: dict[tuple[int, int], deque[_Obs]] = {}
+        self._by_tokens: dict[int, deque[_Obs]] = {}
         self._envelope: list[tuple[int, float]] = []
         self.observations = 0
         self.worst_transient = 0
@@ -219,11 +256,48 @@ class PeakModel:
             - self.prior.kv_copy_bytes_per_context * s.context,
         )
 
-    def _rebuild_envelope(self) -> None:
+    def _fit_attention(self) -> float | None:
+        g = self.prior.kv_copy_bytes_per_context
+        cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
+        best: float | None = None
+        for (batch, chunk), group in self._groups.items():
+            obs = list(group)
+            slopes: list[float] = []
+            for i in range(len(obs)):
+                for j in range(i + 1, len(obs)):
+                    lo, hi = obs[i], obs[j]
+                    if lo.shape.context > hi.shape.context:
+                        lo, hi = hi, lo
+                    span = hi.shape.context - lo.shape.context
+                    need = max(
+                        SLOPE_MIN_SPAN_CHUNKS * chunk,
+                        SLOPE_MIN_SPAN_FRACTION * hi.shape.context,
+                    )
+                    if span <= 0 or span < need:
+                        continue
+                    slope = (hi.transient - lo.transient) / span
+                    slopes.append(max(0.0, slope - g) / max(1, batch * chunk))
+            if len(slopes) < SLOPE_MIN_PAIRS:
+                continue
+            estimate = _median(slopes)
+            best = estimate if best is None else max(best, estimate)
+        if best is None:
+            return None
+        return min(best, cap)
+
+    def _robust_residual(self, window: deque[_Obs], a: float) -> float:
+        values = sorted(self._residual(o, a) for o in window)
+        if len(values) >= ROBUST_MIN_OBS:
+            return values[-2]
+        return values[-1]
+
+    def _rebuild(self) -> None:
+        self._a_learned = self._fit_attention()
+        a = self.attention_bytes_per_unit
         running = 0.0
         env: list[tuple[int, float]] = []
-        for tokens in sorted(self._residual_by_tokens):
-            running = max(running, self._residual_by_tokens[tokens])
+        for tokens in sorted(self._by_tokens):
+            running = max(running, self._robust_residual(self._by_tokens[tokens], a))
             env.append((tokens, running))
         self._envelope = env
 
@@ -257,8 +331,9 @@ class PeakModel:
         )
         return int(math.ceil(value))
 
-    def observe(self, shape: StepShape, transient: int) -> bool:
-        """Record one measured dispatch. Returns True when a coefficient moved."""
+    def observe(self, shape: StepShape, transient: int, *, fit: bool = True) -> bool:
+        """Record one measured dispatch. Returns True when the projection of
+        some shape moved (a coefficient or the residual envelope)."""
         if shape.batch <= 0 or shape.chunk <= 0 or shape.context <= 0:
             return False
         transient = max(0, int(transient))
@@ -267,63 +342,27 @@ class PeakModel:
             self.worst_transient = transient
             self.worst_shape = shape
         obs = _Obs(shape, transient)
-        key = (shape.batch, shape.chunk)
-        group = self._groups.setdefault(key, deque(maxlen=OBS_PER_GROUP))
-        changed = False
-
-        # 1) attention coefficient from pair slopes within the group.
-        best: float | None = None
-        g = self.prior.kv_copy_bytes_per_context
-        for other in group:
-            lo, hi = (
-                (other, obs) if other.shape.context < shape.context else (obs, other)
-            )
-            span = hi.shape.context - lo.shape.context
-            need = max(
-                SLOPE_MIN_SPAN_CHUNKS * shape.chunk,
-                SLOPE_MIN_SPAN_FRACTION * hi.shape.context,
-            )
-            if span <= 0 or span < need:
-                continue
-            slope = (hi.transient - lo.transient) / span
-            a_pair = max(0.0, slope - g) / max(1, shape.batch * shape.chunk)
-            best = a_pair if best is None else max(best, a_pair)
-        group.append(obs)
-        if best is not None and (self._a_learned is None or best > self._a_learned):
-            first = self._a_learned is None
-            self._a_learned = best
-            changed = True
-            if first:
-                # The prior (usually larger) is replaced: recompute every
-                # residual from the stored observations so each one stays
-                # covered under the new, smaller attention term.
-                self._residual_by_tokens = {}
-                for grp in self._groups.values():
-                    for o in grp:
-                        r = self._residual(o, best)
-                        tok = o.shape.tokens
-                        self._residual_by_tokens[tok] = max(
-                            self._residual_by_tokens.get(tok, 0.0), r
-                        )
-
-        # 2) model-free linear residual for this size.
-        r = self._residual(obs, self.attention_bytes_per_unit)
-        tok = shape.tokens
-        if r > self._residual_by_tokens.get(tok, -1.0):
-            self._residual_by_tokens[tok] = r
-            changed = True
-        if changed:
-            self._rebuild_envelope()
-        return changed
+        if fit:
+            self._groups.setdefault(
+                (shape.batch, shape.chunk), deque(maxlen=OBS_PER_GROUP)
+            ).append(obs)
+        self._by_tokens.setdefault(shape.tokens, deque(maxlen=OBS_PER_GROUP)).append(
+            obs
+        )
+        before = (self._a_learned, list(self._envelope))
+        self._rebuild()
+        return before != (self._a_learned, self._envelope)
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "source": "calibrated" if self.calibrated else "prior",
             "calibrated": self.calibrated,
             "observations": self.observations,
             "attention_bytes_per_unit": round(self.attention_bytes_per_unit, 3),
             "attention_bytes_per_unit_prior": round(
                 self.prior.attention_bytes_per_unit, 3
             ),
+            "attention_cap_multiple_of_prior": MAX_PRIOR_MULTIPLE,
             "kv_copy_bytes_per_context": round(self.prior.kv_copy_bytes_per_context, 1),
             "token_bytes_prior": round(self.prior.token_bytes, 1),
             "linear_bytes_by_tokens": {str(t): int(r) for t, r in self._envelope},
@@ -378,10 +417,30 @@ class GuardProbe:
     active: Callable[[], int]
     cache: Callable[[], int]
     clear_cache: Callable[[], None]
-    # Evict one prefix entry, oldest first; ``keep_newest`` refuses to take
-    # the last remaining entry. Returns True when one was evicted.
-    evict_one: Callable[[bool], bool]
+    # Evict one prefix entry of eviction level <= ``max_level`` (the lowest
+    # level first, LRU within a level; see EVICT_* below). Returns True when
+    # one was evicted.
+    evict_one: Callable[[int], bool]
     entry_count: Callable[[], int]
+
+
+# The ONE prefix-cache eviction order every path uses (E1, the pressure
+# evictor, E5, store-time room). What the NEXT turn of a live session needs is
+# the entry stored at the END of this turn; during a turn the entry it was
+# fetched from is redundant once copied into the live cache (mlx-lm merges /
+# writes it into new buffers).
+# 1: an entry on no live request's path (LRU) -- includes finished turns'
+#    completion entries a re-rendered next prompt will not match.
+EVICT_UNUSED = 1
+# 2: an entry on a running request's path that it has already fetched
+#    (key length <= its cached tokens): its bytes are duplicated in the live
+#    cache, so evicting it frees memory and loses nothing for that session.
+EVICT_REDUNDANT = 2
+# 3: an entry a live session still needs: stored during this turn beyond what
+#    the running request fetched (the next turn's base), or on a waiting
+#    request's path. Evicted only before refusing a prefill or under hard
+#    pressure at the cap.
+EVICT_NEEDED = 3
 
 
 @dataclass
@@ -418,6 +477,8 @@ class MemoryGuard:
             "backstop_fired": 0,
             "backstop_requeued": 0,
             "calibrations": 0,
+            "deferrals": 0,
+            "store_skips": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
@@ -425,19 +486,70 @@ class MemoryGuard:
         self.effective_prefix_budget: int | None = None
         self.configured_prefix_budget: int | None = None
         self.cache_limit: int | None = None
-        # Worst observed non-evictable footprint of one dispatch beyond the
-        # idle base: the request's live KV/state at that moment + its
-        # transient. Drives the derived prefix budget and cache limit (E2/E3).
-        self.worst_step_footprint = 0
+        # Last dispatch's live KV/state beyond the idle base + its transient:
+        # reported, never fed back into a budget (the first guard derived the
+        # prefix budget from the worst of these, which double-counted the live
+        # KV and ratcheted prefix caching off for long sessions).
+        self.last_step_footprint = 0
+        # E5: [context_threshold, extra_bytes, original] decaying margins.
+        self._backstop: list[list[float]] = []
 
     # -- arithmetic -----------------------------------------------------
     def margin(self, transient: int, ceiling: int) -> int:
         return int(MARGIN_CEILING_RATIO * ceiling + MARGIN_TRANSIENT_RATIO * transient)
 
-    def need(self, shape: StepShape, ceiling: int) -> tuple[int, int]:
-        """(projected transient, margin) of one dispatch."""
+    def backstop_extra(self, shape: StepShape) -> int:
+        extra = 0.0
+        for threshold, value, _original in self._backstop:
+            if shape.context >= threshold:
+                extra = max(extra, value)
+        return int(extra)
+
+    def need(
+        self, shape: StepShape, ceiling: int, *, backstop: bool = True
+    ) -> tuple[int, int]:
+        """(projected transient, margin) of one dispatch. The transient
+        includes any live E5 backstop margin for this shape unless
+        ``backstop=False`` (admission and the honest window are structural:
+        a decaying OOM margin must not shrink the advertised context)."""
         transient = self.model.project(shape)
+        if backstop:
+            transient += self.backstop_extra(shape)
         return transient, self.margin(transient, ceiling)
+
+    def record_backstop(self, shape: StepShape, lower_bound: int) -> int:
+        """E5: a dispatch of ``shape`` hit a Metal OOM; it needed at least
+        ``lower_bound`` bytes. The deficit over the projection becomes a
+        decaying extra margin on shapes at or above
+        ``BACKSTOP_CONTEXT_FRACTION`` of its context -- never a fit
+        observation (the lower bound 'working set - active' can be tens of GB
+        when other processes hold the GPU, and the first guard's slope took
+        that as the device's attention cost). Returns the deficit recorded."""
+        if shape.batch <= 0:
+            return 0
+        deficit = int(lower_bound) - self.model.project(shape)
+        if deficit <= 0:
+            return 0
+        self._backstop.append(
+            [
+                float(BACKSTOP_CONTEXT_FRACTION * shape.context),
+                float(deficit),
+                float(deficit),
+            ]
+        )
+        return deficit
+
+    def note_dispatch_ok(self, shape: StepShape) -> None:
+        """A dispatch completed: decay the backstop margins it was under."""
+        if not self._backstop:
+            return
+        kept = []
+        for threshold, value, original in self._backstop:
+            if shape.context >= threshold:
+                value *= BACKSTOP_DECAY
+            if value >= BACKSTOP_DROP_FRACTION * original:
+                kept.append([threshold, value, original])
+        self._backstop = kept
 
     # -- E1: before every prefill chunk ---------------------------------
     def plan(
@@ -477,26 +589,25 @@ class MemoryGuard:
             actions.append(f"clear_cache footprint {_gb(before):.2f}->{_gb(fp):.2f}GB")
             ok, shape, transient, margin = fits(chunk, fp)
 
-        def evict(keep_newest: bool) -> None:
+        def evict(max_level: int) -> None:
             nonlocal fp, ok, shape, transient, margin
-            while not ok and probe.entry_count() > (1 if keep_newest else 0):
+            while not ok and probe.entry_count() > 0:
                 before = fp
-                if not probe.evict_one(keep_newest):
+                if not probe.evict_one(max_level):
                     break
                 probe.clear_cache()
                 self.counts["evictions"] += 1
                 fp = footprint()
                 actions.append(
-                    f"evict prefix entry (oldest) footprint "
+                    f"evict prefix entry (level<={max_level}) footprint "
                     f"{_gb(before):.2f}->{_gb(fp):.2f}GB"
                 )
                 ok, shape, transient, margin = fits(chunk, fp)
 
-        # (b) prefix entries yield oldest-first -- but the newest entry (the
-        # session's own next-turn prefix) is kept until halving the chunk
-        # has been tried: a smaller chunk costs some prefill throughput,
-        # losing that entry costs the next turn a full re-prefill.
-        evict(keep_newest=True)
+        # (b) prefix entries no live session needs, then the entries a running
+        # request already fetched (duplicated in its live cache). The entry
+        # the next turn will fetch is not among them.
+        evict(EVICT_REDUNDANT)
         # (c) halve the chunk down to the floor. Every chunk of a long
         # prefill under pressure re-derives the same halving from the
         # configured size; it is logged and counted only when the chunk
@@ -516,8 +627,19 @@ class MemoryGuard:
         if halvings and chunk != self.last_chunk:
             actions.extend(halvings)
             self.counts["chunk_halvings"] += len(halvings)
-        # (b') the last entry goes too before anyone is refused.
-        evict(keep_newest=False)
+        # (b') entries a live session still needs go before anyone is refused.
+        evict(EVICT_NEEDED)
+        if not ok and self.backstop_extra(shape):
+            # Only a decaying E5 margin stands in the way at the floor: the
+            # structural projection fits, so dispatch (a repeat OOM aborts
+            # that request as before; the margin is never a reason to refuse).
+            t_plain, m_plain = self.need(shape, ceiling, backstop=False)
+            if fp + t_plain + m_plain <= ceiling:
+                ok = True
+                actions.append(
+                    "dispatch at the floor: only the decaying backstop margin "
+                    f"({_gb(self.backstop_extra(shape)):.2f}GB) exceeds the ceiling"
+                )
 
         plan = GuardPlan(
             chunk=chunk,
@@ -533,13 +655,14 @@ class MemoryGuard:
             # (d) refuse BEFORE allocating: the row with the longest context.
             active_rows = [r for r in rows if r.segment > 0]
             if active_rows:
+                # The scheduler decides: defer (fits once the others finish)
+                # or refuse (cannot fit even alone).
                 victim = max(active_rows, key=lambda r: r.offset + r.segment)
                 plan.refuse = victim
                 plan.needed = fp + transient + margin
-                self.counts["refusals"] += 1
                 actions.append(
-                    f"REFUSE request {victim.request_id[:12]} prompt="
-                    f"{victim.prompt_tokens} needs {_gb(plan.needed):.2f}GB "
+                    f"cannot dispatch request {victim.request_id[:12]} prompt="
+                    f"{victim.prompt_tokens}: needs {_gb(plan.needed):.2f}GB "
                     f"> ceiling {_gb(ceiling):.2f}GB at floor chunk {chunk}"
                 )
         for line in actions:
@@ -565,30 +688,35 @@ class MemoryGuard:
         *,
         live_beyond_base: int = 0,
         source: str = "step",
+        fit: bool = True,
     ) -> bool:
         """Feed one measured dispatch back. Returns True on a model change."""
         if shape.batch <= 0:
             return False
         projected = self.model.project(shape)
-        changed = self.model.observe(shape, transient)
-        footprint = max(0, int(live_beyond_base)) + max(0, int(transient))
-        if footprint > self.worst_step_footprint:
-            self.worst_step_footprint = footprint
-            changed = True
+        a_before = self.model.attention_bytes_per_unit
+        changed = self.model.observe(shape, transient, fit=fit)
+        self.last_step_footprint = max(0, int(live_beyond_base)) + max(
+            0, int(transient)
+        )
+        self.note_dispatch_ok(shape)
         if changed:
             self.counts["calibrations"] += 1
-            logger.info(
-                "[memory_guard] calibrate (%s) shape=%dx%dx%d measured=%.2fGB "
-                "projected_before=%.2fGB a=%.2fB/unit worst_step=%.2fGB",
-                source,
-                shape.batch,
-                shape.chunk,
-                shape.context,
-                _gb(transient),
-                _gb(projected),
-                self.model.attention_bytes_per_unit,
-                _gb(self.worst_step_footprint),
-            )
+            # One line when the attention coefficient moves; residual-window
+            # moves are frequent and visible in /v1/status.
+            if self.model.attention_bytes_per_unit != a_before:
+                logger.info(
+                    "[memory_guard] calibrate (%s) shape=%dx%dx%d measured=%.2fGB "
+                    "projected_before=%.2fGB a=%.2f->%.2fB/unit",
+                    source,
+                    shape.batch,
+                    shape.chunk,
+                    shape.context,
+                    _gb(transient),
+                    _gb(projected),
+                    a_before,
+                    self.model.attention_bytes_per_unit,
+                )
         return changed
 
     # -- honest context / admission -------------------------------------
@@ -605,7 +733,7 @@ class MemoryGuard:
         step peak plus margin."""
         chunk = min(self.floor_tokens, max(1, context))
         shape = StepShape(1, chunk, max(1, context))
-        transient, margin = self.need(shape, ceiling)
+        transient, margin = self.need(shape, ceiling, backstop=False)
         return int(base) + int(kv_footprint(context)) + transient + margin
 
     def max_context(
@@ -644,16 +772,33 @@ class MemoryGuard:
         return lo
 
     # -- E2/E3 ----------------------------------------------------------
-    def derived_headroom(self, *, ceiling: int, base: int) -> int:
-        """Bytes left beside the idle base, the worst dispatch seen and the
-        margin. Both the prefix budget and the allocator cache live here."""
-        worst = self.worst_step_footprint
-        return int(ceiling - base - worst - self.margin(worst, ceiling))
+    @staticmethod
+    def idle_room(*, ceiling: int, base: int, fraction: float) -> int:
+        """Bytes the prefix entries (and the allocator cache) may hold while
+        the engine is IDLE: ``fraction x ceiling - idle base``. ``fraction``
+        is the pressure evictor's own trigger (0.9), so an idle engine never
+        sits above it and nothing is evicted between turns. Live KV is NOT
+        charged here: during a turn the guard makes room on demand (E1 evicts
+        the entry the turn was fetched from, then halves the chunk)."""
+        return int(fraction * ceiling - base)
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "enabled": True,
             "ceiling_mb": round(self.last_ceiling / 2**20, 1),
+            "coefficients": {
+                "source": "calibrated" if self.model.calibrated else "prior",
+                "observations": self.model.observations,
+                "attention_bytes_per_chunk_context": round(
+                    self.model.attention_bytes_per_unit, 3
+                ),
+                "kv_copy_bytes_per_context": round(
+                    self.model.prior.kv_copy_bytes_per_context, 1
+                ),
+                "linear_bytes_by_tokens": {
+                    str(t): int(r) for t, r in self.model._envelope
+                },
+            },
             "margin_mb": round(self.last_margin / 2**20, 1),
             "margin_ratios": {
                 "ceiling": MARGIN_CEILING_RATIO,
@@ -662,7 +807,11 @@ class MemoryGuard:
             "floor_chunk_tokens": self.floor_tokens,
             "last_chunk_tokens": self.last_chunk,
             "peak_model": self.model.snapshot(),
-            "worst_step_footprint_mb": round(self.worst_step_footprint / 2**20, 1),
+            "last_step_footprint_mb": round(self.last_step_footprint / 2**20, 1),
+            "backstop_margins": [
+                {"from_context": int(t), "extra_mb": round(v / 2**20, 1)}
+                for t, v, _o in self._backstop
+            ],
             "effective_prefix_budget_mb": (
                 None
                 if self.effective_prefix_budget is None
