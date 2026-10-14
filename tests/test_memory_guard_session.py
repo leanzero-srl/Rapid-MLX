@@ -495,8 +495,26 @@ def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
     outs = _drive(scheduler, [_request("t0", first)])["t0"]
     assert not outs[-1].error
     guard = scheduler._memguard()
-    slope_before = guard.model.attention_bytes_per_unit
     window_before = scheduler.memory_guard_max_context(16384)
+    # What the model is fed, and the OOM's lower bound. (The slope itself
+    # may still be converging -- one bounded 1.25x step per observation --
+    # so comparing it before/after was flaky; what matters is that the
+    # lower bound never becomes an observation.)
+    fed: list[int] = []
+    bounds: list[int] = []
+    real_observe = guard.model.observe
+    real_backstop = guard.record_backstop
+
+    def observe(shape, transient, **kw):
+        fed.append(int(transient))
+        return real_observe(shape, transient, **kw)
+
+    def record_backstop(shape, lower_bound):
+        bounds.append(int(lower_bound))
+        return real_backstop(shape, lower_bound)
+
+    monkeypatch.setattr(guard.model, "observe", observe)
+    monkeypatch.setattr(guard, "record_backstop", record_backstop)
 
     second = first + _tokens(outs) + _new_tokens(1, 300)
     device.fail_next = 1
@@ -506,7 +524,8 @@ def test_backstop_requeue_keeps_the_entry_it_will_fetch_and_the_slope(
     assert outs[-1].finished and not outs[-1].error, outs[-1].error
     assert len(second) - outs[-1].cached_tokens <= 300 + 8
     assert guard.counts["backstop_fired"] == 1
-    assert guard.model.attention_bytes_per_unit == slope_before
+    assert bounds and fed
+    assert max(fed) < min(bounds), (max(fed), bounds)
     assert scheduler.memory_guard_max_context(16384) >= 0.9 * window_before
 
 
