@@ -7573,10 +7573,15 @@ class Scheduler:
         if plan is None or plan.shape.batch <= 0:
             return None
         try:
-            # Carry the process-lifetime peak across the per-chunk reset so
-            # ``metal_peak_memory_gb`` in the stats stays "since start".
+            # Carry the process-lifetime peak (and the step's own window)
+            # across the per-chunk reset so ``metal_peak_memory_gb`` stays
+            # "since start" and the step peak keeps its admission part.
+            before = int(mx.get_peak_memory())
             self._memguard_process_peak = max(
-                getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
+                getattr(self, "_memguard_process_peak", 0), before
+            )
+            self._memguard_step_acc = max(
+                int(getattr(self, "_memguard_step_acc", 0) or 0), before
             )
             mx.reset_peak_memory()
             gen = getattr(self.batch_generator, "_generation_batch", None)
@@ -7592,17 +7597,27 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             return None
 
-    def _memguard_step_peak_reset(self, plan: GuardPlan | None = None) -> None:
-        """Every dispatched step (prefill, decode, mixed) is measured: the
-        allocator's peak since this reset is the step's real peak. The step's
-        kind, shape and PLANNED bytes are kept so a step over the ceiling is
-        named (one WARNING line) instead of only counted."""
+    def _memguard_step_open(self) -> None:
+        """A step's peak window: from the start of step() (admission, E1,
+        the dispatch, its stores and responses) to the start of the next one
+        (or the engine going idle). The previous step is recorded here."""
         if getattr(self, "_memory_guard", None) is None:
             return
-        # The previous step ends HERE (its end-of-turn store copies, prompt
-        # snapshot extractions and responses happen after next() returned):
-        # its peak is read now, so it covers the whole step.
         self._memguard_step_peak_record()
+        try:
+            self._memguard_process_peak = max(
+                getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
+            )
+            mx.reset_peak_memory()
+        except Exception:  # noqa: BLE001
+            pass
+        self._memguard_step_acc = 0
+
+    def _memguard_step_describe(self, plan: GuardPlan | None = None) -> None:
+        """A dispatched step's kind, shape and PLANNED bytes, so a step over
+        the ceiling is named (one WARNING line) instead of only counted."""
+        if getattr(self, "_memory_guard", None) is None:
+            return
         try:
             bg = self.batch_generator
             prompt_rows = len(getattr(bg, "_prompt_batch", ()) or ()) + len(
@@ -7628,13 +7643,6 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             self._memguard_step_info = None
         self._memguard_step_pending = True
-        try:
-            self._memguard_process_peak = max(
-                getattr(self, "_memguard_process_peak", 0), int(mx.get_peak_memory())
-            )
-            mx.reset_peak_memory()
-        except Exception:  # noqa: BLE001
-            return
 
     def _memguard_step_peak_record(self) -> None:
         """``/v1/status`` memory_guard.last_step_peak_mb / max_step_peak_mb:
@@ -7648,7 +7656,11 @@ class Scheduler:
         self._memguard_step_pending = False
         try:
             ceiling = self._memguard_ceiling()
-            peak = int(mx.get_peak_memory())
+            peak = max(
+                int(getattr(self, "_memguard_step_acc", 0) or 0),
+                int(mx.get_peak_memory()),
+            )
+            self._memguard_step_acc = 0
             over_before = guard.steps_over_ceiling
             guard.record_step_peak(peak, ceiling)
             if guard.steps_over_ceiling > over_before:
@@ -7721,13 +7733,17 @@ class Scheduler:
                 admit_bytes=plan.admit_bytes,
             )
 
-    def _memguard_idle_base(self) -> int:
+    def _memguard_idle_base(self, *, sample: bool = False) -> int:
         """Weights + fixed runtime state: Metal active with nothing running,
-        less the (evictable) prefix-cache ledger. Re-measured whenever the
-        scheduler is idle; while busy the last idle measurement stands."""
+        less the (evictable) prefix-cache ledger. SAMPLED only when the
+        engine goes idle (``sample=True``, the step thread) -- or the first
+        time it is asked; every other reader gets the window's minimum.
+        Review 4: readers (``/v1/status`` every 2 s, ``/v1/models``) fed the
+        window, so it spanned ~32 s of one idle moment and KV a finished
+        response still held raised the base by its full size."""
         running = getattr(self, "running", None)
         stored = int(getattr(self, "_memguard_idle_base_bytes", 0) or 0)
-        if running and stored > 0:
+        if stored > 0 and (running or not sample):
             return stored
         active = self._current_metal_active_bytes()
         prefix = self._cache_self_pressure_current_bytes()
@@ -7839,7 +7855,7 @@ class Scheduler:
         # The last step of the turn (and its store) ends with the batch.
         self._memguard_step_peak_record()
         self._memguard_yield_to_system()
-        base = self._memguard_idle_base()
+        base = self._memguard_idle_base(sample=True)
         applied = int(getattr(self, "_memguard_budget_base", 0) or 0)
         if applied <= 0 or abs(base - applied) > REAPPLY_RATIO * max(1, applied):
             self._memguard_apply_budgets()
@@ -9854,7 +9870,7 @@ class Scheduler:
         if not self.running:
             try:
                 if self._memguard() is not None:
-                    self._memguard_idle_base()
+                    self._memguard_idle_base(sample=True)
             except Exception:  # noqa: BLE001
                 logger.debug("[memory_guard] idle base probe failed", exc_info=True)
         self._enforce_metal_cap_at_admission(request)
@@ -12642,6 +12658,9 @@ class Scheduler:
         guard_plan: GuardPlan | None = None
         guard_begin: tuple[int, int, int] | None = None
         guard_refusals: list[RequestOutput] = []
+        # The step's peak window opens BEFORE admission (scheduling, E1):
+        # an admission copy belongs to this step, not the previous one.
+        self._memguard_step_open()
         for attempt in range(max_retries + 1):
             try:
                 guard_plan = None
@@ -12683,7 +12702,7 @@ class Scheduler:
                     # A refusal can empty the batch; then nothing dispatches.
                     dispatch = bool(self.running)
                     if dispatch:
-                        self._memguard_step_peak_reset(guard_plan)
+                        self._memguard_step_describe(guard_plan)
                         guard_begin = self._memguard_measure_begin(guard_plan)
                     srpf_step = self._srpf_step_begin()
                     if not dispatch:

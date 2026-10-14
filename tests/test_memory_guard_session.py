@@ -1043,6 +1043,59 @@ def test_the_main_session_hits_after_its_subagent_runs_alone(
     assert scheduler._memguard().steps_over_ceiling == 0
 
 
+def test_status_polls_do_not_move_the_idle_base(llama, monkeypatch):
+    """Review 4 (C4): the idle base window was fed by every READER --
+    /v1/status (goose polls it every 2 s) and /v1/models -- so 16 polls of
+    one idle moment, with a finished response still holding 50 MB, raised
+    the base by the full 50 MB. Only the engine going idle samples it."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _scheduler(llama, cache_memory_mb=4000)
+    device.install(monkeypatch, scheduler)
+    assert scheduler.device_memory_admission(600) is None
+    base = scheduler._memguard_idle_base()
+    held = mx.zeros((50 * MB // 4,), dtype=mx.float32)
+    mx.eval(held)
+    _drive(scheduler, [_request("t", _new_tokens(0, 600))])
+    assert not scheduler.running
+    for _ in range(16):
+        scheduler.get_stats()
+    assert scheduler._memguard_idle_base() <= base + MB
+    del held
+
+
+def test_an_admission_spike_counts_in_its_own_step_peak(llama, monkeypatch):
+    """Review 4 (C5): the step peak window was reset AFTER scheduling (the
+    admission copy, E1's evictions): from idle, an allocation made while a
+    request was admitted fell into no step at all -- the reset discarded it
+    and /v1/status max_step_peak_mb never showed it. The window now opens
+    at the start of step(). Control: the same request with no spike stays
+    well below it."""
+    spikes = []
+    for spike in (True, False):
+        device = _Device(physical=GABEE_PHYSICAL)
+        scheduler = _scheduler(llama, cache_memory_mb=4000)
+        device.install(monkeypatch, scheduler)
+        real = scheduler._schedule_waiting
+
+        once = [spike]
+
+        def admit(*args, _real=real, _once=once, _s=scheduler, **kwargs):
+            if _once[0] and _s.waiting:  # the admission from idle
+                _once[0] = False
+                held = mx.zeros((80 * MB // 4,), dtype=mx.float32)
+                mx.eval(held)
+                del held
+            return _real(*args, **kwargs)
+
+        scheduler._schedule_waiting = admit
+        _drive(scheduler, [_request("t", _new_tokens(0, 600))])
+        peak = scheduler.get_stats()["memory_guard"]["max_step_peak_mb"] * 2**20
+        spikes.append(peak)
+    with_spike, without = spikes
+    assert with_spike >= BASE + 0.9 * 80 * MB, (with_spike, without)
+    assert without < BASE + 0.5 * 80 * MB, (with_spike, without)
+
+
 def test_machine_pressure_keeps_the_waiting_main_session_head(llama, monkeypatch):
     """Review 4 (C2): at WARN the cache keeps what live / queued requests
     need and the most recently used session's head -- also while a request
