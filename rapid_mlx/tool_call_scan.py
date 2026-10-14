@@ -33,7 +33,9 @@ the same defect could be fixed in ``tool_calling.py`` and still be live in
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
@@ -42,7 +44,30 @@ __all__ = [
     "split_marked_calls",
     "split_marked_parameters",
     "trim_wrapping_newlines",
+    "warn_undeclared_call",
 ]
+
+_logger = logging.getLogger(__name__)
+
+
+def warn_undeclared_call(name: str, declared: Iterable[str] | None, where: str) -> None:
+    """Say, loudly, that a call to a tool the request never offered is passing.
+
+    A well-formed top-level call to an undeclared name is the MODEL's mistake,
+    and the client is the party that has to answer it ("tool not found") so
+    the model can recover. Folding it into text instead ends the agent turn
+    with a meaningless final answer and leaves no trace of why. Passing it
+    on is right; passing it on silently is not, so every such call is logged
+    once, at the point it is emitted, under one greppable tag.
+    """
+    _logger.warning(
+        "[TOOL-CALL-UNDECLARED] %s: the model called %r, which the request did "
+        "not offer (declared: %s); passing it to the client as a tool call so "
+        "the client can answer it with a tool error",
+        where,
+        name,
+        sorted(declared or ()),
+    )
 
 
 def trim_wrapping_newlines(value: str) -> str:
@@ -189,6 +214,8 @@ def split_marked_calls(
     closer: str,
     outer: str | None = None,
     valid_names: frozenset[str] | set[str] | None = None,
+    *,
+    surface_undeclared: bool = False,
 ) -> list[tuple[str, str, int, int]]:
     """``(name, body, span_start, span_end)`` for each call in ``text``.
 
@@ -198,9 +225,96 @@ def split_marked_calls(
     invocation from surrounding prose in one step — a second, differently
     truncating regex pass over the same text is how tag fragments leak into
     user-visible content.
+
+    ``surface_undeclared`` (only meaningful with ``valid_names``) also
+    returns well-formed calls to names the request did NOT declare, provided
+    they sit OUTSIDE every declared call's span. Declared names are resolved
+    first and exactly as without the flag, so they still decide nesting: an
+    undeclared opener inside a declared call's value stays part of that value
+    and never becomes a sibling. What changes is only the top level — a call
+    the model really made to a tool it was not offered reaches the client,
+    which answers it with "tool not found", instead of being folded into the
+    answer text where it silently ends the agent's turn. The result is in
+    text order; callers can tell the undeclared entries by their name.
+    """
+    resolved = _split_declared_calls(text, opener, closer, outer, valid_names)
+    found = [call for call, _region in resolved if call is not None]
+    if not surface_undeclared or valid_names is None:
+        return found
+    regions = [region for _call, region in resolved]
+    found.extend(
+        _split_undeclared_calls(text, opener, closer, outer, valid_names, regions)
+    )
+    found.sort(key=lambda call: call[2])
+    return found
+
+
+def _split_undeclared_calls(
+    text: str,
+    opener: str,
+    closer: str,
+    outer: str | None,
+    valid_names: frozenset[str] | set[str],
+    regions: list[tuple[int, int]],
+) -> list[tuple[str, str, int, int]]:
+    """Well-formed calls to undeclared names that no declared call encloses.
+
+    ``regions`` are the byte ranges the declared pass assigned to declared
+    openers (their whole span, or up to their next sibling when they never
+    closed). An undeclared opener inside one is payload of that call, full
+    stop. Outside them, the position-only rules apply among the undeclared
+    openers, bounded by the next declared region so an undeclared call can
+    never absorb a declared one.
+    """
+
+    def _enclosed(pos: int) -> bool:
+        return any(start <= pos < end for start, end in regions)
+
+    free = [
+        match
+        for match in re.finditer(opener, text, re.DOTALL)
+        if match.group(1).strip() not in valid_names and not _enclosed(match.start())
+    ]
+    calls: list[tuple[str, str, int, int]] = []
+    k = 0
+    while k < len(free):
+        start = free[k].start()
+        limit = min((s for s, _e in regions if s > start), default=len(text))
+        bounded = text[:limit]
+        group = [match for match in free[k:] if match.start() < limit]
+        segmented = segment_by_next_opener(bounded, group, 0, closer)
+        sibling = _next_sibling(bounded, group, 0, closer)
+        if segmented is not None:
+            body, span_end = segmented
+            emit = True
+            if outer:
+                tail_limit = group[sibling].start() if sibling < len(group) else limit
+                tail = re.match(r"\s*" + re.escape(outer), text[span_end:tail_limit])
+                if tail:
+                    span_end += tail.end()
+                else:
+                    emit = False
+            if emit:
+                calls.append((group[0].group(1).strip(), body, start, span_end))
+        k += sibling if sibling > 0 else 1
+    return calls
+
+
+def _split_declared_calls(
+    text: str,
+    opener: str,
+    closer: str,
+    outer: str | None,
+    valid_names: frozenset[str] | set[str] | None,
+) -> list[tuple[tuple[str, str, int, int] | None, tuple[int, int]]]:
+    """The declared-name pass: ``(call or None, region)`` per opener it owns.
+
+    ``call`` is ``None`` for an opener that was resolved but not emitted (no
+    closer, or a missing required ``outer``); its region still encloses
+    whatever follows it, so nothing inside can surface as an undeclared call.
     """
     openers = list(re.finditer(opener, text, re.DOTALL))
-    calls: list[tuple[str, str, int, int]] = []
+    calls: list[tuple[tuple[str, str, int, int] | None, tuple[int, int]]] = []
     i = 0
     while i < len(openers):
         # NO name deduplication here. That rule belongs to parameters, where
@@ -209,26 +323,29 @@ def split_marked_calls(
         # turn is ordinary agent behaviour — read_file /a then read_file /b —
         # and suppressing the second opener merges both into one body and
         # silently drops a call the model asked for.
-        # The gate applies to the opener being EMITTED, not only to the
-        # search for the next one. Filtering siblings alone left the hole
-        # wide open at index 0: a standalone ``<function=delete_everything>``
-        # was still returned as a call, so the authorisation check could be
-        # skipped entirely by putting the undeclared opener first.
+        # This pass resolves DECLARED openers only — the opener being emitted
+        # as well as the search for the next sibling. Undeclared openers are
+        # never siblings here, so marker text inside a declared value cannot
+        # split it. Whether a top-level undeclared call is returned at all is
+        # decided afterwards, outside every region this pass assigns
+        # (``surface_undeclared``); without that flag it is not returned.
         if valid_names is not None and openers[i].group(1).strip() not in valid_names:
             i += 1
             continue
         segmented = segment_by_next_opener(text, openers, i, closer, valid_names)
         sibling = _next_sibling(text, openers, i, closer, valid_names)
+        limit = openers[sibling].start() if sibling < len(openers) else len(text)
+        call: tuple[str, str, int, int] | None = None
+        region_end = limit
         if segmented is not None:
             body, span_end = segmented
+            region_end = span_end
             emit = True
             if outer:
-                limit = (
-                    openers[sibling].start() if sibling < len(openers) else len(text)
-                )
                 tail = re.match(r"\s*" + re.escape(outer), text[span_end:limit])
                 if tail:
                     span_end += tail.end()
+                    region_end = span_end
                 else:
                     # ``outer`` is REQUIRED when requested, not opportunistic.
                     # The regex this replaced matched only with the enclosing
@@ -238,9 +355,8 @@ def split_marked_calls(
                     # documents that case) simply do not pass ``outer``.
                     emit = False
             if emit:
-                calls.append(
-                    (openers[i].group(1).strip(), body, openers[i].start(), span_end)
-                )
+                call = (openers[i].group(1).strip(), body, openers[i].start(), span_end)
+        calls.append((call, (openers[i].start(), region_end)))
         # See split_marked_parameters: skip openers swallowed by this value.
         i = sibling if sibling > i else i + 1
     return calls
