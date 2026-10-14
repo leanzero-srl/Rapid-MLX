@@ -1049,60 +1049,67 @@ def test_refused_block_before_valid_call_in_one_delta_is_not_swallowed():
     assert f"<function={_NAME}>" not in content, content
 
 
+# With tools declared, nemotron streams the first call's HEADER and reads
+# everything after it once, from the complete output, at stream end
+# (``finalize_legacy_raw_stream`` — review of 26452cbe3, item 5: whether a raw
+# value closed, ran on, or holds another call's markup is only known from the
+# bytes after it). The three tests below drove the old close-time emission;
+# they now assert the same properties across that end-of-stream read.
+
+
+def _nemotron_turn(deltas: list[str]) -> tuple[list[dict], str]:
+    """Stream ``deltas`` through nemotron, then its end-of-stream read."""
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    parser.reset()
+    calls: dict[int, dict] = {}
+    content, previous = "", ""
+
+    def take(out):
+        nonlocal content
+        content += (out or {}).get("content") or ""
+        for tc in (out or {}).get("tool_calls") or []:
+            call = calls.setdefault(tc["index"], {"name": "", "arguments": ""})
+            fn = tc.get("function") or {}
+            call["name"] += fn.get("name") or ""
+            call["arguments"] += fn.get("arguments") or ""
+
+    for delta in deltas:
+        current = previous + delta
+        take(
+            parser.extract_tool_calls_streaming(
+                previous, current, delta, request=_REQUEST
+            )
+        )
+        previous = current
+    take(parser.finalize_legacy_raw_stream(previous, request=_REQUEST))
+    return [calls[i] for i in sorted(calls)], content
+
+
 def test_plain_less_than_after_call_is_not_mistaken_for_partial_markup():
     """Ordinary same-delta prose containing ``<`` must survive stream end."""
-    parser = ToolParserManager.get_tool_parser("nemotron")(None)
     valid = _render_xml_body(_NAME, _KEY, "ok")
-    text = valid + " Result: 2 < 3"
-
-    delta = parser.extract_tool_calls_streaming("", text, text, request=_REQUEST)
-
-    calls = (delta or {}).get("tool_calls") or []
-    assert [call["function"]["name"] for call in calls] == [_NAME]
-    assert (delta or {}).get("content") == " Result: 2 < 3"
+    calls, content = _nemotron_turn([valid + " Result: 2 < 3"])
+    assert [call["name"] for call in calls] == [_NAME]
+    assert json.loads(calls[0]["arguments"]) == {_KEY: "ok"}
+    assert content == " Result: 2 < 3"
 
 
 def test_disambiguated_partial_opener_releases_every_withheld_byte():
     """A marker-like suffix that becomes prose must be released in full."""
-    parser = ToolParserManager.get_tool_parser("nemotron")(None)
     valid = _render_xml_body(_NAME, _KEY, "ok")
-    parser.extract_tool_calls_streaming("", valid, valid, request=_REQUEST)
-
-    previous = valid
-    emitted = ""
-    for char in "<funx":
-        current = previous + char
-        delta = parser.extract_tool_calls_streaming(
-            previous, current, char, request=_REQUEST
-        )
-        previous = current
-        emitted += (delta or {}).get("content") or ""
-
-    assert emitted == "<funx"
+    calls, content = _nemotron_turn([valid, *"<funx"])
+    assert [call["name"] for call in calls] == [_NAME]
+    assert content == "<funx"
 
 
 def test_wrapper_close_is_accounted_before_following_prose():
     """A decorative close must not leak after an already-emitted call."""
-    parser = ToolParserManager.get_tool_parser("nemotron")(None)
     function = (
         f"<tool_call><function={_NAME}><parameter={_KEY}>ok</parameter></function>"
     )
-    first = parser.extract_tool_calls_streaming(
-        "", function, function, request=_REQUEST
-    )
-    assert len((first or {}).get("tool_calls") or []) == 1
-
-    wrapped = function + "</tool_call>"
-    close = parser.extract_tool_calls_streaming(
-        function, wrapped, "</tool_call>", request=_REQUEST
-    )
-    assert not (close or {}).get("content")
-
-    complete = wrapped + " after"
-    prose = parser.extract_tool_calls_streaming(
-        wrapped, complete, " after", request=_REQUEST
-    )
-    assert (prose or {}).get("content") == " after"
+    calls, content = _nemotron_turn([function, "</tool_call>", " after"])
+    assert [call["name"] for call in calls] == [_NAME]
+    assert content == " after"
 
 
 def test_gating_is_off_when_the_request_declares_no_tools():
