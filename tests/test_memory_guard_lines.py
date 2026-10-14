@@ -68,8 +68,10 @@ def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
     s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
     frame = _hybrid_tokens(1, 300)
     main = frame + _hybrid_tokens(2, 1500)
+    # main's first request carries one message; goose's summary helper is
+    # a system prompt (the transcript) and ONE user message.
     _c, out = _hybrid_run(
-        s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, **_MAIN
+        s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, multi=False, **_MAIN
     )
     summary = _hybrid_tokens(7, 200) + main[300:] + out + _hybrid_tokens(8, 50)
     _hybrid_run(
@@ -80,6 +82,7 @@ def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
         turn_start=True,
         session="main",
         frame=200,
+        multi=False,
     )
     compacted = frame + _hybrid_tokens(9, 400)
     for t in range(2):
@@ -134,7 +137,11 @@ def test_a_finished_chat_goes_before_the_new_chats_chunk_shrinks(
     else:
         a_kw, b_kw = {"first_end": 330}, {"first_end": 330}
     old = _new_tokens(0, 320) + [3 + (i * 5) % 97 for i in range(5680)]
-    _drive(scheduler, [_request("old", old, 4, turn_start=True, **a_kw)])
+    # Chat A's turn ended with a reply (the chat route reports "stop").
+    _drive(
+        scheduler,
+        [_request("old", old, 4, turn_start=True, outcome=["stop"], **a_kw)],
+    )
     mac = scheduler.memory_aware_cache
     guard = scheduler._memguard()
     held_while_reduced = 0
@@ -167,25 +174,37 @@ def test_a_finished_chat_goes_before_the_new_chats_chunk_shrinks(
     assert all(c > 0 for c in turns[1:]), turns
 
 
-def test_main_waiting_on_a_subagent_stays_protected(cpu):
-    """Control for item 1: the subagent is a YOUNGER session whose task is
-    its first request (a user message) followed by its tool loop; it never
-    starts a second user turn, so main's head stays NEEDED throughout."""
+@pytest.mark.parametrize("main_outcome", [["tool_calls"], ["length"], None])
+def test_main_waiting_on_a_subagent_stays_protected(cpu, main_outcome):
+    """Review 7, item 1 (HIGH): main is mid-turn (its last completion is a
+    tool call -- the subagent --, a length cut, or not reported) while a
+    YOUNGER session runs requests that end in a user message: a subagent's
+    task, then mid-task trailing user messages (goose: a tool image becomes
+    a trailing user message; FINAL_OUTPUT / LENGTH_CUT continuations, goal
+    nudges, steers). On 5ba8a8870 the second such request abandoned main
+    and an eviction to EVICT_HEAD took every main entry. Main's head stays
+    NEEDED, and duress up to EVICT_HEAD leaves it."""
     s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
     first = _hybrid_tokens(1, 1500)
     prompt, _ls, _last = _hybrid_tool_loop(s, first, "main")
-    _c, out = _hybrid_run(s, "main-final", prompt, len(prompt) - 3, **_MAIN)
+    _c, out = _hybrid_run(
+        s, "main-final", prompt, len(prompt) - 3, outcome=main_outcome, **_MAIN
+    )
     head = tuple(prompt + out)
     sub = {"session": "sub", "frame": 300}
     sp = _hybrid_tokens(300, 600) + _GEN_PROMPT
     b = len(sp) - 3
     for j in range(5):
-        _c, o = _hybrid_run(s, f"sub{j}", sp, b, turn_start=j == 0, **sub)
+        # every request but the tool rounds ends in a user message
+        _c, o = _hybrid_run(s, f"sub{j}", sp, b, turn_start=j != 1, **sub)
         nxt = sp + o + [904] + _hybrid_tokens(400 + j, 300)
         b = len(nxt)
         sp = nxt + _GEN_PROMPT
         assert _levels(s)[head] == EVICT_NEEDED, j
     assert ("session", "main") not in {o[0] for o in s._memguard_outlived_lines()}
+    while s._memguard_evict_ordered(EVICT_HEAD, reason="E1"):
+        pass
+    assert head in s.memory_aware_cache._entries
 
 
 # -- item 2: the hybrid entry-count bound, NO memory pressure -------------

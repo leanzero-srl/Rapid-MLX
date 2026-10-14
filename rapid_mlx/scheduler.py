@@ -6636,36 +6636,47 @@ class Scheduler:
         return {"owner": self._memguard_line(request)}
 
     def _memguard_line_activity(self, request: Any) -> None:
-        """A line's first and latest activity (admission, store), in one
-        monotonic sequence: what ``_memguard_outlived_lines`` reads. Tracked
-        per (line, frame): a helper call of the session (its own frame) is
-        outlived like a subagent once the main frame runs again (review 6,
-        item 5: each helper head stayed NEEDED for the whole session)."""
-        line = self._memguard_line(request)
+        """A (line, frame)'s first and latest activity (admission, store), in
+        one monotonic sequence, plus what ``_memguard_outlived_lines`` reads
+        from the request itself: its latest user-turn activity, the hint of
+        its latest request (whose ``outcome`` the chat route fills with the
+        finish_reason), and whether the frame ever carried more than one
+        message (a conversation, not a one-message helper call)."""
+        owner = self._memguard_line(request)
         seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
         self._memguard_seq = seq
         lines = self.__dict__.setdefault("_memguard_lines", {})
-        rid = getattr(request, "request_id", None)
-        # [first, latest, the line's first request, its latest NEW user
-        # turn]: a request that ends in a user message and is not the line's
-        # first request (a subagent's or a helper's task is its first).
-        record = lines.get(line)
-        if record is None:
-            lines[line] = [seq, seq, rid, 0]
-            return
-        record[1] = seq
         hint = getattr(request, "session_hint", None)
-        if getattr(hint, "turn_start", False) and rid != record[2]:
-            record[3] = seq
+        # [first, latest, latest user-turn activity, latest hint, conversation]
+        record = lines.get(owner)
+        if record is None:
+            record = lines[owner] = [seq, seq, 0, hint, False]
+        record[1] = seq
+        record[3] = hint
+        if getattr(hint, "turn_start", False):
+            record[2] = seq
+        if hint is None or getattr(hint, "multi", True):
+            record[4] = True
 
     def _memguard_outlived_lines(self) -> set[Any]:
-        """``(line, frame)`` pairs an OLDER one outlived (it started before
-        this one and ran again after this one's latest activity), or a
-        YOUNGER conversation left behind (below). goose's shape: the main
-        session waits while a subagent (its own session) runs, then the main
-        session's next turn -- the subagent is finished; likewise a helper
-        call the main turn followed. A line that runs again stops being
-        outlived. Lines with no entry and no request are forgotten."""
+        """``(line, frame)`` pairs whose heads are abandoned (EVICT_HEAD: they
+        go under duress before the chunk is reduced, never without it):
+
+        * another (line, frame) that started BEFORE this one ran again after
+          this one's latest activity -- goose: the main session waits while
+          a subagent runs, then its next request: the subagent is finished;
+          likewise a helper call the main turn followed;
+        * this conversation's turn ENDED (every frame's latest completion
+          finished with a reply, ``finish_reason == "stop"``, as the chat
+          route reports it) and a YOUNGER conversation then started a user
+          turn -- the user left chat A for chat B, or the next benchmark
+          task (review 6, item 1). A conversation that is mid-turn (a tool
+          call pending -- a subagent running for it --, a length cut, or no
+          outcome reported) is never abandoned this way: a younger session's
+          trailing user message (a tool image, a continuation nudge) is not
+          a sign of anything (review 7, item 1);
+        A line that runs again stops being outlived. Lines with no entry and
+        no request are forgotten."""
         lines = self.__dict__.get("_memguard_lines")
         if not lines:
             return set()
@@ -6682,27 +6693,38 @@ class Scheduler:
             kept.pop(owner, None)
             if not any(o[0] == owner[0] for o in lines):
                 self.__dict__.get("_memguard_rewriting_lines", set()).discard(owner[0])
+        # Per conversation: first and latest activity, latest user turn, and
+        # whether its turn ended (every frame's latest completion a reply).
+        sessions: dict[Any, list[Any]] = {}
+        for (line, _frame), (first, last, turn, hint, _conv) in lines.items():
+            outcome = getattr(hint, "outcome", None)
+            ended = bool(outcome) and outcome[0] == "stop"
+            agg = sessions.get(line)
+            if agg is None:
+                sessions[line] = [first, last, turn, ended]
+            else:
+                agg[0] = min(agg[0], first)
+                agg[1] = max(agg[1], last)
+                agg[2] = max(agg[2], turn)
+                agg[3] = agg[3] and ended
         outlived: set[Any] = set()
         latest_older = 0
-        for line, (first, last, *_r) in sorted(lines.items(), key=lambda kv: kv[1][0]):
+        for owner, (_first, last, *_r) in sorted(
+            lines.items(), key=lambda kv: kv[1][0]
+        ):
             if latest_older > last:
-                outlived.add(line)
+                outlived.add(owner)
             latest_older = max(latest_older, last)
-        # Review 6, item 1: a conversation is also abandoned once a YOUNGER
-        # conversation (another session, not a helper frame of its own) has
-        # started a NEW user turn after its last activity -- the user left
-        # chat A for chat B (or the next benchmark task). A subagent never
-        # starts a second user turn, so main stays protected while one runs;
-        # main running again (or its next user turn) revives it. Abandoned
-        # heads still go only under duress (before the chunk is reduced).
-        for line, (first, last, *_r) in lines.items():
-            if line in outlived:
+        gone: set[Any] = set()
+        for line, (first, last, _turn, ended) in sessions.items():
+            if not ended:
                 continue
             if any(
-                other[0] != line[0] and o_first > first and o_turn > last
-                for other, (o_first, _l, _rid, o_turn) in lines.items()
+                other != line and o_first > first and o_turn > last
+                for other, (o_first, _l, o_turn, _e) in sessions.items()
             ):
-                outlived.add(line)
+                gone.add(line)
+        outlived |= {owner for owner in lines if owner[0] in gone}
         return outlived
 
     def _memguard_entry_level(
