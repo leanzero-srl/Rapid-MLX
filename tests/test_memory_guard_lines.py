@@ -52,3 +52,32 @@ def test_a_helper_turn_keeps_mains_turn_boundary(cpu):
         s, "new-user", new_user, len(new_user) - 3, turn_start=True, **_MAIN
     )
     assert cached >= len(first), cached
+
+
+def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
+    """Item 5: goose's summary (compaction) helper runs under MAIN's session
+    id with its own frame and the whole conversation; main then continues
+    from the compacted history. On b06acd8ea lines were tracked per session,
+    so the helper's 3k head stayed NEEDED for the whole session. Main's own
+    newest head stays NEEDED (the control)."""
+    s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
+    frame = _hybrid_tokens(1, 300)
+    main = frame + _hybrid_tokens(2, 1500)
+    _c, out = _hybrid_run(s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, **_MAIN)
+    summary = _hybrid_tokens(7, 200) + main[300:] + out + _hybrid_tokens(8, 50)
+    _hybrid_run(
+        s, "summary", summary + _GEN_PROMPT, len(summary), turn_start=True,
+        session="main", frame=200,
+    )
+    compacted = frame + _hybrid_tokens(9, 400)
+    for t in range(2):
+        _c, out = _hybrid_run(
+            s, f"m{t + 1}", compacted + _GEN_PROMPT, len(compacted),
+            turn_start=True, **_MAIN,
+        )
+        compacted = compacted + _GEN_PROMPT + out + _hybrid_tokens(20 + t, 100)
+    levels = _levels(s)
+    helper = [lv for k, lv in levels.items() if k[:200] == tuple(summary[:200])]
+    mains = [lv for k, lv in levels.items() if k[:300] == tuple(frame) and len(k) > 700]
+    assert helper and max(helper) < EVICT_NEEDED, helper
+    assert EVICT_NEEDED in mains, mains

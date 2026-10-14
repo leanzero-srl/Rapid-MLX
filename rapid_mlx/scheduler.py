@@ -6631,8 +6631,11 @@ class Scheduler:
 
     def _memguard_line_activity(self, request: Any) -> None:
         """A line's first and latest activity (admission, store), in one
-        monotonic sequence: what ``_memguard_outlived_lines`` reads."""
-        line = self._memguard_line(request)[0]
+        monotonic sequence: what ``_memguard_outlived_lines`` reads. Tracked
+        per (line, frame): a helper call of the session (its own frame) is
+        outlived like a subagent once the main frame runs again (review 6,
+        item 5: each helper head stayed NEEDED for the whole session)."""
+        line = self._memguard_line(request)
         seq = int(getattr(self, "_memguard_seq", 0) or 0) + 1
         self._memguard_seq = seq
         lines = self.__dict__.setdefault("_memguard_lines", {})
@@ -6642,7 +6645,7 @@ class Scheduler:
             lines[line] = [seq, seq]
 
     def _memguard_outlived_lines(self) -> set[Any]:
-        """Lines an OLDER line outlived: it started before this one and ran
+        """``(line, frame)`` pairs an OLDER one outlived: it started before this one and ran
         again after this one's latest activity. goose's shape: the main
         session waits while a subagent (its own session) runs, then the main
         session's next turn -- the subagent is finished; likewise a helper
@@ -6653,17 +6656,19 @@ class Scheduler:
             return set()
         mac = getattr(self, "memory_aware_cache", None)
         entries = mac._entries if mac is not None else {}  # noqa: SLF001
-        present = {self._memguard_entry_line(e)[0] for e in entries.values()}
+        present = {self._memguard_entry_line(e) for e in entries.values()}
         for r in list(getattr(self, "running", {}).values()) + list(
             getattr(self, "waiting", ())
         ):
-            present.add(self._memguard_line(r)[0])
+            present.add(self._memguard_line(r))
         kept = self.__dict__.get("_memguard_turn_boundaries", {})
-        for line in [k for k in lines if k not in present]:
-            lines.pop(line, None)
-            for owner in [o for o in kept if o[0] == line]:
-                kept.pop(owner, None)
-            self.__dict__.get("_memguard_rewriting_lines", set()).discard(line)
+        for owner in [k for k in lines if k not in present]:
+            lines.pop(owner, None)
+            kept.pop(owner, None)
+            if not any(o[0] == owner[0] for o in lines):
+                self.__dict__.get("_memguard_rewriting_lines", set()).discard(
+                    owner[0]
+                )
         outlived: set[Any] = set()
         latest_older = 0
         for line, (first, last) in sorted(lines.items(), key=lambda kv: kv[1][0]):
@@ -6796,9 +6801,10 @@ class Scheduler:
                 and not self._memguard_seq_prefix(tokens, key)
                 for rep_line, rep_frame, tokens in reps
             )
-            if not diverged and line not in outlived:
+            gone = (line, frame) in outlived
+            if not diverged and not gone:
                 protected.add(key)
-            elif diverged and line not in outlived and line != _ANONYMOUS_LINE:
+            elif diverged and not gone and line != _ANONYMOUS_LINE:
                 branches.add(key)
             reps.append((line, frame, key))  # a newer head for older ones
         protected |= self._memguard_kept_turn_boundaries(outlived)
@@ -8322,10 +8328,10 @@ class Scheduler:
         entries = mac._entries  # noqa: SLF001
         return {
             key
-            for (line, _frame), key in kept.items()
+            for owner, key in kept.items()
             if key in entries
-            and line not in outlived
-            and self._memguard_line_rewrites(line)
+            and owner not in outlived
+            and self._memguard_line_rewrites(owner[0])
         }
 
     def _memguard_note_divergence(self, request: Request) -> None:
