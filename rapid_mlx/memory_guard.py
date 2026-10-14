@@ -473,6 +473,9 @@ class RowPlan:
     chunk_cap: int = 0  # per-request chunk ceiling (0 = none), E5 backstop
     chunk_floor: int = 0  # per-request floor override (0 = guard floor)
     prompt_tokens: int = 0  # the request's full prompt, for the refusal
+    # When the request arrived (its arrival_time): under pressure the LATEST
+    # arrival yields (deferred), never the session that was running first.
+    arrival: float = 0.0
     # Bytes of the row's cached KV its admission copies (copy-on-admit /
     # batched merge; the source stays alive until the copy is evaluated in
     # this very dispatch). Gabee Q8: +3-4 GB at 51-62k on the first chunk of
@@ -514,6 +517,9 @@ class GuardProbe:
     # one was evicted.
     evict_one: Callable[[int], bool]
     entry_count: Callable[[], int]
+    # Bytes evicting every entry of level <= ``max_level`` would free (the
+    # feasibility test runs BEFORE anything is evicted). ``None``: unknown.
+    evictable: Callable[[int], int] | None = None
 
 
 # The ONE prefix-cache eviction order every path uses (E1, the pressure
@@ -528,11 +534,20 @@ EVICT_UNUSED = 1
 #    (key length <= its cached tokens): its bytes are duplicated in the live
 #    cache, so evicting it frees memory and loses nothing for that session.
 EVICT_REDUNDANT = 2
-# 3: an entry a live session still needs: stored during this turn beyond what
-#    the running request fetched (the next turn's base), or on a waiting
-#    request's path. Evicted only before refusing a prefill or under hard
-#    pressure at the cap.
-EVICT_NEEDED = 3
+# 3: the HEAD of a session that finished a turn (the entry its next turn
+#    fetches) other than the costliest one: evicted -- cheapest to re-prefill
+#    first, so a short side request's head goes before a long session's --
+#    after the unused and redundant entries and BEFORE the chunk is reduced
+#    (losing a 1.6k-token head costs one 1.6k re-prefill; a reduced chunk
+#    slows every chunk of the turn). Without this stage the heads of
+#    finished side requests filled the idle room and forced chunk
+#    reductions on the main session (session sim, 2026-10-14).
+EVICT_HEAD = 3
+# 4: an entry a live session still needs: stored during this turn beyond what
+#    the running request fetched, on a waiting request's path, or the
+#    costliest session head. Evicted only after the chunk is at the floor,
+#    before refusing a prefill, or under hard pressure at the cap.
+EVICT_NEEDED = 4
 
 
 @dataclass
@@ -547,6 +562,7 @@ class GuardPlan:
     needed: int = 0
     actions: list[str] = field(default_factory=list)
     admit_bytes: int = 0
+    evicted: int = 0  # prefix entries this plan evicted
 
 
 class MemoryGuard:
@@ -584,6 +600,9 @@ class MemoryGuard:
             # decoding row is never aborted). Expected 0: the window and the
             # admission of every joiner include the growth.
             "decode_over_ceiling": 0,
+            # Plans that evicted prefix entries and then deferred the request
+            # anyway (feasibility is decided first, so expected 0).
+            "evictions_then_deferred": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
@@ -768,7 +787,35 @@ class MemoryGuard:
 
         fp = footprint()
         ok, shape, transient, margin = fits(chunk, fp)
-        if not ok and probe.cache() > 0:
+        evicted = 0
+
+        def fits_plain(c: int, fp_: int) -> bool:
+            shape_ = step_shape(rows, c)
+            t, _m = self.need(shape_, ceiling, backstop=False)
+            t += admit
+            return fp_ + t + self.margin(t, ceiling) <= ceiling
+
+        infeasible = False
+        if not ok:
+            # FEASIBILITY FIRST: if even the floor chunk does not fit with
+            # the allocator cache and every evictable entry gone, nothing is
+            # cleared, evicted or reduced -- the plan refuses at once and the
+            # scheduler defers the latest arrival (Gabee Q8 12:22: E1 evicted
+            # two entries, one the main session's 36k, then deferred anyway).
+            reclaim = int(probe.cache())
+            if probe.evictable is not None:
+                reclaim += int(probe.evictable(EVICT_NEEDED))
+            elif probe.entry_count() > 0:
+                reclaim = fp  # unknown: do not pre-empt the evictions
+            infeasible = not fits_plain(floor, fp - reclaim)
+        if infeasible:
+            chunk = floor
+            ok, shape, transient, margin = fits(chunk, fp)
+            actions.append(
+                f"infeasible even at floor chunk {floor} with the allocator "
+                "cache and every evictable entry gone: no eviction, no reduction"
+            )
+        if not ok and not infeasible and probe.cache() > 0:
             # (a) the allocator cache is reusable memory MLX holds; give it
             # back before touching anything that has value.
             before = fp
@@ -779,13 +826,14 @@ class MemoryGuard:
             ok, shape, transient, margin = fits(chunk, fp)
 
         def evict(max_level: int) -> None:
-            nonlocal fp, ok, shape, transient, margin
-            while not ok and probe.entry_count() > 0:
+            nonlocal fp, ok, shape, transient, margin, evicted
+            while not ok and not infeasible and probe.entry_count() > 0:
                 before = fp
                 if not probe.evict_one(max_level):
                     break
                 probe.clear_cache()
                 self.counts["evictions"] += 1
+                evicted += 1
                 fp = footprint()
                 actions.append(
                     f"evict prefix entry (level<={max_level}) footprint "
@@ -794,29 +842,36 @@ class MemoryGuard:
                 ok, shape, transient, margin = fits(chunk, fp)
 
         # (b) prefix entries no live session needs, then the entries a running
-        # request already fetched (duplicated in its live cache). The entry
-        # the next turn will fetch is not among them.
+        # request already fetched (duplicated in its live cache). Session
+        # heads (the entry a next turn fetches) are not among them.
         evict(EVICT_REDUNDANT)
-        # (c) halve the chunk down to the floor. Every chunk of a long
-        # prefill under pressure re-derives the same halving from the
-        # configured size; it is logged and counted only when the chunk
-        # actually changes from the previous dispatch (no per-chunk spam).
+        evict(EVICT_HEAD)
+        # (c) the LARGEST chunk that fits, capped at the engine's normal
+        # chunk (derived, not halved: a big Mac never reduces it; a small
+        # one loses only what the headroom requires). Logged and counted
+        # only when the chunk changes from the previous dispatch.
         start = chunk
-        halvings: list[str] = []
-        while not ok and chunk > floor:
-            new = max(floor, chunk // 2)
-            halvings.append(
-                f"halve chunk {chunk}->{new} (projected step "
-                f"{_gb(transient):.2f}GB at context {shape.context})"
-            )
-            chunk = new
+        if not ok and not infeasible and chunk > floor:
+            lo, hi = floor, chunk - 1
+            best = floor
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fits(mid, fp)[0]:
+                    best, lo = mid, mid + 1
+                else:
+                    hi = mid - 1
+            chunk = best
             ok, shape, transient, margin = fits(chunk, fp)
         if chunk < start:
             self.counts["chunks_reduced"] += 1
-        if halvings and chunk != self.last_chunk:
-            actions.extend(halvings)
-            self.counts["chunk_halvings"] += len(halvings)
-        # (b') entries a live session still needs go before anyone is refused.
+            if chunk != self.last_chunk:
+                self.counts["chunk_halvings"] += 1
+                actions.append(
+                    f"reduce chunk {start}->{chunk} (largest that fits; projected "
+                    f"step {_gb(transient):.2f}GB at context {shape.context})"
+                )
+        # (b') entries a live session still needs, and session heads, go
+        # before anyone is refused -- re-prefill cost order (cheapest first).
         evict(EVICT_NEEDED)
         if not ok and self.backstop_extra(shape):
             # Only a decaying E5 margin stands in the way at the floor: the
@@ -841,15 +896,22 @@ class MemoryGuard:
             ceiling=ceiling,
             actions=actions,
             admit_bytes=admit,
+            evicted=evicted,
         )
         self.last_margin = margin
         if not ok:
-            # (d) refuse BEFORE allocating: the row with the longest context.
+            # (d) refuse BEFORE allocating. The scheduler decides: defer
+            # (fits once the others finish) or refuse (cannot fit even
+            # alone). The LATEST arrival yields -- a request admitted beside
+            # a running one, never the session that was running first
+            # (Gabee Q8 12:22: the main session was deferred behind a side
+            # request because it had the longest context).
             active_rows = [r for r in rows if r.segment > 0]
             if active_rows:
-                # The scheduler decides: defer (fits once the others finish)
-                # or refuse (cannot fit even alone).
-                victim = max(active_rows, key=lambda r: r.offset + r.segment)
+                victim = max(
+                    active_rows,
+                    key=lambda r: (r.admitting, r.arrival, r.offset + r.segment),
+                )
                 plan.refuse = victim
                 plan.needed = fp + transient + margin
                 actions.append(

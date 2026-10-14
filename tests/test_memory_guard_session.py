@@ -248,7 +248,9 @@ def _request(rid: str, prompt: list[int], max_tokens: int = 4) -> Request:
     )
 
 
-def _drive(scheduler: Scheduler, requests, steps: int = 4000, arrive=None):
+def _drive(
+    scheduler: Scheduler, requests, steps: int = 4000, arrive=None, admit_check=False
+):
     """Step to completion, running the pressure evictor after every step."""
     outputs: dict[str, list] = {}
     arrive = arrive or {}
@@ -256,6 +258,9 @@ def _drive(scheduler: Scheduler, requests, steps: int = 4000, arrive=None):
         scheduler.add_request(r)
     for step in range(steps):
         for r in arrive.get(step, ()):
+            if admit_check:
+                # The route's HTTP admission runs while the others are busy.
+                assert scheduler.device_memory_admission(len(r.prompt)) is None
             scheduler.add_request(r)
         out = scheduler.step()
         scheduler.evict_prefix_cache_under_pressure()
@@ -555,15 +560,18 @@ def test_guard_off_restores_the_lz10_pressure_evictor(llama, monkeypatch):
 def test_guard_on_pressure_evictor_keeps_the_session_entry(llama, monkeypatch):
     # Negative control for the test above: guard on, the same footprint.
     # Below the guard's line (1 - its static margin) nothing is evicted;
-    # above it, below the cap, everything but the last entry.
+    # above it, below the cap, everything but each session's HEAD (the
+    # newest entry of a session that finished a turn): two sessions here.
     scheduler = _scheduler(llama, cache_memory_mb=4000)
     before, evicted = _pressure_tick(scheduler, 0.95)
     assert scheduler._memguard() is not None
     assert before >= 2 and evicted == 0
     scheduler = _scheduler(llama, cache_memory_mb=4000)
     before, evicted = _pressure_tick(scheduler, 0.985)
-    assert evicted == before - 1
-    assert len(scheduler.memory_aware_cache._entries) == 1
+    left = list(scheduler.memory_aware_cache._entries)
+    assert len(left) == 2 and evicted == before - 2
+    firsts = {_new_tokens(1, 1)[0], _new_tokens(2, 1)[0]}
+    assert {key[0] for key in left} == firsts
 
 
 def test_an_operator_prefix_budget_still_caps_the_session(llama, monkeypatch):
@@ -582,3 +590,91 @@ def test_an_operator_prefix_budget_still_caps_the_session(llama, monkeypatch):
     full = [length for _t, length, cached in history[1:] if length - cached > 508]
     assert full and min(full) < 14_000, history
     assert scheduler._memguard().configured_prefix_budget is not None
+
+
+def _side_prompt(turn: int, n: int) -> list[int]:
+    # A different system prompt from the main session: no shared prefix.
+    return [127 - ((turn * 13 + i * 7) % 60) for i in range(n)]
+
+
+def _session_with_side_requests(scheduler, turns: int, side_tokens: int):
+    """The main session grows turn after turn; a side request (a subagent,
+    its own prompt) arrives three steps into every main turn."""
+    prompt = _new_tokens(0, 600)
+    history = []
+    windows = []
+    for turn in range(turns):
+        main = _request(f"main-{turn}", prompt, 4)
+        side = _request(f"side-{turn}", _side_prompt(turn, side_tokens), 8)
+        assert scheduler.device_memory_admission(len(prompt)) is None
+        outputs = _drive(scheduler, [main], arrive={3: [side]}, admit_check=True)
+        windows.append(scheduler.memory_guard_max_context(65536))
+        for rid in (main.request_id, side.request_id):
+            assert outputs[rid][-1].finished, rid
+            assert not outputs[rid][-1].error, (rid, outputs[rid][-1].error)
+        history.append((turn, len(prompt), outputs[main.request_id][-1].cached_tokens))
+        prompt = prompt + _tokens(outputs[main.request_id]) + _new_tokens(turn + 1, 496)
+    return history, windows
+
+
+def test_the_main_session_keeps_hitting_with_a_side_request_every_turn(
+    llama, monkeypatch
+):
+    """Gabee Q8 12:22 (f7df48332): the main session's next turn (36k cached,
+    handed over) was batched with a 21k side request; E1 evicted the main
+    session's newest entry and the side request's, then DEFERRED the main
+    turn anyway, dropping its handed-over KV -- a full 36k re-prefill
+    (241.9 s vs 26.9 s). Now: feasibility is decided before anything is
+    evicted, the latest arrival yields, a deferred request's KV is kept as
+    an entry, and session heads are protected -- the main session hits on
+    every turn, nothing is evicted for a dispatch that then defers, and
+    every step stays under the ceiling. Side requests are ~1/7 of the device
+    room each, as 21k of 50.1 GB on Gabee; each passes the HTTP admission
+    while the session runs (it fits alone: accepted, then deferred)."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
+    device.install(monkeypatch, scheduler)
+
+    history, windows = _session_with_side_requests(
+        scheduler, turns=22, side_tokens=1600
+    )
+
+    guard = scheduler._memguard()
+    # Mixed steps (a side request beside the session) stay out of the peak
+    # model: the advertised window does not collapse (Gabee Q8 k=22: a 21k
+    # side request was refused "maximum context here is 0 tokens").
+    assert min(windows) >= 0.97 * windows[0], windows
+    # Under pressure the side request waits; the session's chunk is never
+    # reduced for it.
+    assert guard.counts["deferrals"] >= 1
+    assert guard.counts["chunks_reduced"] == 0
+    for _turn, length, cached in history[1:]:
+        assert length - cached <= 508, history
+    assert guard.counts["evictions_then_deferred"] == 0
+    assert guard.counts["decode_over_ceiling"] == 0
+    assert device.ooms == 0
+    assert device.max_seen <= device.ceiling, (device.max_seen, device.ceiling)
+
+
+def test_a_refusal_carries_the_advertised_window_as_n_ctx(llama, monkeypatch):
+    """ONE feasibility rule for the HTTP 400 and the dispatch: the prompt
+    ALONE on the idle engine. Anything within the advertised max_model_len
+    is accepted; a refusal's n_ctx IS that advertised figure (> 0, below the
+    prompt) -- never one priced from what other requests hold now."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, scheduler)
+    _drive(scheduler, [_request("warm", _new_tokens(0, 600))])
+    window = scheduler.memory_guard_max_context(65536)
+    assert window and 0 < window < 65536
+    assert scheduler.device_memory_admission(window) is None
+    refusal = scheduler.device_memory_admission(window + 500)
+    assert refusal is not None
+    detail = refusal.error_object()
+    assert detail["n_ctx"] == window
+    # And while a long request runs, a prompt that fits alone is accepted.
+    scheduler.add_request(_request("long", _new_tokens(1, int(0.6 * window)), 50))
+    for _ in range(30):
+        scheduler.step()
+    assert scheduler.running
+    assert scheduler.device_memory_admission(int(0.5 * window)) is None

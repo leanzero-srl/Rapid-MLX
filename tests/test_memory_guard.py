@@ -178,7 +178,8 @@ class _World:
     """A fake device: active bytes, allocator cache, prefix entries.
 
     ``entries``: (bytes, eviction level) oldest first; level 1 = no live
-    session needs it, 2 = a running request already copied it, 3 = a live
+    session needs it, 2 = a running request already copied it, 3 = a session
+    head other than the costliest (gone before the chunk is reduced), 4 = a live
     session still needs it (see ``memory_guard.EVICT_*``)."""
 
     def __init__(self, *, active, cache=0, entries=()):
@@ -247,30 +248,36 @@ def test_the_allocator_cache_goes_first():
 def test_order_is_cache_then_unneeded_entries_then_halving_then_needed_ones():
     guard = _guard()
     # Active 41 GB incl. 3 entries of 3 GB: the one the next turn needs
-    # (level 3, stored this turn) is the OLDEST, then the fetched-from one a
+    # (level 4, stored this turn) is the OLDEST, then the fetched-from one a
     # running request already copied (2), then an unused one (1). A 2048
     # chunk needs 12.7 GB.
     world = _World(
-        active=41 * GB, cache=1 * GB, entries=[(3 * GB, 3), (3 * GB, 2), (3 * GB, 1)]
+        active=41 * GB, cache=1 * GB, entries=[(3 * GB, 4), (3 * GB, 2), (3 * GB, 1)]
     )
     plan = guard.plan(ROW, configured_chunk=2048, ceiling=48 * GB, probe=world.probe())
     # cache, then level 1, then level 2 (never by age): 35 GB + 12.7 GB step
-    # + margin is still over 48 GB, so the chunk halves; at 1024 it fits and
-    # the entry the next turn needs survives.
+    # + margin is still over 48 GB, so the chunk is reduced to the LARGEST
+    # that fits (derived, not halved: 1024 would waste headroom), and the
+    # entry the next turn needs survives.
     assert world.log == ["clear", "evict1", "evict2"]
-    assert plan.chunk == 1024 and plan.refuse is None
-    assert world.entries == [(3 * GB, 3)]
+    assert 1024 < plan.chunk < 2048 and plan.refuse is None
+    fp = 41 * GB - 6 * GB  # cache cleared, two entries evicted
+    for chunk, fits in ((plan.chunk, True), (plan.chunk + 1, False)):
+        shape = step_shape(ROW, chunk)
+        t, m = guard.need(shape, 48 * GB)
+        assert (fp + t + m <= 48 * GB) is fits
+    assert world.entries == [(3 * GB, 4)]
     assert guard.counts["chunk_halvings"] == 1
 
 
 def test_a_needed_entry_goes_only_after_halving_to_the_floor():
     guard = _guard()
-    world = _World(active=int(48.5 * GB), entries=[(4 * GB, 3)])
+    world = _World(active=int(48.5 * GB), entries=[(4 * GB, 4)])
     plan = guard.plan(ROW, configured_chunk=2048, ceiling=50 * GB, probe=world.probe())
     # Halving to the floor (256: 1.5 GB step + 1.2 GB margin) is not enough
     # at 48.5 GB; the needed entry goes, then it fits.
     assert plan.chunk == 256
-    assert world.log == ["evict3"] and plan.refuse is None
+    assert world.log == ["evict4"] and plan.refuse is None
 
 
 def test_cannot_dispatch_at_the_floor_reports_the_longest_row():

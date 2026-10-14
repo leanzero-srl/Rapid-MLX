@@ -149,6 +149,7 @@ from .memory_cache import (  # noqa: E402
 )
 from .memory_guard import (  # noqa: E402
     CACHE_LIMIT_FLOOR_RATIO,
+    EVICT_HEAD,
     EVICT_NEEDED,
     EVICT_REDUNDANT,
     EVICT_UNUSED,
@@ -6551,6 +6552,100 @@ class Scheduler:
                 return EVICT_NEEDED
         return level
 
+    def _memguard_ranked_entries(
+        self,
+        storing: tuple[Any, int] | None = None,
+        finished: str | None = None,
+    ) -> list[tuple[tuple, int, int]]:
+        """``(key, level, bytes)`` of every prefix entry in EVICTION order:
+        lowest level first, then the cheapest to re-prefill (fewest tokens --
+        a short side-request entry goes before a 36k session's), then LRU.
+        Caller holds the cache lock.
+
+        Levels (``memory_guard.EVICT_*``): UNUSED, REDUNDANT (a running
+        request fetched it: duplicated in its live cache), NEEDED (a live or
+        queued request still needs it, or it is a session's HEAD). A head is
+        the newest entry of a session that finished a turn -- an entry no
+        other entry extends, or a message-boundary entry extended only by
+        heads (non-trimmable caches resume from the boundary when the next
+        prompt re-renders the reply). Heads go only after the chunk is at the
+        floor (Gabee Q8 12:22: E1 took the main session's 36,039 entry, then
+        a 21,525 one, to fit a request beside a side request -- and deferred
+        it anyway)."""
+        mac = self.memory_aware_cache
+        entries = mac._entries  # noqa: SLF001
+        live: list[tuple[Any, int]] = [
+            (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
+            for r in list(getattr(self, "running", {}).values())
+            if finished is None or r.request_id != finished
+        ]
+        if storing is not None:
+            live.append(storing)
+        waiting = [r.prompt_token_ids for r in list(getattr(self, "waiting", ()))]
+        ordered = sorted(entries)
+        heads: set[tuple] = set()
+        for i, key in enumerate(ordered):
+            run = []
+            for other in ordered[i + 1 :]:
+                if other[: len(key)] != key:
+                    break
+                run.append(other)
+            # Sorted: an entry's extensions follow it contiguously, so a run
+            # member is a leaf iff the next member does not extend it.
+            only_leaves = all(
+                nxt[: len(cur)] != cur for cur, nxt in zip(run, run[1:], strict=False)
+            )
+            if not run or (
+                only_leaves and getattr(entries[key], "message_boundary", False)
+            ):
+                heads.add(key)
+        # The costliest session (most tokens to re-prefill) keeps its heads
+        # until the floor; the other sessions' heads go first, cheapest first.
+        # A session running now counts (its own entry may be handed over: a
+        # 1.6k side head is not the costliest beside a live 10k session).
+        costliest = max(
+            [len(k) for k in heads]
+            + [len(tokens or ()) for tokens, _f in live]
+            + [len(tokens or ()) for tokens in waiting],
+            default=0,
+        )
+        ranked = []
+        for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
+            level = self._memguard_entry_level(key, live, waiting)
+            if key in heads and (
+                level == EVICT_UNUSED
+                or (
+                    finished is not None
+                    and level == EVICT_REDUNDANT
+                    and getattr(entry, "message_boundary", False)
+                )
+            ):
+                chain_cost = max(
+                    (
+                        len(h)
+                        for h in heads
+                        if h[: len(key)] == key or key[: len(h)] == h
+                    ),
+                    default=len(key),
+                )
+                level = EVICT_NEEDED if chain_cost >= costliest else EVICT_HEAD
+            cost = int(getattr(entry, "memory_bytes", 0) or 0)
+            ranked.append((level, len(key), position, key, cost))
+        ranked.sort(key=lambda item: item[:3])
+        return [(key, level, cost) for level, _n, _p, key, cost in ranked]
+
+    def _memguard_evictable_bytes(self, max_level: int) -> int:
+        """Bytes the ONE policy could free evicting up to ``max_level``."""
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return 0
+        with mac._lock:  # noqa: SLF001
+            return sum(
+                cost
+                for _k, level, cost in self._memguard_ranked_entries()
+                if level <= max_level
+            )
+
     def _memguard_evict_ordered(
         self,
         max_level: int,
@@ -6578,28 +6673,14 @@ class Scheduler:
                 return False
             evicted = self._evict_one_prefix_cache_entry()
         else:
-            live: list[tuple[Any, int]] = [
-                (r.prompt_token_ids, int(getattr(r, "cached_tokens", 0) or 0))
-                for r in list(getattr(self, "running", {}).values())
-                if finished is None or r.request_id != finished
-            ]
-            if storing is not None:
-                live.append(storing)
-            waiting = [r.prompt_token_ids for r in list(getattr(self, "waiting", ()))]
             with mac._lock:  # noqa: SLF001 — coordinated eviction
-                keys = list(mac._entries)  # noqa: SLF001 — LRU -> MRU
-                if not keys or (keep_last and len(keys) <= 1):
+                ranked = self._memguard_ranked_entries(storing, finished)
+                if not ranked or (keep_last and len(ranked) <= 1):
                     return False
-                best_key, best_level = None, None
-                for key in keys:
-                    level = self._memguard_entry_level(key, live, waiting)
-                    if best_level is None or level < best_level:
-                        best_key, best_level = key, level
-                        if level == EVICT_UNUSED:
-                            break
-                if best_level is None or best_level > max_level:
+                best_key, best_level, _cost = ranked[0]
+                if best_level > max_level:
                     return False
-                if best_key == keys[0]:
+                if best_key == next(iter(mac._entries)):  # noqa: SLF001
                     # The plain LRU entry: the cache's own path (its failures
                     # propagate to the engine's rate-limited warning).
                     mac._evict_lru()  # noqa: SLF001
@@ -6631,6 +6712,11 @@ class Scheduler:
             clear_cache=mx.clear_cache,
             evict_one=self._memguard_evict_one,
             entry_count=self._memguard_prefix_entry_count,
+            evictable=(
+                self._memguard_evictable_bytes
+                if getattr(self, "memory_aware_cache", None) is not None
+                else None
+            ),
         )
 
     def _memguard_request_for_uid(self, uid: Any) -> Request | None:
@@ -6721,6 +6807,7 @@ class Scheduler:
                     # the source stays alive until the copy is evaluated.
                     admit_bytes=_admit_bytes(offset, caches) if admitting else 0,
                     admitting=admitting,
+                    arrival=float(getattr(request, "arrival_time", 0.0) or 0.0),
                 )
             )
 
@@ -6804,7 +6891,7 @@ class Scheduler:
             deferred_joiner = False
             for row in rows:
                 if row.admitting and not self._memguard_joiner_fits(
-                    guard, ceiling, row
+                    guard, ceiling, row, rows
                 ):
                     deferred_joiner = True
                     break
@@ -6842,6 +6929,10 @@ class Scheduler:
                 # It fits this Mac once the requests beside it finish: wait,
                 # never context_length_exceeded (the client would compact a
                 # conversation that is not too long).
+                if plan.evicted:
+                    # Feasibility-first should make this 0: entries lost for
+                    # a dispatch that did not happen.
+                    guard.counts["evictions_then_deferred"] += 1
                 self._memguard_defer(row, plan, others)
                 continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
@@ -7033,6 +7124,14 @@ class Scheduler:
         allocator cache and evicting with the ONE policy up to ``max_level``."""
         margin = int(MARGIN_CEILING_RATIO * ceiling)
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - extra - margin)
+        if footprint + extra + margin <= ceiling:
+            return True
+        # Feasibility first: evict only when evicting makes it fit.
+        reclaim = self._current_metal_cache_bytes() + self._memguard_evictable_bytes(
+            max_level
+        )
+        if footprint - reclaim + extra + margin > ceiling:
+            return False
         while footprint + extra + margin > ceiling:
             if not self._memguard_evict_ordered(max_level, reason="join"):
                 return False
@@ -7089,34 +7188,67 @@ class Scheduler:
         return True
 
     def _memguard_joiner_fits(
-        self, guard: MemoryGuard, ceiling: int, row: RowPlan
+        self,
+        guard: MemoryGuard,
+        ceiling: int,
+        row: RowPlan,
+        rows: list[RowPlan] | None = None,
     ) -> bool:
-        """A request admitted while others decode will, at the end of its
-        prefill, hold its whole KV AND merge into the decoding batch. If that
-        cannot fit even after evicting what no live session needs, it waits
-        (deferred) -- it is never refused for a peak the others cause."""
-        gen_lengths = self._memguard_generation_lengths()
+        """A request admitted while others prefill or decode joins THEIR
+        batch: mlx-lm merges it into the prompt batch now (every row padded
+        to the longest; a singleton row is first promoted -- a copy), splits
+        rows out of that batch as each finishes its prefill (the moving row
+        and the rows left behind are copied), and merges it into the
+        decoding batch (padded again). Real allocator, 1/100 Gabee: a 1.6k
+        side request joining a 4.1k main prefill = +45 MB in the join step,
+        +50 MB in the split step -- both unplanned, both over the ceiling.
+        All of it, plus its own KV and the others' growth to their final
+        prompts, is charged before it is admitted; if it does not fit even
+        after evicting what no session needs, the JOINER waits (deferred) --
+        the running rows' chunk is never reduced for it, and it is never
+        refused for a peak the others cause."""
         kv_fn = self._kv_footprint_fn()
-        if not gen_lengths or kv_fn is None:
+        if kv_fn is None:
+            return True
+        gen_lengths = self._memguard_generation_lengths()
+        ahead = [
+            r
+            for r in (rows or ())
+            if r.request_id != row.request_id
+            and r.segment > 0
+            and (not r.admitting or r.arrival < row.arrival)
+        ]
+        if not gen_lengths and not ahead:
             return True
         final = max(row.prompt_tokens, row.offset + row.segment)
-        extra = (
-            int(kv_fn(final))
-            + row.admit_bytes
-            + self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
-            + guard.decode_growth(
-                max([*gen_lengths, final]),
-                batch=len(gen_lengths) + 1,
-                kv_footprint=kv_fn,
+        extra = int(kv_fn(final)) + row.admit_bytes
+        if ahead:
+            finals = [max(r.prompt_tokens, r.offset + r.segment) for r in ahead]
+            longest = max([*finals, final])
+            # The others' KV still to come (their remaining prompt).
+            extra += sum(
+                max(0, int(kv_fn(f)) - int(kv_fn(r.offset)))
+                for r, f in zip(ahead, finals, strict=True)
             )
+            rows_after = len(ahead) + 1
+            extra += rows_after * int(kv_fn(longest))  # the padded merge
+            if len(ahead) == 1 and not ahead[0].admitting:
+                extra += int(kv_fn(ahead[0].offset))  # the singleton promoted
+            extra += rows_after * int(kv_fn(longest))  # the split copies
+        if gen_lengths:
+            extra += self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+        extra += guard.decode_growth(
+            max([*gen_lengths, final]),
+            batch=len(gen_lengths) + 1,
+            kv_footprint=kv_fn,
         )
-        if self._memguard_make_room(extra, ceiling, EVICT_REDUNDANT):
+        if self._memguard_make_room(extra, ceiling, EVICT_HEAD):
             return True
         request = self.running.get(row.request_id)
         if request is None:
             return True
         self._memguard_defer_request(
-            request, extra, ceiling, reason="prefill beside the decoding batch"
+            request, extra, ceiling, reason="join the running batch"
         )
         return False
 
@@ -7147,10 +7279,26 @@ class Scheduler:
         uid = self.request_id_to_uid.pop(rid, None)
         if uid is not None:
             if self.batch_generator is not None:
+                bg = self.batch_generator
+                kept = None
+                solo = False
                 try:
-                    self.batch_generator.remove([uid])
+                    stage, _idx = bg._find_uids([uid]).get(uid, (None, None))
+                    batch = {
+                        1: getattr(bg, "_prompt_batch", None),
+                        2: getattr(bg, "_generation_batch", None),
+                    }.get(stage)
+                    # Alone in its batch (or still queued): the batch buffers
+                    # die with the row, so the entry needs one layer of room.
+                    solo = stage == 0 or (batch is not None and len(batch) == 1)
+                except Exception:  # noqa: BLE001
+                    solo = False
+                try:
+                    kept = bg.remove([uid], return_prompt_caches=True)
                 except Exception:  # noqa: BLE001
                     logger.debug("[memory_guard] bg.remove failed", exc_info=True)
+                if kept:
+                    self._memguard_keep_requeued_kv(request, kept.get(uid), solo=solo)
             self.uid_to_request_id.pop(uid, None)
             self._hybrid_checkpoints.pop(uid, None)
             self._forget_uid_grammar(uid)
@@ -7158,6 +7306,50 @@ class Scheduler:
         self.running.pop(rid, None)
         self._memguard_reset_for_requeue(request)
         self.waiting.appendleft(request)
+
+    def _memguard_keep_requeued_kv(
+        self, request: Request, payload: Any, *, solo: bool
+    ) -> None:
+        """A request leaving the batch (deferred, or requeued by the
+        backstop) keeps the KV it already holds -- a prefix hit (perhaps
+        handed over: its entry is gone) plus the chunks it prefilled -- as a
+        prefix entry, so its re-dispatch re-fetches it instead of
+        re-prefilling (Gabee Q8 12:22:43: a 36k session deferred behind a
+        21k side request lost its handed-over entry and re-prefilled 36k).
+        The row is already out of the batch: the entry takes its buffers
+        over layer by layer (one layer of room), never a second copy."""
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None or not payload or _pflash_compressed(request):
+            return
+        try:
+            cache = list(payload[0] or ())
+        except (TypeError, IndexError):
+            return
+        layers = _exact_data_layers(cache)
+        if not layers:
+            return
+        held = getattr(layers[0], "offset", None)
+        if not isinstance(held, int) or held <= 0:
+            return
+        if held > len(request.prompt_token_ids or ()):
+            return  # holds output tokens: not a prompt prefix
+        for layer in layers:
+            layer.__dict__.pop("_lz_sole_owner", None)
+        tokens = list(request.prompt_token_ids[:held])
+        try:
+            if not self._memguard_room_for_store(request, cache, handoff=solo):
+                return
+            stored = mac.store(tokens, cache, evict_prefixes=False, handoff=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("[memory_guard] requeue store failed", exc_info=True)
+            return
+        logger.warning(
+            "[memory_guard] request %s leaves the batch holding %d tokens of "
+            "KV: kept as a prefix entry (stored=%s)",
+            request.request_id[:12],
+            held,
+            stored,
+        )
 
     def _memguard_reset_for_requeue(self, request: Request) -> None:
         request.status = RequestStatus.WAITING
@@ -7221,19 +7413,19 @@ class Scheduler:
             alone = guard.single_sequence_need(
                 prompt, base=base, kv_footprint=kv_fn, ceiling=plan.ceiling
             )
-            if alone <= plan.ceiling:
-                # Alone and it fits by the idle measurement, but not now:
-                # something non-evictable grew since the engine was last idle.
-                # Price the window from what is resident now.
-                base = max(base, plan.footprint - int(kv_fn(row.offset)))
-                alone = guard.single_sequence_need(
-                    prompt, base=base, kv_footprint=kv_fn, ceiling=plan.ceiling
+            # n_ctx is the advertised max_model_len (the same idle-base
+            # figure /v1/models publishes), never one priced from what other
+            # requests hold right now.
+            published = self.memory_guard_max_context(self._memguard_native_context())
+            max_ctx = (
+                published
+                if published is not None
+                else guard.max_context(
+                    base=base,
+                    kv_footprint=kv_fn,
+                    ceiling=plan.ceiling,
+                    upper=self._memguard_native_context() or max(prompt, 1),
                 )
-            max_ctx = guard.max_context(
-                base=base,
-                kv_footprint=kv_fn,
-                ceiling=plan.ceiling,
-                upper=self._memguard_native_context() or max(prompt, 1),
             )
             needed = max(alone, plan.needed)
         else:
@@ -7314,9 +7506,17 @@ class Scheduler:
         base = getattr(self, "_memguard_idle_base_bytes", 0)
         live = max(0, active_before - prefix_before - base) if base > 0 else 0
         guard = self._memguard()
+        if guard is not None and mixed:
+            # A step that also decoded other rows carries THEIR allocations
+            # (KV growth, merges into the decoding batch, async in-flight
+            # buffers), which are charged explicitly. Fed into the residual
+            # envelope they priced every later single-sequence projection:
+            # Gabee Q8 k=22, a 21,363-token side request beside a 50k session
+            # was refused "needs 52.4 GB ... maximum context here is 0
+            # tokens" (a 21k prompt fits alone). Mixed steps stay out of the
+            # model; the backstop still records a real OOM on them.
+            return
         if guard is not None:
-            # A step that also decoded other rows carries their transient: it
-            # bounds the residual (safety) but never fits the attention slope.
             guard.observe(
                 plan.shape,
                 transient,
@@ -7426,17 +7626,31 @@ class Scheduler:
             if ceiling <= 0 or kv_fn is None:
                 return None
             base = self._memguard_idle_base()
+            # ONE feasibility rule for this 400 and for the dispatch: the
+            # prompt ALONE on the idle engine (weights + fixed state, the
+            # minimum since load) -- never what other requests hold now (a
+            # prompt that fits alone is accepted and deferred). Anything
+            # within the advertised max_model_len is accepted outright, so a
+            # refusal's n_ctx is that advertised figure, below the prompt.
+            published = self.memory_guard_max_context(self._memguard_native_context())
+            if published is not None and tokens <= published:
+                return None
             need = guard.single_sequence_need(
                 tokens, base=base, kv_footprint=kv_fn, ceiling=ceiling
             )
             if need <= ceiling:
                 return None
-            max_ctx = guard.max_context(
-                base=base,
-                kv_footprint=kv_fn,
-                ceiling=ceiling,
-                upper=self._memguard_native_context() or max(tokens, 1),
+            max_ctx = (
+                published
+                if published is not None
+                else guard.max_context(
+                    base=base,
+                    kv_footprint=kv_fn,
+                    ceiling=ceiling,
+                    upper=self._memguard_native_context() or max(tokens, 1),
+                )
             )
+            max_ctx = min(max_ctx, tokens - 1)
         except Exception:  # noqa: BLE001
             logger.debug("[memory_guard] admission probe failed", exc_info=True)
             return None
@@ -8900,6 +9114,7 @@ class Scheduler:
         for _ in range(max(0, int(max_evict))):
             should_evict = False
             hard = False
+            over_own_budget = False
             if metal_threshold > 0:
                 # Memory guard E2: active + allocator cache, the cache given
                 # back first so a full cache never costs a prefix entry.
@@ -8913,6 +9128,7 @@ class Scheduler:
                 if current_cache >= cache_self_threshold:
                     should_evict = True
                     triggered_cache_self = True
+                    over_own_budget = True
             if not should_evict:
                 break
             # Memory guard: the ONE eviction policy. Below the cap only
@@ -8920,13 +9136,15 @@ class Scheduler:
             # request already copied), and never the last entry; at the cap
             # the next-turn entries go too. The first guard ran plain LRU
             # here and twice left 0 entries mid-session on Gabee (61k, 74k),
-            # so the next turn re-prefilled everything (361 s, 465 s).
+            # so the next turn re-prefilled everything (361 s, 465 s). The
+            # cache over its OWN budget may take session heads too (cheapest
+            # to re-prefill first), never the last entry.
             if getattr(self, "_memory_guard", None) is None and not guard_enabled():
                 # RAPID_MLX_MEMORY_GUARD=0 restores the lz.10 evictor exactly.
                 if not self._evict_one_prefix_cache_entry():
                     break
             elif not self._memguard_evict_ordered(
-                EVICT_NEEDED if hard else EVICT_REDUNDANT,
+                EVICT_NEEDED if hard or over_own_budget else EVICT_REDUNDANT,
                 keep_last=not hard,
                 reason="pressure",
                 count=False,  # counted below, with the clear_cache contract
