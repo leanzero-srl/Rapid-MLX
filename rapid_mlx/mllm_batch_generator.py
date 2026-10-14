@@ -1092,6 +1092,8 @@ class MLLMBatchGenerator:
         singleton_fastpath: str = "auto",
         media_prefix_cache: str = "auto",
         structural_singleton: bool = False,
+        cache_memory_mb: int | None = None,
+        cache_memory_percent: float | None = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -1127,6 +1129,8 @@ class MLLMBatchGenerator:
                 max sequences, prefill batch, and completion batch are all 1.
                 Media-boundary reuse stays disabled without this proof.
         """
+        self._cache_memory_mb = cache_memory_mb
+        self._cache_memory_percent = cache_memory_percent
         if singleton_fastpath not in ("auto", "off"):
             raise ValueError(
                 f"singleton_fastpath must be 'auto' or 'off', "
@@ -1210,6 +1214,9 @@ class MLLMBatchGenerator:
                     }
                     if "APC_DISK_ENABLED" not in os.environ:
                         apc_overrides["disk_enabled"] = False
+                    snapshot_cap_gb = self._operator_snapshot_cap_gb()
+                    if snapshot_cap_gb is not None:
+                        apc_overrides["memory_max_gb"] = snapshot_cap_gb
                     self._prefix_cache = _apc.from_env(overrides=apc_overrides)
                     self._prefix_cache_mode = mode
                     self._configure_exact_cache_capacity(self._prefix_cache)
@@ -2350,11 +2357,7 @@ class MLLMBatchGenerator:
             )
         if self._media_boundary_max_bytes <= 0:
             try:
-                from .memory_cache import MemoryCacheConfig
-
-                self._media_boundary_max_bytes = max(
-                    0, int(MemoryCacheConfig().compute_memory_limit())
-                )
+                self._media_boundary_max_bytes = self._configured_cache_budget_bytes()
             except Exception:
                 self._media_boundary_max_bytes = 0
         return self._media_boundary_max_bytes
@@ -2509,6 +2512,60 @@ class MLLMBatchGenerator:
                 )
         return _MLLM_EXACT_CACHE_ENTRIES_DEFAULT
 
+    def _configured_cache_budget_bytes(self) -> int:
+        """The prefix-cache byte budget from the server's ``--cache-memory-mb``
+        / ``--cache-memory-percent`` — the same ``MemoryCacheConfig`` the text
+        scheduler builds (``RAPID_MLX_PREFIX_CACHE_MAX_BYTES`` still wins
+        inside ``compute_memory_limit``). Before LeanZero lz.11 this lane built
+        a bare ``MemoryCacheConfig()``, so both flags were silently ignored."""
+        from .memory_cache import MemoryCacheConfig
+
+        kwargs: dict[str, Any] = {}
+        mb = getattr(self, "_cache_memory_mb", None)
+        percent = getattr(self, "_cache_memory_percent", None)
+        if mb is not None:
+            kwargs["max_memory_mb"] = mb
+        if percent is not None:
+            kwargs["max_memory_percent"] = percent
+        return max(0, int(MemoryCacheConfig(**kwargs).compute_memory_limit()))
+
+    def _operator_snapshot_cap_gb(self) -> float | None:
+        """mlx-vlm's APC refuses (silently, with no disk tier) any exact
+        snapshot larger than ``memory_max_bytes``, whose default is
+        ``min(8 GiB, Metal working set / 10)``: on a 64 GB Mac nothing past
+        ~85k tokens of a 27B hybrid is ever stored, whatever the operator set.
+        When the operator chose a budget (``--cache-memory-mb``, or a
+        ``--cache-memory-percent`` other than the default) and did not pin
+        ``APC_MEMORY_MAX_GB`` themselves, that budget is APC's cap too, so one
+        snapshot may use what the operator gave the cache. A server on
+        defaults keeps APC's automatic cap exactly as before. APC's own
+        headroom test (free RAM / working set minus a reserve) still refuses
+        a store that would not fit."""
+        from .memory_cache import _DEFAULT_MEMORY_PERCENT
+
+        if "APC_MEMORY_MAX_GB" in os.environ:
+            return None
+        mb = getattr(self, "_cache_memory_mb", None)
+        percent = getattr(self, "_cache_memory_percent", None)
+        if mb is None and (percent is None or percent == _DEFAULT_MEMORY_PERCENT):
+            return None
+        try:
+            budget = self._configured_cache_budget_bytes()
+        except Exception as exc:
+            logger.warning(
+                "[mllm_apc] operator cache budget unreadable; APC keeps its "
+                "automatic snapshot cap: %s",
+                exc,
+            )
+            return None
+        if budget <= 0:
+            return None
+        logger.info(
+            "[mllm_apc] APC snapshot cap follows the operator cache budget: %.1f GB",
+            budget / (1 << 30),
+        )
+        return budget / (1 << 30)
+
     def _configure_exact_cache_capacity(self, cache: Any) -> None:
         """Raise mlx-vlm's exact-entry LRU to the lane default and adopt the
         engine-wide prefix-cache byte budget for those entries.
@@ -2518,11 +2575,7 @@ class MLLMBatchGenerator:
         walks), mlx-vlm's own capacity is kept unless the operator asked for
         a count explicitly via ``APC_EXACT_CACHE_ENTRIES``."""
         try:
-            from .memory_cache import MemoryCacheConfig
-
-            self._prefix_cache_max_bytes = max(
-                0, int(MemoryCacheConfig().compute_memory_limit())
-            )
+            self._prefix_cache_max_bytes = self._configured_cache_budget_bytes()
         except Exception as exc:
             logger.warning("[mllm_apc] no byte budget for exact entries: %s", exc)
             self._prefix_cache_max_bytes = 0

@@ -2754,3 +2754,77 @@ def test_rewind_exact_entry_refuses_layers_it_cannot_rewind():
     stubborn.update_and_fetch(mx.zeros((1, 1, 100, 4)), mx.zeros((1, 1, 100, 4)))
     stubborn.trim = lambda n: 0
     assert rewind([stubborn], 50) is None
+
+
+# --- LeanZero lz.11 (goose T12 G4): the MLLM lane honours the cache flags ---
+
+
+def _bare_generator(monkeypatch, *, mb=None, percent=None):
+    monkeypatch.delenv("RAPID_MLX_PREFIX_CACHE_MAX_BYTES", raising=False)
+    monkeypatch.delenv("APC_MEMORY_MAX_GB", raising=False)
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen._cache_memory_mb = mb
+    gen._cache_memory_percent = percent
+    return gen
+
+
+def test_cache_memory_mb_reaches_the_mllm_budget_and_the_apc_snapshot_cap(monkeypatch):
+    """Before lz.11 the lane built a bare MemoryCacheConfig(), so
+    --cache-memory-mb 9000 still logged the 20%-of-free default (measured on a
+    64 GB Mac serving a 27B hybrid, 2026-10-14) and APC kept skipping every
+    snapshot past its own min(8 GiB, working set / 10) cap."""
+    gen = _bare_generator(monkeypatch, mb=12 * 1024)
+    assert gen._configured_cache_budget_bytes() == 12 * 1024 * 1024 * 1024
+    assert gen._operator_snapshot_cap_gb() == pytest.approx(12.0)
+
+    apc = pytest.importorskip("mlx_vlm.apc")
+    manager = apc.from_env(
+        overrides={
+            "enabled": True,
+            "num_blocks": 0,
+            "disk_enabled": False,
+            "memory_max_gb": gen._operator_snapshot_cap_gb(),
+        }
+    )
+    assert manager.memory_max_bytes == 12 * (1 << 30)
+
+
+def test_an_explicit_cache_percent_is_honoured(monkeypatch):
+    from rapid_mlx.memory_cache import MemoryCacheConfig
+
+    gen = _bare_generator(monkeypatch, percent=0.35)
+    expected = MemoryCacheConfig(max_memory_percent=0.35).compute_memory_limit()
+    assert gen._configured_cache_budget_bytes() == pytest.approx(expected, rel=0.05)
+    assert gen._operator_snapshot_cap_gb() is not None
+
+
+def test_a_server_on_defaults_keeps_both_budgets_exactly_as_before(monkeypatch):
+    from rapid_mlx.memory_cache import _DEFAULT_MEMORY_PERCENT, MemoryCacheConfig
+
+    for percent in (None, _DEFAULT_MEMORY_PERCENT):
+        gen = _bare_generator(monkeypatch, percent=percent)
+        assert gen._operator_snapshot_cap_gb() is None, percent
+        assert gen._configured_cache_budget_bytes() == pytest.approx(
+            MemoryCacheConfig().compute_memory_limit(), rel=0.05
+        )
+    # The bare fixture (no __init__) reads as defaults too.
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    assert gen._operator_snapshot_cap_gb() is None
+
+
+def test_an_operator_pinned_apc_cap_and_the_env_budget_still_win(monkeypatch):
+    gen = _bare_generator(monkeypatch, mb=12 * 1024)
+    monkeypatch.setenv("APC_MEMORY_MAX_GB", "3")
+    assert gen._operator_snapshot_cap_gb() is None
+    monkeypatch.delenv("APC_MEMORY_MAX_GB")
+    monkeypatch.setenv("RAPID_MLX_PREFIX_CACHE_MAX_BYTES", str(5 << 30))
+    assert gen._configured_cache_budget_bytes() == 5 << 30
+
+
+def test_the_scheduler_config_carries_the_cache_flags_to_the_generator():
+    from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
+
+    config = MLLMSchedulerConfig(cache_memory_mb=9000, cache_memory_percent=0.35)
+    assert (config.cache_memory_mb, config.cache_memory_percent) == (9000, 0.35)
+    defaults = MLLMSchedulerConfig()
+    assert (defaults.cache_memory_mb, defaults.cache_memory_percent) == (None, None)
