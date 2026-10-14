@@ -25,6 +25,7 @@ from ..tool_call_scan import (
 from ..tool_call_scan import (
     split_marked_calls,
     split_marked_parameters,
+    warn_undeclared_call,
 )
 from .models import FunctionCall, ResponseFormat, ToolCall
 
@@ -516,16 +517,24 @@ def parse_tool_calls(
     # Pattern for Nemotron-style:
     # Format 1: <tool_call><function=name><parameter=key>val</parameter></function></tool_call>
     # Format 2: <toolcall>func_name\n<parameter=key>value</parameter>...</toolcall>
-    # Declared TOOL names gate which openers count as calls. A value that
-    # contains ``</function> … <function=other>`` otherwise splits into a
-    # second executable call, so marker text inside an argument could
-    # fabricate an invocation the caller never authorised. Names are
-    # checked, not positions, because position alone cannot tell a real
-    # sibling from markup in a value.
+    # Declared TOOL names decide NESTING. A value that contains
+    # ``</function> … <function=other>`` otherwise splits into a second call,
+    # so marker text inside an argument could fabricate an invocation the
+    # model never made. Names are checked, not positions, because position
+    # alone cannot tell a real sibling from markup in a value.
+    #
+    # They do NOT decide whether a top-level call exists. A well-formed call
+    # to a name the request did not offer, outside every declared call's
+    # span, is the model's mistake and goes to the client like any other
+    # call (``surface_undeclared``), which answers it with "tool not found"
+    # so the model can recover — the same thing a cloud API or vLLM does.
+    # Folding it into the answer text instead ended the agent's turn on a
+    # "final answer" that was really three ``read`` calls (AREX-2 on the
+    # Forge 2.0 benchmark, 2026-10-14). The tool list is the client's
+    # authority, not ours: an unoffered name cannot execute there.
     #
     # No tools declared => None => the position-only rules, which is the
-    # pre-existing behaviour and cannot fabricate anything executable
-    # (nothing would be authorised to run either way).
+    # pre-existing behaviour.
     declared_tools = _declared_tool_names(request)
     nemotron_matches = split_marked_calls(
         text,
@@ -533,8 +542,13 @@ def parse_tool_calls(
         "</function>",
         "</tool_call>",
         valid_names=declared_tools,
+        surface_undeclared=True,
     ) or split_marked_calls(
-        text, r"<toolcall>\s*(\w+)\s*\n", "</toolcall>", valid_names=declared_tools
+        text,
+        r"<toolcall>\s*(\w+)\s*\n",
+        "</toolcall>",
+        valid_names=declared_tools,
+        surface_undeclared=True,
     )
 
     for name, params_block, _, _ in nemotron_matches:
@@ -560,6 +574,8 @@ def parse_tool_calls(
             except (json.JSONDecodeError, ValueError):
                 arguments[p_name] = val
 
+        if declared_tools is not None and name.strip() not in declared_tools:
+            warn_undeclared_call(name.strip(), declared_tools, "parse_tool_calls")
         tool_calls.append(
             ToolCall(
                 id=f"call_{uuid.uuid4().hex[:8]}",
