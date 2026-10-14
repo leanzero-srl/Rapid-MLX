@@ -19,6 +19,8 @@ from ..tool_call_scan import (
     declared_tool_names as _declared_tool_names,
 )
 from ..tool_call_scan import (
+    inside_code,
+    may_surface_undeclared,
     split_marked_calls,
     split_marked_parameters,
     warn_undeclared_call,
@@ -68,6 +70,10 @@ class NemotronToolParser(ToolParser):
     # still has the attribute.
     _content_upto = 0
     _stream_started = False
+    # Deferred streaming (tools declared): the first call's header has been
+    # sent and everything after it waits for the end-of-stream parse.
+    _deferred = False
+    _first_call_name: str | None = None
 
     # Pattern for Nemotron-style with parameters.
     #
@@ -108,6 +114,8 @@ class NemotronToolParser(ToolParser):
         super().reset()
         self._content_upto = 0
         self._stream_started = False
+        self._deferred = False
+        self._first_call_name = None
 
     def _visible_content_between(
         self,
@@ -178,21 +186,14 @@ class NemotronToolParser(ToolParser):
         text — the same rule the qwen3_coder_xml parser applies.
         """
         declared = _declared_tool_names(request)
-        matches = split_marked_calls(
+        return split_marked_calls(
             text,
             r"<function=([^>]+)>",
             "</function>",
             valid_names=declared,
             surface_undeclared=True,
+            wrapper="<tool_call>",
         )
-        if declared is None:
-            return matches
-        return [
-            match
-            for match in matches
-            if match[0].strip() in declared
-            or text[: match[2]].rstrip().endswith("<tool_call>")
-        ]
 
     @staticmethod
     def _pending_markup_index(text: str) -> int | None:
@@ -304,6 +305,8 @@ class NemotronToolParser(ToolParser):
                 "</parameter>",
                 valid_names=declared_parameter_names(func_name, request),
                 reject_undeclared_siblings=True,
+                call_close="</function>",
+                call_header="<function=",
             )
             if params is None:
                 continue
@@ -376,6 +379,94 @@ class NemotronToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
+    _HEADER = re.compile(r"<function=([^>]+)>")
+
+    def _first_call_header(
+        self, text: str, request: dict[str, Any] | None
+    ) -> tuple[int, str] | None:
+        """``(span_start, name)`` of the first header that is a call, or None.
+
+        A header is a call once something other than another header follows
+        it, and its name is declared — or it is a wrapped, top-level call to
+        an undeclared name that may surface (not under ``tool_choice`` none or
+        a named choice, not inside markdown code). The FIRST call is always
+        top-level: nothing before it can hold it as a value.
+        """
+        declared = _declared_tool_names(request) or frozenset()
+        for match in self._HEADER.finditer(text, self._content_upto):
+            rest = text[match.end() :].lstrip()
+            if rest.startswith("<function="):
+                continue  # a header that meets another header is prose
+            if not rest or "<function=".startswith(rest):
+                return None  # what follows the header is not here yet
+            name = match.group(1).strip()
+            before = text[: match.start()].rstrip()
+            wrapped = before.endswith("<tool_call>")
+            span_start = len(before) - len("<tool_call>") if wrapped else match.start()
+            if name in declared:
+                return span_start, name
+            if (
+                wrapped
+                and may_surface_undeclared(request)
+                and not inside_code(text, span_start)
+            ):
+                return span_start, name
+        return None
+
+    def finalize_legacy_raw_stream(
+        self, model_output: str, request: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """The calls (and text) a deferred stream withheld, from the full output.
+
+        Called by the postprocessor once the engine stream ends. The first
+        call's header is already on the wire; this returns its arguments,
+        every later call whole, and the text after the first call that is not
+        a call — all from ONE parse of the complete output, so streaming
+        reads exactly what ``extract_tool_calls`` reads.
+        """
+        if not self._deferred:
+            return None
+        self._deferred = False
+        result = self._extract(model_output, request, warn_undeclared=False)
+        calls = list(result.tool_calls) if result.tools_called else []
+        if not calls:
+            # Cut off before the first call closed: its header stands alone,
+            # as a cut-off call does on every streaming path.
+            return None
+        tool_calls: list[dict[str, Any]] = []
+        if calls[0]["name"] == self._first_call_name:
+            tool_calls.append(
+                {"index": 0, "function": {"arguments": calls.pop(0)["arguments"]}}
+            )
+        else:
+            logger.warning(
+                "nemotron stream finalize: the full parse's first call is %r, "
+                "not the %r whose header streamed",
+                calls[0]["name"],
+                self._first_call_name,
+            )
+        declared = _declared_tool_names(request)
+        for index, tc in enumerate(calls, start=1):
+            if declared is not None and tc["name"] not in declared:
+                warn_undeclared_call(tc["name"], declared, "nemotron")
+            tool_calls.append(
+                {
+                    "index": index,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+            )
+        self.current_tool_id = len(tool_calls) - 1
+        out: dict[str, Any] = {"tool_calls": tool_calls}
+        content = self._visible_content_between(
+            model_output, self._content_upto, len(model_output), request
+        )
+        self._content_upto = len(model_output)
+        if content.strip():
+            out["content"] = content
+        return out
+
     @staticmethod
     def _close_tag_count(text: str) -> int:
         """Number of completed tool-call close tags present in ``text``.
@@ -443,6 +534,69 @@ class NemotronToolParser(ToolParser):
             # later refusal must not send it again.
             self._content_upto = len(current_text)
             return {"content": delta_text}
+
+        if self._deferred:
+            return None
+        if (
+            _declared_tool_names(request) is not None
+            and isinstance(request, dict)
+            and request.get("tool_choice") != "none"
+        ):
+            # Tools declared: the first call's header goes out as soon as it
+            # is one, and everything after it is read ONCE, from the complete
+            # output, by ``finalize_legacy_raw_stream`` — the model
+            # qwen3_coder_xml's legacy-raw stream uses. A raw value has no
+            # escaping, so whether a call closed, ran on into the next one,
+            # or holds another call's markup as text is only known from the
+            # bytes that come AFTER it (review of 26452cbe3, item 5): emitting
+            # each call as its close arrived streamed ``write {"content":
+            # "foo"}`` plus a fabricated ``shell`` for a value the buffered
+            # parser reads as one ``write``. And because the header is on the
+            # wire, a long call is no longer withheld whole, where the #1359
+            # budget turned anything over 64 KB into text (item 2).
+            first = self._first_call_header(current_text, request)
+            if first is None:
+                return self._stream_before_first_call(
+                    previous_text, current_text, delta_text, request
+                )
+            span_start, name = first
+            content = self._visible_content_between(
+                current_text, self._content_upto, span_start, request
+            )
+            self._content_upto = span_start
+            self._deferred = True
+            self._first_call_name = name
+            self.current_tool_id = 0
+            declared = _declared_tool_names(request)
+            if declared is not None and name not in declared:
+                warn_undeclared_call(name, declared, "nemotron stream")
+            out: dict[str, Any] = {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": generate_tool_id(),
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    }
+                ]
+            }
+            if content:
+                out["content"] = content
+            return out
+
+        return self._stream_before_first_call(
+            previous_text, current_text, delta_text, request
+        )
+
+    def _stream_before_first_call(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        request: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Close-driven streaming: prose, refused blocks, and (with no tools
+        declared, or under ``tool_choice`` none) calls emitted as they close."""
 
         # Trigger from the COMPLETION STATE of current_text, NOT from a close
         # tag appearing inside a single delta_text. We fire only when a NEW
