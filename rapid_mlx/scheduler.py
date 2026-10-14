@@ -7221,22 +7221,28 @@ class Scheduler:
         if not gen_lengths and not ahead:
             return True
         final = max(row.prompt_tokens, row.offset + row.segment)
-        extra = int(kv_fn(final)) + row.admit_bytes
+        # What stays resident: the batch it joins at the END of everyone's
+        # prompt, every row padded to the longest, less what those rows hold
+        # already (in the footprint).
+        persistent = int(kv_fn(final))
+        one_off = 0
         if ahead:
             finals = [max(r.prompt_tokens, r.offset + r.segment) for r in ahead]
             longest = max([*finals, final])
-            # The others' KV still to come (their remaining prompt).
-            extra += sum(
-                max(0, int(kv_fn(f)) - int(kv_fn(r.offset)))
-                for r, f in zip(ahead, finals, strict=True)
+            persistent = (len(ahead) + 1) * int(kv_fn(longest)) - sum(
+                int(kv_fn(r.offset)) for r in ahead
             )
-            rows_after = len(ahead) + 1
-            extra += rows_after * int(kv_fn(longest))  # the padded merge
-            if len(ahead) == 1 and not ahead[0].admitting:
-                extra += int(kv_fn(ahead[0].offset))  # the singleton promoted
-            extra += rows_after * int(kv_fn(longest))  # the split copies
+            # The largest single copy one step makes on the way: promoting a
+            # singleton row, or copying a row out at a split -- one row of
+            # the longest. Measured, 1/100 Gabee, a 1.6k side request joining
+            # a 4.1k prefill: +45 MB in the join step, +50 MB in the split
+            # step, one kv(4.6k) = 38 MB each plus the step itself.
+            one_off = int(kv_fn(longest))
         if gen_lengths:
-            extra += self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+            one_off = max(
+                one_off, self._memguard_merge_bytes(gen_lengths, [final], kv_fn)
+            )
+        extra = max(0, persistent) + one_off + row.admit_bytes
         extra += guard.decode_growth(
             max([*gen_lengths, final]),
             batch=len(gen_lengths) + 1,
@@ -9161,6 +9167,13 @@ class Scheduler:
             # the metric still reads 0 cumulative evictions).
             evicted += 1
             self.num_prefix_cache_pressure_evictions += 1
+            if not over_own_budget:
+                # Device pressure (the Metal trigger), apart from the cache
+                # keeping to its own budget (capacity LRU, as without the
+                # guard).
+                self.num_prefix_cache_metal_pressure_evictions = (
+                    getattr(self, "num_prefix_cache_metal_pressure_evictions", 0) + 1
+                )
             # Force the MLX allocator to actually return the slab now
             # that the trie / dict no longer pins the CacheEntry.
             # Without this, the underlying Metal allocation lingers in

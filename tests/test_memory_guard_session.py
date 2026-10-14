@@ -131,8 +131,12 @@ class _Device:
     crossed ``physical``).
     """
 
-    def __init__(self, physical: int):
+    def __init__(self, physical: int, scratch_scale: float = 1.0):
         self.physical = physical
+        # Multiplies the simulated attention scratch: 30 puts a full-context
+        # prefill step at ~3% of Gabee's ceiling at 1/100 (measured live:
+        # 1.72 GB at 1x512x29,184 of a 50.1 GB ceiling).
+        self.scratch_scale = scratch_scale
         self.ooms = 0
         self.fail_next = 0
         self.steps = 0
@@ -159,7 +163,7 @@ class _Device:
         self.steps += 1
         noise = 1.0 + 0.06 * math.sin(self.steps * 1.7)
         att = 1.6 * b * n * (x**1.15) / 8.0
-        return int((att + 700 * b * n + 30 * x + 40_000) * noise)
+        return int((att * self.scratch_scale + 700 * b * n + 30 * x + 40_000) * noise)
 
     def install(self, monkeypatch, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
@@ -204,7 +208,7 @@ class _Device:
         # concatenation) is the engine's own analytic term.
         scheduler._memory_guard = MemoryGuard(
             PeakPrior(
-                attention_bytes_per_unit=6.0,
+                attention_bytes_per_unit=6.0 * device.scratch_scale,
                 token_bytes=1500.0,
                 kv_copy_bytes_per_context=(
                     scheduler._memguard_prior().kv_copy_bytes_per_context
@@ -678,3 +682,82 @@ def test_a_refusal_carries_the_advertised_window_as_n_ctx(llama, monkeypatch):
         scheduler.step()
     assert scheduler.running
     assert scheduler.device_memory_admission(int(0.5 * window)) is None
+
+
+# measured/published: the M4 Max 128 GB recommended working set is 115.4 GB,
+# the M3 Ultra 96 GB 83.5 GB; goose's cap is 0.9 of it. Gabee (M3 Max 64 GB)
+# measured a 50.1 GB ceiling. All at 1/100 like the rest of this module.
+M4_MAX_128_CEILING = int(0.9 * 1154 * MB)
+M3_ULTRA_96_CEILING = int(0.9 * 835 * MB)
+GABEE_64_CEILING = int(501 * MB)
+# The goose 27B session of the live ladders, at 1/100 of its bytes: 116k
+# tokens x 62.5 KB of KV = 7.25 GB -> 72.5 MB = 8.85k tokens of this model's
+# 8.19 KB; the subagent's 21k-token prompt -> 1.6k tokens.
+SESSION_TOKENS = 8_850
+SIDE_TOKENS = 1_600
+
+
+def _ladder_with_a_subagent(llama, monkeypatch, ceiling: int):
+    device = _Device(physical=int(ceiling / 0.97) + 1, scratch_scale=30.0)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
+    device.install(monkeypatch, scheduler)
+    chunks: list[int] = []
+    real_step = scheduler.step
+
+    def step():
+        out = real_step()
+        bg = scheduler.batch_generator
+        if bg is not None and len(bg._prompt_batch):
+            chunks.append(int(bg.prefill_step_size))
+        return out
+
+    scheduler.step = step
+    turns = (SESSION_TOKENS - 600) // 500 + 1
+    history, _windows = _session_with_side_requests(
+        scheduler, turns=turns, side_tokens=SIDE_TOKENS
+    )
+    assert history[-1][1] >= SESSION_TOKENS - 500
+    for _turn, length, cached in history[1:]:
+        assert length - cached <= 508, history
+    assert device.ooms == 0
+    assert device.max_seen <= device.ceiling
+    return scheduler._memguard().counts, chunks, scheduler
+
+
+@pytest.mark.parametrize(
+    "ceiling", [M4_MAX_128_CEILING, M3_ULTRA_96_CEILING], ids=["128GB", "96GB"]
+)
+def test_a_big_mac_never_sees_the_guard_act(llama, monkeypatch, ceiling):
+    """Owner rule: the chunk is reduced only under duress on weaker devices;
+    a Mac with a lot of memory must see none of it. The live ladder (a
+    session growing to 116k + a 21k subagent request every turn) at 128 GB
+    and 96 GB proportions: zero chunk reductions, zero evictions forced by
+    the guard (E1, pressure, store-room, join), zero deferrals, and every
+    prefill dispatch at the engine's normal chunk."""
+    counts, chunks, scheduler = _ladder_with_a_subagent(llama, monkeypatch, ceiling)
+    assert counts["chunks_reduced"] == 0 and counts["chunk_halvings"] == 0
+    assert counts["evictions"] == 0
+    # (The cache keeping to its own budget -- capacity LRU, as without the
+    # guard -- is not device pressure.)
+    assert getattr(scheduler, "num_prefix_cache_metal_pressure_evictions", 0) == 0
+    assert counts["deferrals"] == 0
+    assert counts["admission_handoffs"] == 0
+    assert chunks and set(chunks) == {CHUNK}
+
+
+def test_the_same_ladder_at_64gb_makes_the_guard_act(llama, monkeypatch):
+    # Negative control for the test above: Gabee's proportions. The subagent
+    # cannot join the session's batch here: it waits (and the session still
+    # hits every turn, under the ceiling).
+    counts, _chunks, scheduler = _ladder_with_a_subagent(
+        llama, monkeypatch, GABEE_64_CEILING
+    )
+    acted = (
+        counts["deferrals"]
+        + counts["evictions"]
+        + counts["chunks_reduced"]
+        + counts["admission_handoffs"]
+        + scheduler.num_prefix_cache_pressure_evictions
+    )
+    assert acted > 0
+    assert counts["evictions_then_deferred"] == 0
