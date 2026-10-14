@@ -8108,15 +8108,133 @@ class Scheduler:
                 (effective or 0) / 1e9,
             )
 
+    def _memguard_session_key(self, tokens: Any) -> tuple | None:
+        """A logical session's identity: its first KV block (system prompt)."""
+        block = kv_growth_step()
+        if tokens is None or len(tokens) < block:
+            return None
+        return tuple(tokens[:block])
+
+    def _memguard_session_diverges(self, tokens: Any) -> bool:
+        if self._memguard_template_strips():
+            return True
+        key = self._memguard_session_key(tokens)
+        return key is not None and key in getattr(
+            self, "_memguard_divergent_sessions", ()
+        )
+
+    def _memguard_template_strips(self) -> bool:
+        """Does the model's chat template DROP an earlier assistant turn's
+        reasoning once a new user message follows (classic Qwen3)? Then a
+        new user message diverges right after the boundary before the last
+        tool loop, and a non-trimmable cache can resume only from there.
+        Probed once by rendering: reasoning present in [user, assistant] but
+        absent in [user, assistant, user]. Unknown (no template, a render
+        error) -> False: the observed-divergence rule still applies."""
+        cached = getattr(self, "_memguard_strips", None)
+        if cached is not None:
+            return cached
+        strips = False
+        tok = getattr(self, "_actual_tokenizer", None) or getattr(
+            self, "tokenizer", None
+        )
+        render = getattr(tok, "apply_chat_template", None)
+        if callable(render):
+            marker = "zq7reasoningmarker"
+            for assistant in (
+                {"role": "assistant", "content": "a1", "reasoning_content": marker},
+                {"role": "assistant", "content": f"<think>{marker}</think>a1"},
+            ):
+                try:
+                    one = render(
+                        [{"role": "user", "content": "u1"}, assistant],
+                        tokenize=False,
+                    )
+                    two = render(
+                        [
+                            {"role": "user", "content": "u1"},
+                            assistant,
+                            {"role": "user", "content": "u2"},
+                        ],
+                        tokenize=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(one, str) and isinstance(two, str) and marker in one:
+                    strips = marker not in two
+                    break
+        self._memguard_strips = strips
+        if strips:
+            logger.info(
+                "[memory_guard] the chat template drops earlier reasoning on "
+                "a new user message: message-boundary entries of non-trimmable "
+                "caches are never superseded"
+            )
+        return strips
+
+    def _memguard_note_divergence(self, request: Request) -> None:
+        """Admission (step thread): a request that shares its conversation
+        with a cached non-trimmable entry (more than the system block) but
+        does NOT extend it has diverged from its own session -- the template
+        rewrote an earlier part (stripped reasoning). From then on that
+        session's message-boundary entries are never superseded."""
+        if getattr(self, "_memory_guard", None) is None:
+            return
+        mac = getattr(self, "memory_aware_cache", None)
+        prompt = request.prompt_token_ids
+        session = self._memguard_session_key(prompt)
+        if mac is None or session is None or self._memguard_session_diverges(prompt):
+            return
+        span = 2 * len(session)
+        head = tuple(prompt[:span])
+        with mac._lock:  # noqa: SLF001
+            for key, entry in mac._entries.items():  # noqa: SLF001
+                if (
+                    len(key) <= span
+                    or not getattr(entry, "non_trimmable", False)
+                    or key[:span] != head
+                ):
+                    continue
+                if len(key) > len(prompt) or tuple(prompt[: len(key)]) != key:
+                    if not hasattr(self, "_memguard_divergent_sessions"):
+                        self._memguard_divergent_sessions = set()
+                    self._memguard_divergent_sessions.add(session)
+                    logger.info(
+                        "[memory_guard] request %s diverges from its session's "
+                        "%d-token entry: its message-boundary entries are kept "
+                        "from now on",
+                        request.request_id[:12],
+                        len(key),
+                    )
+                    return
+
     def _memguard_supersede(self, request: Request, sequence: list[int]) -> None:
-        """After a session's end-of-turn entry is stored, its OLDER entries
-        that the new one strictly extends are dead weight -- the previous
-        turns' end-of-turn and boundary entries. Review 3 (real Metal, 128 GB):
+        """After a session's end-of-turn entry is stored, the OLDER entries
+        it strictly extends are dead weight. Review 3 (real Metal, 128 GB):
         idle held 40 GB of cache with the guard vs 29 GB without, mostly
-        superseded entries of the same session. Kept: this turn's message-
-        boundary entry (a non-trimmable cache resumes from it when the next
-        prompt re-renders the reply), any entry another branch also extends
-        (a shared prefix), and anything a live or queued request needs."""
+        superseded entries of the same session.
+
+        A TRIMMABLE strict prefix is always dead weight: the fetch rewinds a
+        longer entry to the longest common prefix, so whatever line extends
+        it still hits. A NON-TRIMMABLE (hybrid) entry cannot be rewound (the
+        fetch snaps to the nearest recurrent checkpoint), so the one this
+        request resumed FROM stays; the ones it passed and its own snapshots
+        past it go. Review 4 (live, Gabee Q8, a hybrid): a side branch --
+        main's conversation plus one extra user message (a retry, a helper
+        call, a compaction attempt) -- resumed from main's newest entry and
+        stored one extending it; superseding main's entry made main's next
+        turn (which extends main's entry, not the branch's) snap back to an
+        older checkpoint: cached 34,334 of 55,921 instead of ~50.4k. At store
+        time a branch and the next turn of the line look the same; only the
+        NEXT request resuming past the newer entry proves the older one dead.
+        Cost (hybrids only): a session idles with two entries, not one; under
+        duress the older one ranks first for eviction.
+
+        Also kept: this turn's message-boundary entry, message-boundary
+        entries of a non-trimmable cache whose template rewrites history
+        (see ``_memguard_session_diverges``), any entry another branch also
+        extends (a shared prefix), and anything a live or queued request
+        needs."""
         if getattr(self, "_memory_guard", None) is None:
             return
         mac = getattr(self, "memory_aware_cache", None)
@@ -8132,6 +8250,7 @@ class Scheduler:
             or 0
         )
         keep = {tuple(request.prompt_token_ids[:boundary])} if boundary > 0 else set()
+        resumed = int(getattr(request, "_memguard_resumed", 0) or 0)
         superseded = 0
         with mac._lock:  # noqa: SLF001
             if key not in mac._entries:  # noqa: SLF001
@@ -8142,9 +8261,28 @@ class Scheduler:
                     (sequence, len(sequence)), request.request_id
                 )
             }
-            keys = list(mac._entries)  # noqa: SLF001
+            entries = mac._entries  # noqa: SLF001
+            keys = list(entries)
             for k in keys:
                 if len(k) >= len(key) or key[: len(k)] != k or k in keep:
+                    continue
+                entry = entries[k]
+                if len(k) == resumed and getattr(entry, "non_trimmable", False):
+                    continue  # the non-trimmable entry it resumed FROM
+                if (
+                    getattr(entry, "non_trimmable", False)
+                    and getattr(entry, "message_boundary", False)
+                    and self._memguard_session_diverges(k)
+                ):
+                    # A non-trimmable (hybrid recurrent-state) cache cannot
+                    # rewind: a message boundary is the only place a prompt
+                    # that diverges after it can resume from. Kept only for
+                    # a session OBSERVED to diverge from its own newest
+                    # entry (a template that strips earlier reasoning when a
+                    # new user message arrives -- review 4: re-prefill from
+                    # 0 instead of resuming at 6000). A template that just
+                    # extends the prefix (AREX-2, measured live) never
+                    # diverges, and keeps the superseding win.
                     continue
                 if levels.get(k, EVICT_NEEDED) > EVICT_REDUNDANT:
                     continue
@@ -10051,6 +10189,7 @@ class Scheduler:
         """
         import time as _time
 
+        self._memguard_note_divergence(request)
         _fetch_t0 = _time.monotonic()
         cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
         _fetch_dt = _time.monotonic() - _fetch_t0
@@ -10059,6 +10198,12 @@ class Scheduler:
             request.prompt_cache = cache
             request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
             request.remaining_tokens = remaining
+            # Memory guard: how far along its line this request RESUMED --
+            # the entries it provably continued past (superseding).
+            request._memguard_resumed = max(
+                int(getattr(request, "_memguard_resumed", 0) or 0),
+                request.cached_tokens,
+            )
             logger.info(
                 f"[cache_fetch] request={request.request_id[:12]} HIT "
                 f"prompt_tokens={len(request.prompt_token_ids)} "

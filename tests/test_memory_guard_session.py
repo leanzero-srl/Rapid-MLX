@@ -981,6 +981,39 @@ def test_a_session_keeps_only_its_newest_entries(llama, monkeypatch):
         assert length - cached <= 508
 
 
+@pytest.mark.parametrize("branch_first", [True, False], ids=["branch", "control"])
+def test_a_side_branch_does_not_supersede_the_main_line(
+    llama, monkeypatch, branch_first
+):
+    """Review 4 (live, Gabee Q8, 244d8de5c): a side branch -- main's
+    conversation so far plus one extra user message (a retry, a title or
+    summary helper call, a compaction attempt) -- extended main's newest
+    end-of-turn entry and stored its own; superseding then dropped MAIN's
+    entry, and main's next turn (which extends main's entry, not the
+    branch's) fell back to an older one: cached 34,334 of 55,921 instead of
+    ~50.4k. On a TRIMMABLE cache (this Llama) that is harmless -- the fetch
+    rewinds the branch's entry to the common prefix -- so superseding stays
+    full there; this pins that (green on 244d8de5c too). The hybrid case,
+    which lost the hit live, is the next test. Control: no branch."""
+    device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
+    scheduler = _auto_budget_scheduler(llama, monkeypatch, device, max_num_seqs=4)
+    device.install(monkeypatch, scheduler)
+    prompt = _new_tokens(0, 600)
+    for turn in range(4):
+        outs = _drive(scheduler, [_request(f"main-{turn}", prompt, 4)])[f"main-{turn}"]
+        line = prompt + _tokens(outs)
+        if branch_first and turn == 2:
+            branch = _request("branch", line + _new_tokens(50, 120), 8)
+            assert not _drive(scheduler, [branch])["branch"][-1].error
+        prompt = line + _new_tokens(turn + 1, 496)
+        if turn >= 2:
+            nxt = _drive(scheduler, [_request(f"next-{turn}", prompt, 4)])
+            cached = nxt[f"next-{turn}"][-1].cached_tokens
+            assert cached >= len(line) - 8, (turn, len(line), cached)
+            prompt = prompt + _tokens(nxt[f"next-{turn}"]) + _new_tokens(9, 64)
+    assert scheduler._memguard().counts["superseded"] > 0
+
+
 def _two_sessions(llama, monkeypatch):
     device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
@@ -1124,3 +1157,209 @@ def test_machine_pressure_keeps_the_waiting_main_session_head(llama, monkeypatch
         scheduler.step()
     outs = _drive(scheduler, [_request("main-2", main_next + _new_tokens(5, 300), 4)])
     assert outs["main-2"][-1].cached_tokens >= len(main_next) - 8
+
+
+def _tiny_hybrid():
+    """A tiny Qwen3.5 (GatedDeltaNet + full attention, the goose 27B's
+    layout: one full-attention layer in four) -- a non-trimmable cache."""
+    from mlx_lm.models import qwen3_5
+
+    text = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "vocab_size": 1024,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 65536,
+        "full_attention_interval": 4,
+        "layer_types": ["linear_attention"] * 3
+        + ["full_attention"]
+        + ["linear_attention"] * 3
+        + ["full_attention"],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 32,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "linear_value_head_dim": 32,
+        "attn_output_gate": True,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": False,
+    }
+    mx.random.seed(0)
+    model = qwen3_5.Model(
+        qwen3_5.ModelArgs.from_dict(
+            {"model_type": "qwen3_5", "text_config": text, "tie_word_embeddings": False}
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+class _Tokenizer(SimpleNamespace):
+    pass
+
+
+def _tiny_tokenizer(strips: bool | None):
+    """A test tokenizer. ``strips`` None: no chat template (unknown);
+    True: renders like classic Qwen3 (earlier reasoning DROPPED once a new
+    user message follows); False: renders like AREX-2 (kept)."""
+    tok = _Tokenizer(
+        encode=lambda text: list(text),
+        decode=lambda ids, **_: "",
+        eos_token_id=9999,
+        eos_token_ids={9999},
+    )
+    if strips is not None:
+
+        def render(messages, tokenize=False, **_):
+            last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+            parts = []
+            for i, m in enumerate(messages):
+                text = m["content"]
+                reasoning = m.get("reasoning_content")
+                if reasoning and not (strips and i < last_user):
+                    text = f"<think>{reasoning}</think>{text}"
+                parts.append(f"<{m['role']}>{text}")
+            return "".join(parts)
+
+        tok.apply_chat_template = render
+    return tok
+
+
+def _hybrid_scheduler(model, tokenizer):
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=2,
+            spec_decode="none",
+            prefill_step_size=512,
+            enable_prefix_cache=True,
+            use_memory_aware_cache=True,
+            use_paged_cache=False,
+            hybrid_cache_entries=24,
+            cache_memory_mb=2048,
+        ),
+    )
+    scheduler._memory_guard = MemoryGuard(
+        PeakPrior(
+            attention_bytes_per_unit=6.0,
+            token_bytes=1500.0,
+            kv_copy_bytes_per_context=(
+                scheduler._memguard_prior().kv_copy_bytes_per_context
+            ),
+        ),
+        floor_tokens=64,
+    )
+    scheduler._resolve_metal_cap_bytes = lambda: 10**12
+    return scheduler
+
+
+def _hybrid_tokens(seed, n):
+    return [(seed * 37 + i * 11) % 900 + 1 for i in range(n)]
+
+
+_GEN_PROMPT = [901, 902, 903]
+
+
+def _hybrid_run(scheduler, rid, prompt, boundary):
+    request = _request(rid, prompt, 4)
+    request.prefix_boundary = boundary
+    outs = _drive(scheduler, [request])[rid]
+    assert not outs[-1].error, outs[-1].error
+    return outs[-1].cached_tokens, _tokens(outs)
+
+
+def _hybrid_tool_loop(scheduler, user, rid):
+    """A user message, then a 4-request tool loop that keeps its reasoning
+    (each prompt extends the previous end-of-turn entry). Returns the
+    loop's last prompt and where the loop started."""
+    prompt = user + _GEN_PROMPT
+    boundary = len(user)
+    loop_start = len(prompt)
+    for k in range(4):
+        _cached, out = _hybrid_run(scheduler, f"{rid}-loop{k}", prompt, boundary)
+        nxt = prompt + out + [904] + _hybrid_tokens(10 + k, 700)
+        boundary = len(nxt)
+        prompt = nxt + _GEN_PROMPT
+    return prompt, loop_start
+
+
+def _strip_loop(prompt, user, loop_start, seed):
+    """The new user message under a stripping template: the loop's
+    reasoning (the first generated tokens) is gone; the rest re-rendered."""
+    return (
+        user + _GEN_PROMPT + [905] + prompt[loop_start + 4 :] + _hybrid_tokens(seed, 50)
+    )
+
+
+@pytest.mark.parametrize("strips", [True, None], ids=["stripping", "unknown"])
+def test_a_new_user_message_on_a_hybrid_resumes_from_its_boundary(
+    monkeypatch, cpu, strips
+):
+    """Review 4 (C3): a non-trimmable (hybrid) cache cannot rewind. A tool
+    loop keeps its reasoning (each prompt extends the previous end-of-turn
+    entry), then a NEW USER MESSAGE: the template strips the loop's
+    reasoning and the prompt diverges right after the boundary before the
+    loop. 244d8de5c superseded that boundary entry: cached 0 (at goose
+    scale a ~100k re-prefill on every new user message); 4ac506f7d resumed
+    at the boundary. A template that strips (probed by rendering) keeps the
+    boundary entries from the start; an unknown one keeps them once the
+    session has been OBSERVED to diverge (its first new user message pays
+    once). Superseding still happens either way."""
+    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(strips))
+    first = _hybrid_tokens(1, 1500)
+    prompt, loop_start = _hybrid_tool_loop(scheduler, first, "a")
+    assert scheduler._memguard().counts["superseded"] > 0  # the win stays
+    new_user = _strip_loop(prompt, first, loop_start, 77)
+    cached, out = _hybrid_run(scheduler, "new-user", new_user, len(new_user) - 3)
+    if strips:
+        assert cached >= len(first)
+    second = new_user + out + [906] + _hybrid_tokens(78, 40)
+    prompt, loop_start = _hybrid_tool_loop(scheduler, second, "b")
+    new_user = _strip_loop(prompt, second, loop_start, 79)
+    cached, _out = _hybrid_run(scheduler, "new-user-2", new_user, len(new_user) - 3)
+    assert cached >= len(second)
+
+
+def test_a_template_that_keeps_reasoning_keeps_superseding_boundaries(cpu):
+    """Negative control (AREX-2, measured live: a new user message just
+    extends the prefix): the template probe says it does not strip, no
+    session diverges, and message-boundary entries are superseded."""
+    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
+    assert scheduler._memguard_template_strips() is False
+    first = _hybrid_tokens(1, 1500)
+    prompt, _loop_start = _hybrid_tool_loop(scheduler, first, "a")
+    # The loop's next prompt: the last reply + a 700-token tool result.
+    cached, _out = _hybrid_run(scheduler, "next", prompt, len(prompt) - 3)
+    assert cached >= len(prompt) - len(_GEN_PROMPT) - 701 - 8
+    entries = scheduler.memory_aware_cache._entries
+    assert tuple(first) not in entries  # the loop's first boundary went
+    assert not getattr(scheduler, "_memguard_divergent_sessions", set())
+
+
+def test_a_side_branch_on_a_hybrid_does_not_supersede_the_main_line(cpu):
+    """Review 4 (live, Gabee Q8 = a hybrid): the branch shape on a
+    non-trimmable cache -- main's turn, a branch (main + one extra user
+    message), then main's next turn must still resume from main's entry."""
+    scheduler = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
+    first = _hybrid_tokens(1, 1500)
+    prompt, _loop_start = _hybrid_tool_loop(scheduler, first, "a")
+    _cached, out = _hybrid_run(scheduler, "main", prompt, len(prompt) - 3)
+    line = prompt + out
+    branch = line + [907] + _hybrid_tokens(81, 120) + _GEN_PROMPT
+    _hybrid_run(scheduler, "branch", branch, len(branch) - 3)
+    nxt = line + [904] + _hybrid_tokens(82, 300) + _GEN_PROMPT
+    cached, _out = _hybrid_run(scheduler, "main-next", nxt, len(nxt) - 3)
+    assert cached >= len(line) - 8, (len(line), cached)
