@@ -76,6 +76,7 @@ from ..service.helpers import (
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
 )
+from .session_outcome import anthropic_outcome, reports_outcome
 
 
 def _apply_anthropic_thinking_defaults(openai_request: ChatCompletionRequest) -> None:
@@ -619,6 +620,7 @@ def _estimate_anthropic_prompt_tokens(engine, messages, tools) -> int:
         Depends(check_rate_limit_or_x_api_key),
     ],
 )
+@reports_outcome(anthropic_outcome)
 async def create_anthropic_message(
     request: Request,
 ):

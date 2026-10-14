@@ -3574,6 +3574,10 @@ class BatchedEngine(BaseEngine):
         from ..request import SessionHint
 
         sid = session_id if isinstance(session_id, str) and session_id else None
+        if outcome is None:
+            from ..request import SESSION_OUTCOME
+
+            outcome = SESSION_OUTCOME.get()
         turn_start = (
             bool(messages)
             and isinstance(messages[-1], dict)

@@ -8,6 +8,7 @@ request management system, simplified for MLX backend.
 
 import enum
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -117,6 +118,15 @@ class SamplingParams:
             self.stop = []
         if self.stop_token_ids is None:
             self.stop_token_ids = []
+
+
+# The memory guard's outcome holder for the HTTP request being served, for
+# routes that do not thread it through their engine calls (/v1/messages,
+# /v1/responses): set at the route's entry, read by the engine when it
+# builds a SessionHint, filled by the route with the finish_reason.
+SESSION_OUTCOME: ContextVar[list | None] = ContextVar(
+    "rapid_mlx_session_outcome", default=None
+)
 
 
 @dataclass(frozen=True)

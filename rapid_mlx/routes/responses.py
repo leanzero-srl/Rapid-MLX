@@ -122,6 +122,7 @@ from ..service.helpers import (
     repair_messages_fit_context,
     served_chat_template,
 )
+from .session_outcome import reports_outcome, responses_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -879,6 +880,7 @@ def _enforce_responses_tool_choice(
         Depends(check_rate_limit),
     ],
 )
+@reports_outcome(responses_outcome)
 async def create_response(request: Request):
     """OpenAI Responses API entry point.
 
