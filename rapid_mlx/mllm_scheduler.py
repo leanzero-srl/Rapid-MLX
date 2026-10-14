@@ -111,6 +111,12 @@ class MLLMSchedulerConfig:
     # Prior-turn media boundary store/lookup (default ``"auto"``); ``"off"``
     # disables both directions and keeps the cold image path.
     mllm_media_prefix_cache: str = "auto"
+    # Prefix-cache byte budget: the same ``--cache-memory-mb`` /
+    # ``--cache-memory-percent`` the text scheduler reads. ``None`` = the
+    # ``MemoryCacheConfig`` default, so a config that never set them builds
+    # exactly the budget it built before these fields existed.
+    cache_memory_mb: int | None = None
+    cache_memory_percent: float | None = None
 
     def __post_init__(self) -> None:
         if self.mllm_singleton_fastpath not in ("auto", "off"):
@@ -598,6 +604,8 @@ class MLLMScheduler:
                 enable_prefix_cache=self.config.enable_prefix_cache,
                 singleton_fastpath=self.config.mllm_singleton_fastpath,
                 media_prefix_cache=self.config.mllm_media_prefix_cache,
+                cache_memory_mb=self.config.cache_memory_mb,
+                cache_memory_percent=self.config.cache_memory_percent,
                 structural_singleton=(
                     self.config.max_num_seqs == 1
                     and self.config.prefill_batch_size == 1

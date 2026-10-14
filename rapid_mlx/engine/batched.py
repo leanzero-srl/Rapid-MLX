@@ -1955,6 +1955,10 @@ class BatchedEngine(BaseEngine):
             mllm_media_prefix_cache=getattr(
                 self._scheduler_config, "mllm_media_prefix_cache", "auto"
             ),
+            cache_memory_mb=getattr(self._scheduler_config, "cache_memory_mb", None),
+            cache_memory_percent=getattr(
+                self._scheduler_config, "cache_memory_percent", None
+            ),
             vision_min_pixels=vision_min_pixels,
             vision_max_pixels=vision_max_pixels,
         )
