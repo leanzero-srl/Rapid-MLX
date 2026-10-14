@@ -6681,9 +6681,7 @@ class Scheduler:
             lines.pop(owner, None)
             kept.pop(owner, None)
             if not any(o[0] == owner[0] for o in lines):
-                self.__dict__.get("_memguard_rewriting_lines", set()).discard(
-                    owner[0]
-                )
+                self.__dict__.get("_memguard_rewriting_lines", set()).discard(owner[0])
         outlived: set[Any] = set()
         latest_older = 0
         for line, (first, last, *_r) in sorted(lines.items(), key=lambda kv: kv[1][0]):
@@ -6847,12 +6845,16 @@ class Scheduler:
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
-            if (key in heads or key in protected) and key not in branches and (
-                level == EVICT_UNUSED
-                or (
-                    finished is not None
-                    and level == EVICT_REDUNDANT
-                    and getattr(entry, "message_boundary", False)
+            if (
+                (key in heads or key in protected)
+                and key not in branches
+                and (
+                    level == EVICT_UNUSED
+                    or (
+                        finished is not None
+                        and level == EVICT_REDUNDANT
+                        and getattr(entry, "message_boundary", False)
+                    )
                 )
             ):
                 level = EVICT_NEEDED if key in protected else EVICT_HEAD
@@ -6870,8 +6872,7 @@ class Scheduler:
         if getattr(self, "_memory_guard", None) is None:
             return []
         return [
-            key
-            for key, _level, _cost in self._memguard_ranked_entries(recency=True)
+            key for key, _level, _cost in self._memguard_ranked_entries(recency=True)
         ]
 
     def _memguard_evictable_bytes(self, max_level: int) -> int:

@@ -40,8 +40,13 @@ def test_a_helper_turn_keeps_mains_turn_boundary(cpu):
     prompt, loop_start, _last = _hybrid_tool_loop(s, first, "a")
     h = _hybrid_tokens(700, 200) + _hybrid_tokens(701, 600)
     _hybrid_run(
-        s, "helper", h + _GEN_PROMPT, len(h), turn_start=True,
-        session="main", frame=200,
+        s,
+        "helper",
+        h + _GEN_PROMPT,
+        len(h),
+        turn_start=True,
+        session="main",
+        frame=200,
     )
     assert _levels(s)[tuple(first)] == EVICT_NEEDED
     # Duress: everything below NEEDED goes.
@@ -63,17 +68,28 @@ def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
     s = _hybrid_scheduler(_tiny_hybrid(), _tiny_tokenizer(False))
     frame = _hybrid_tokens(1, 300)
     main = frame + _hybrid_tokens(2, 1500)
-    _c, out = _hybrid_run(s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, **_MAIN)
+    _c, out = _hybrid_run(
+        s, "m0", main + _GEN_PROMPT, len(main), turn_start=True, **_MAIN
+    )
     summary = _hybrid_tokens(7, 200) + main[300:] + out + _hybrid_tokens(8, 50)
     _hybrid_run(
-        s, "summary", summary + _GEN_PROMPT, len(summary), turn_start=True,
-        session="main", frame=200,
+        s,
+        "summary",
+        summary + _GEN_PROMPT,
+        len(summary),
+        turn_start=True,
+        session="main",
+        frame=200,
     )
     compacted = frame + _hybrid_tokens(9, 400)
     for t in range(2):
         _c, out = _hybrid_run(
-            s, f"m{t + 1}", compacted + _GEN_PROMPT, len(compacted),
-            turn_start=True, **_MAIN,
+            s,
+            f"m{t + 1}",
+            compacted + _GEN_PROMPT,
+            len(compacted),
+            turn_start=True,
+            **_MAIN,
         )
         compacted = compacted + _GEN_PROMPT + out + _hybrid_tokens(20 + t, 100)
     levels = _levels(s)
@@ -87,8 +103,8 @@ def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
 
 from tests.test_memory_guard_session import (  # noqa: E402,F401
     GABEE_PHYSICAL,
-    _Device,
     _auto_budget_scheduler,
+    _Device,
     _drive,
     _new_tokens,
     _request,
@@ -111,7 +127,10 @@ def test_a_finished_chat_goes_before_the_new_chats_chunk_shrinks(
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, scheduler)
     if mode == "header":
-        a_kw, b_kw = {"session": "chatA", "frame": 320}, {"session": "chatB", "frame": 320}
+        a_kw, b_kw = (
+            {"session": "chatA", "frame": 320},
+            {"session": "chatB", "frame": 320},
+        )
     else:
         a_kw, b_kw = {"first_end": 330}, {"first_end": 330}
     old = _new_tokens(0, 320) + [3 + (i * 5) % 97 for i in range(5680)]
@@ -136,9 +155,9 @@ def test_a_finished_chat_goes_before_the_new_chats_chunk_shrinks(
     turns = []
     for turn in range(10):
         rid = f"new-{turn}"
-        outs = _drive(
-            scheduler, [_request(rid, prompt, 4, turn_start=True, **b_kw)]
-        )[rid]
+        outs = _drive(scheduler, [_request(rid, prompt, 4, turn_start=True, **b_kw)])[
+            rid
+        ]
         assert not outs[-1].error
         turns.append(outs[-1].cached_tokens)
         prompt = prompt + _tokens(outs) + _new_tokens(turn + 1, 496)
@@ -227,8 +246,10 @@ def test_twin_clients_without_a_session_id_keep_their_heads(llama, monkeypatch, 
             rid = f"{name}{t}"
             outs = _drive(s, [_request(rid, paths[name], 4, **kw)])[rid]
             rows.append((name, t, len(paths[name]), outs[-1].cached_tokens))
-            paths[name] = paths[name] + _tokens(outs) + _new_tokens(
-                10 * t + (1 if name == "A" else 2), 200
+            paths[name] = (
+                paths[name]
+                + _tokens(outs)
+                + _new_tokens(10 * t + (1 if name == "A" else 2), 200)
             )
     misses = [r for r in rows if r[1] > 0 and r[2] - r[3] > 210]
     assert not misses, misses

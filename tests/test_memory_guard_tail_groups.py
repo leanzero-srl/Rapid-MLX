@@ -48,7 +48,12 @@ TARGET = StepShape(1, 1567, 111_179)
 def _truth(chunk: int, context: int) -> float:
     start = context - chunk
     grows = (context + STEP - 1) // STEP > (start + STEP - 1) // STEP
-    return 48.0 * chunk * context + 1.36e6 * chunk + 0.3e9 + (4096 * context if grows else 0)
+    return (
+        48.0 * chunk * context
+        + 1.36e6 * chunk
+        + 0.3e9
+        + (4096 * context if grows else 0)
+    )
 
 
 def _ladder(seed: int) -> MemoryGuard:
