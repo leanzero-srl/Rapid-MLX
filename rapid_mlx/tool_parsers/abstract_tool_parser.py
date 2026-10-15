@@ -76,6 +76,62 @@ class ExtractedToolCallInformation:
     """Any content that wasn't part of tool calls."""
 
 
+_RESIDUAL_WRAPPER = re.compile(r"</?tool_call>")
+
+
+def settle_cut_call(
+    model_output: str,
+    request: Any,
+    result: ExtractedToolCallInformation,
+    warn_undeclared: bool,
+    where: str,
+) -> ExtractedToolCallInformation:
+    """Apply the cut-call rule to a parse of a COMPLETE output.
+
+    The output was cut inside call markup the parser did not admit (a
+    ``max_tokens`` stop mid-call): ``<tool_call>`` alone, a header still
+    being written, or ``<function=NAME>`` with its arguments unfinished. A
+    cut call whose name is known and may be called becomes a call with
+    empty arguments — the same answer every streaming path gives it, which
+    the client meets with a tool error so the agent goes on. Anything else
+    is dropped. Raw markup never reaches the answer (review of c88275f9c:
+    the streams had started returning it; the buffered parse always had).
+    """
+    from ..tool_call_scan import cut_call_name, warn_undeclared_call
+
+    cut = cut_call_name(model_output, request)
+    if cut is None:
+        return result
+    start, name = cut
+    tail = model_output[start:]
+    content = result.content or ""
+    trimmed = None
+    for form in (tail, _RESIDUAL_WRAPPER.sub("", tail)):
+        if form.strip() and content.rstrip().endswith(form.strip()):
+            trimmed = content.rstrip()[: len(content.rstrip()) - len(form.strip())]
+            break
+    if trimmed is None:
+        return result  # the parser already admitted it (a recovered call)
+    calls = list(result.tool_calls)
+    if name is not None:
+        tools = request.get("tools") if isinstance(request, dict) else None
+        declared = {
+            (t.get("function") or {}).get("name")
+            for t in tools or []
+            if isinstance(t, dict)
+        }
+        if warn_undeclared and name not in declared:
+            warn_undeclared_call(name, declared, f"{where} cut call")
+        calls.append(
+            {"id": f"call_{uuid.uuid4().hex[:8]}", "name": name, "arguments": "{}"}
+        )
+    return ExtractedToolCallInformation(
+        tools_called=bool(calls),
+        tool_calls=calls,
+        content=trimmed if trimmed.strip() else None,
+    )
+
+
 # Canonical wire-format labels each ToolParser subclass declares it handles.
 # Adding a new label here is a deliberate act — the audit script and the
 # parity test (test_tool_call_streaming_parity.py) cross-reference these

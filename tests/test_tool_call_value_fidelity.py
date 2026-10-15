@@ -543,11 +543,15 @@ def test_malformed_emissions_produce_no_tool_call(case, text):
     from rapid_mlx.api.tool_calling import parse_tool_calls
 
     _, calls = parse_tool_calls(text, _REQUEST)
-    assert not calls, (
+    # An output that ENDS inside a wrapped call (a max_tokens cut) is the
+    # cut-call rule's case: one call with EMPTY arguments, the answer every
+    # streaming path gives it — never a value read past the missing closer.
+    assert all(json.loads(c.function.arguments) == {} for c in calls or []), (
         f"[{case}] unterminated markup produced {len(calls)} call(s) with "
         f"arguments {[c.function.arguments for c in calls]!r} — the scanner "
         f"read past the missing closer and invented a value."
     )
+    assert len(calls or []) <= 1
 
 
 # Orderings where syntax alone cannot decide whether the second marker opens
