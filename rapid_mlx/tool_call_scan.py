@@ -54,6 +54,7 @@ __all__ = [
     "top_level_calls",
     "HEADER_FIRST",
     "call_shape",
+    "cut_call_name",
     "declared_tool_names",
     "find_value_close",
     "inside_code",
@@ -63,6 +64,7 @@ __all__ = [
     "segment_by_next_opener",
     "split_marked_calls",
     "split_marked_parameters",
+    "trailing_cut_call",
     "trim_wrapping_newlines",
     "warn_undeclared_call",
 ]
@@ -458,6 +460,92 @@ def inside_code(text: str, pos: int) -> bool:
         return True
     line_start = text.rfind("\n", 0, pos) + 1
     return text.count("`", line_start, pos) % 2 == 1
+
+
+_TRAILING_CUT = re.compile(
+    r"(?P<wrapper><tool_call>\s*)?<function=(?P<name>[^>\s]*)(?P<closed>>)?(?P<rest>.*)",
+    re.DOTALL,
+)
+
+
+def trailing_cut_call(text: str) -> tuple[int, str | None, bool] | None:
+    """A call the stream was CUT inside: ``(start, name, wrapped)``, or None.
+
+    ``text`` ends inside call markup that never closed — at ``<tool_call>``,
+    inside ``<function=NA``, at or after ``<function=NAME>`` (its first
+    parameter opened, even a value begun) — with nothing after it but that
+    markup. ``name`` is None when the header never completed. ``start`` is
+    where the markup begins (the wrapper, when there is one). A trailing
+    region that holds a close, prose after the header, or that sits inside
+    markdown code is not a cut call.
+
+    The rule it serves (review of c88275f9c): a cut-off call is a call with
+    broken arguments when its name is known and it may be called, and
+    NOTHING otherwise — never raw markup in the answer.
+    """
+    wrapper = text.rfind("<tool_call>")
+    header = text.rfind("<function=")
+    if wrapper == -1 and header == -1:
+        return None
+    if header != -1 and (wrapper == -1 or header > wrapper):
+        if wrapper != -1 and not text[wrapper + len("<tool_call>") : header].strip():
+            start = wrapper
+        else:
+            start = header
+    else:
+        start = wrapper
+    tail = text[start:]
+    if "</function>" in tail or "</tool_call>" in tail or inside_code(text, start):
+        return None
+    if not tail[len("<tool_call>") :].strip() and tail.startswith("<tool_call>"):
+        return start, None, True
+    match = _TRAILING_CUT.fullmatch(tail)
+    if match is None:
+        return None
+    wrapped = match.group("wrapper") is not None
+    if not match.group("closed"):
+        return start, None, wrapped  # the header never completed
+    rest = match.group("rest").lstrip()
+    if rest and not (rest.startswith("<parameter=") or "<parameter=".startswith(rest)):
+        return None  # prose after the header: text, not a cut call
+    return start, match.group("name").strip() or None, wrapped
+
+
+def cut_call_name(text: str, request: Any) -> tuple[int, str | None] | None:
+    """``(start, callable name or None)`` for a call the output was cut inside.
+
+    None when ``text`` does not end inside call markup, or when the request
+    passes text through verbatim (no tools, ``tool_choice`` none). The name
+    is returned only for a WRAPPED header whose name may be called: declared
+    (and the forced one, under a named ``tool_choice``) or, when undeclared
+    calls may surface, any name. Otherwise the markup is to be dropped — a
+    bare ``<function=NAME>`` at the end is indistinguishable from prose, and
+    a header that never completed names nothing.
+    """
+    if request is None or _field(request, "tool_choice") == "none":
+        return None
+    tools = _field(request, "tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    cut = trailing_cut_call(text)
+    if cut is None:
+        return None
+    start, name, wrapped = cut
+    if name is None or not wrapped:
+        return start, None
+    declared: set[str] = set()
+    for tool in tools:
+        function = _field(tool, "function")
+        tool_name = _field(function, "name") if function is not None else None
+        tool_name = tool_name or _field(tool, "name")
+        if isinstance(tool_name, str):
+            declared.add(tool_name)
+    forced = named_tool_choice(request)
+    if forced is not None:
+        return start, name if name == forced else None
+    if name in declared or may_surface_undeclared(request):
+        return start, name
+    return start, None
 
 
 def _field(value: Any, name: str) -> Any:

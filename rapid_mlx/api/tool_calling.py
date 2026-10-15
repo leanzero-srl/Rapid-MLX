@@ -20,12 +20,13 @@ from typing import Any
 from jsonschema import ValidationError, validate
 
 from ..tool_call_scan import (
-    declared_tool_names as _declared_tool_names,
-)
-from ..tool_call_scan import (
+    cut_call_name,
     split_marked_calls,
     split_marked_parameters,
     warn_undeclared_call,
+)
+from ..tool_call_scan import (
+    declared_tool_names as _declared_tool_names,
 )
 from .models import FunctionCall, ResponseFormat, ToolCall
 
@@ -744,7 +745,39 @@ def parse_tool_calls(
             cleaned_text = re.sub(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "", cleaned_text)
             cleaned_text = cleaned_text.strip()
 
+    cleaned_text, tool_calls = _settle_cut_call(text, request, cleaned_text, tool_calls)
     return cleaned_text, tool_calls if tool_calls else None
+
+
+def _settle_cut_call(
+    text: str,
+    request: dict[str, Any] | None,
+    cleaned_text: str,
+    tool_calls: list[ToolCall],
+) -> tuple[str, list[ToolCall]]:
+    """The cut-call rule for the scanner fallback (see
+    ``abstract_tool_parser.settle_cut_call``): output cut inside call markup
+    is a call with empty arguments when its name is known and callable, and
+    nothing otherwise — the markup never stays in the answer."""
+    cut = cut_call_name(text, request)
+    if cut is None:
+        return cleaned_text, tool_calls
+    start, name = cut
+    tail = text[start:].strip()
+    stripped = cleaned_text.rstrip()
+    if not tail or not stripped.endswith(tail):
+        return cleaned_text, tool_calls
+    cleaned_text = stripped[: len(stripped) - len(tail)].rstrip()
+    if name is not None:
+        tool_calls = [
+            *tool_calls,
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(name=name, arguments="{}"),
+            ),
+        ]
+    return cleaned_text, tool_calls
 
 
 def convert_tools_for_template(tools: list | None) -> list[dict] | None:
