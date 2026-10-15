@@ -3680,11 +3680,21 @@ class BatchedEngine(BaseEngine):
             *(tokens([*head, {"role": role, "content": probe}]) for probe in probes)
         )
         after = "assistant" if role == "user" else "user"
-        first_end = common(
-            *(
-                tokens([*head, message, {"role": after, "content": probe}])
-                for probe in probes
-            )
+        followed = [
+            tokens([*head, message, {"role": after, "content": probe}])
+            for probe in probes
+        ]
+        # ... and never past the message itself: rendered alone it ends where
+        # it ends. Two probe rows agree beyond that wherever the template
+        # opens the next row with fixed tokens -- Qwen3.5 / Qwen3.8 open an
+        # assistant row with an empty think block, which runs past the end
+        # of turn 1's prompt (its generation prompt opens the think block
+        # only): turn 1 was clamped to ('frame', 304) and every later turn
+        # was ('frame', 306), two lines for one conversation without a
+        # session id (RC6 interaction review, 2026-10-15).
+        first_end = min(
+            common(*followed),
+            common(followed[0], tokens([*head, message])),
         )
         result = (frame, max(frame, first_end))
         memo[digest] = result
