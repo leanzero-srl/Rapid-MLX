@@ -16,9 +16,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..tool_call_scan import (
-    declared_tool_names as _declared_tool_names,
-)
-from ..tool_call_scan import (
+    cut_call_name,
     inside_code,
     may_surface_undeclared,
     named_tool_choice,
@@ -26,11 +24,15 @@ from ..tool_call_scan import (
     split_marked_parameters,
     warn_undeclared_call,
 )
+from ..tool_call_scan import (
+    declared_tool_names as _declared_tool_names,
+)
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
     ToolParserManager,
     declared_parameter_names,
+    settle_cut_call,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ class NemotronToolParser(ToolParser):
     # sent and everything after it waits for the end-of-stream parse.
     _deferred = False
     _first_call_name: str | None = None
+    _stream_request: dict[str, Any] | None = None
 
     # Pattern for Nemotron-style with parameters.
     #
@@ -117,6 +120,7 @@ class NemotronToolParser(ToolParser):
         self._stream_started = False
         self._deferred = False
         self._first_call_name = None
+        self._stream_request = None
 
     def _visible_content_between(
         self,
@@ -244,6 +248,21 @@ class NemotronToolParser(ToolParser):
         return self._extract(model_output, request, warn_undeclared=True)
 
     def _extract(
+        self,
+        model_output: str,
+        request: dict[str, Any] | None,
+        *,
+        warn_undeclared: bool,
+    ) -> ExtractedToolCallInformation:
+        """``_extract_core`` plus the cut-call rule (``settle_cut_call``)."""
+        result = self._extract_core(
+            model_output, request, warn_undeclared=warn_undeclared
+        )
+        return settle_cut_call(
+            model_output, request, result, warn_undeclared, "nemotron"
+        )
+
+    def _extract_core(
         self,
         model_output: str,
         request: dict[str, Any] | None,
@@ -451,7 +470,7 @@ class NemotronToolParser(ToolParser):
         reads exactly what ``extract_tool_calls`` reads.
         """
         if not self._deferred:
-            return None
+            return self._finalize_cut_header(model_output, request)
         self._deferred = False
         result = self._extract(model_output, request, warn_undeclared=False)
         calls = list(result.tool_calls) if result.tools_called else []
@@ -485,8 +504,12 @@ class NemotronToolParser(ToolParser):
             )
         self.current_tool_id = len(tool_calls) - 1
         out: dict[str, Any] = {"tool_calls": tool_calls}
+        end = len(model_output)
+        cut = cut_call_name(model_output, request)
+        if cut is not None and cut[0] >= self._content_upto:
+            end = cut[0]  # a cut call's markup is never text
         content = self._visible_content_between(
-            model_output, self._content_upto, len(model_output), request
+            model_output, self._content_upto, end, request
         )
         self._content_upto = len(model_output)
         if content.strip():
@@ -504,9 +527,49 @@ class NemotronToolParser(ToolParser):
         """
         if self._deferred or self._content_upto >= len(full_text):
             return ""
-        held = full_text[self._content_upto :]
+        end = len(full_text)
+        # A stream CUT inside call markup releases only the text before it:
+        # a cut call is a call when its name is known (finalize sent it) and
+        # nothing otherwise — never raw markup in the answer.
+        cut = cut_call_name(full_text, self._stream_request)
+        if cut is not None and cut[0] >= self._content_upto:
+            end = cut[0]
+        held = full_text[self._content_upto : end]
         self._content_upto = len(full_text)
         return held
+
+    def _finalize_cut_header(
+        self, model_output: str, request: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """A stream that ended right at or after a callable header, before
+        the header could be confirmed (``_first_call_header`` waits for what
+        follows it): the call goes out with empty arguments, as the buffered
+        parse returns it."""
+        cut = cut_call_name(model_output, request)
+        if cut is None or cut[1] is None or cut[0] < self._content_upto:
+            return None
+        start, name = cut
+        content = self._visible_content_between(
+            model_output, self._content_upto, start, request
+        )
+        self._content_upto = len(model_output)
+        self.current_tool_id = 0
+        declared = _declared_tool_names(request)
+        if declared is not None and name not in declared:
+            warn_undeclared_call(name, declared, "nemotron stream cut call")
+        out: dict[str, Any] = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": generate_tool_id(),
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ]
+        }
+        if content.strip():
+            out["content"] = content
+        return out
 
     @staticmethod
     def _close_tag_count(text: str) -> int:
@@ -561,6 +624,8 @@ class NemotronToolParser(ToolParser):
         """
         Extract tool calls from streaming Nemotron model output.
         """
+        if request is not None:
+            self._stream_request = request
         if not self._stream_started or not previous_text:
             # The postprocessor's plain-text fast path can forward an opening
             # prefix without invoking this parser. On the first parser call of
