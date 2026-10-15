@@ -59,8 +59,10 @@ model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
   SYSTEM_PRESSURE_WARN /        2 / 4  the kernel's own memory-pressure enum
     _CRITICAL (memory_budget)          (kern.memorystatus_vm_pressure_level)
   idle-base window              OBS_PER_GROUP idle samples (statistics)
-  floor chunk                   KVCache.step (mlx-lm, read at runtime;
-                                256) unless the operator sets one
+  floor chunk                   KVCache.step: an mlx-lm library constant
+                                (256), read at runtime, not measured on the
+                                device; the KV growth granularity. Operator
+                                override: SchedulerConfig only (no CLI flag)
   normal (largest) chunk        the engine's prefill_step_size; the guard
                                 derives the largest that fits, never more
   idle line / Metal trigger     1 - MARGIN_CEILING_RATIO under the guard
@@ -147,6 +149,12 @@ REAPPLY_RATIO = 0.05
 # Pair slopes are trusted only across a context span of at least this many
 # chunks AND this fraction of the larger context, so measurement noise in the
 # peak (a few hundred MB) cannot dominate the fitted attention coefficient.
+# Consequence, kept on purpose (review 11): a group holds OBS_PER_GROUP
+# consecutive chunks, so no pair qualifies once the context exceeds
+# chunk x (OBS_PER_GROUP - 1) / SLOPE_MIN_SPAN_FRACTION (~123k tokens at 2,048):
+# there the fit is silent, the coefficient keeps the value measured where
+# pairs exist (at 25% spans the run-to-run noise is a ~10% slope error; at a
+# shorter span it would dominate), and an overshoot raise decays back to it.
 SLOPE_MIN_SPAN_CHUNKS = 4
 SLOPE_MIN_SPAN_FRACTION = 0.25
 # Observations kept per (batch, chunk) group for pair slopes, and per
@@ -323,12 +331,17 @@ class PeakModel:
     ) -> None:
         self.prior = prior
         # The smallest chunk whose context slope says anything about ``a``:
-        # the guard's floor chunk (mlx-lm's KVCache growth step, read at
-        # runtime, unless the operator chose one). A smaller chunk usually
-        # writes inside the KV buffer's slack and pays no growth copy, so
-        # its slope is not ``a*u + g`` (review 10: the 12-48-token tails of
-        # every goose turn, plus a few measurement outliers, drove ``a`` to
-        # 0.00 on Gabee -- a 2046 x 95,146 step planned 4.07 GB short).
+        # the guard's floor chunk. Honestly: that is mlx-lm's ``KVCache.step``
+        # -- a library constant (256 today), read at runtime rather than
+        # typed, NOT a device measurement. It is the right physics: it is the
+        # granularity at which mlx-lm grows a KV buffer by concatenation, so
+        # a smaller chunk usually writes inside the buffer's slack and pays
+        # no growth copy, and its slope is not ``a*u + g`` (review 10: the
+        # 12-48-token tails of every goose turn, plus a few measurement
+        # outliers, drove ``a`` to 0.00 on Gabee -- a 2046 x 95,146 step
+        # planned 4.07 GB short). The operator override
+        # (``SchedulerConfig.adaptive_prefill_min_chunk_size``) is reachable
+        # only programmatically: the CLI does not expose it.
         if fit_floor_tokens is None:
             try:
                 fit_floor_tokens = kv_growth_step()
@@ -336,6 +349,9 @@ class PeakModel:
                 fit_floor_tokens = 1
         self.fit_floor_tokens = max(1, int(fit_floor_tokens))
         self._a_learned: float | None = None
+        # The coefficient as the pair fit last set it (before any overshoot
+        # raise): what a raise decays back to while the fit is silent.
+        self._a_fit: float | None = None
         self._b_learned: float | None = None
         self._groups: dict[tuple[int, int], deque[_Obs]] = {}
         self._by_tokens: dict[int, deque[_Obs]] = {}
@@ -462,6 +478,21 @@ class PeakModel:
                 a = self._bounded(a, self._a_learned)
                 b = self._bounded(b, self._b_learned)
             self._a_learned, self._b_learned = a, b
+            self._a_fit = a
+        elif (
+            self._a_learned is not None
+            and self._a_fit is not None
+            and self._a_learned > self._a_fit
+        ):
+            # No group yields a pair spanning SLOPE_MIN_SPAN_FRACTION of the
+            # context -- with OBS_PER_GROUP chunks of 2,048 that is every
+            # step beyond ~131k tokens -- so the fit is silent and cannot
+            # pull an overshoot raise back: it decays toward the last fitted
+            # value by the raise's own bound per observation (review 11: one
+            # +4 GB outlier at 140k held 48.2 -> 53.0 for good, six 64.2).
+            self._a_learned = max(
+                self._a_fit, self._a_learned / (1.0 + MARGIN_TRANSIENT_RATIO)
+            )
         self._rebuild_envelope()
 
     def _rebuild_envelope(self) -> None:
@@ -537,8 +568,10 @@ class PeakModel:
         a one-off moves it little. The pair medians follow only once a group
         holds enough pairs, and an under-plan is the one error that becomes
         an OOM (review 10: Gabee planned 8.53 GB, measured 12.45 GB, and the
-        coefficient went 0.00 -> 0.00). The robust fit pulls it back, one
-        bounded step per observation, if the overshoot was a one-off."""
+        coefficient went 0.00 -> 0.00). If the overshoot was a one-off, the
+        pair fit pulls it back one bounded step per observation -- or, where
+        the fit is silent (long contexts), it decays back to the last fitted
+        value (``_rebuild``)."""
         if not fit or self._a_learned is None or shape.chunk < self.fit_floor_tokens:
             return
         excess = transient - projected_before
@@ -546,10 +579,10 @@ class PeakModel:
             return
         a = self._a_learned
         a_cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
-        if a <= 0:
-            raised = excess / shape.units
-        else:
-            raised = min(a + excess / shape.units, a * (1.0 + MARGIN_TRANSIENT_RATIO))
+        # One rule at every a, 0 included (review 11: 0 -> 5.5 while
+        # 0.01 -> 0.011): a coefficient the evidence put at 0 is moved by the
+        # pair fit, never by one step's excess.
+        raised = min(a + excess / shape.units, a * (1.0 + MARGIN_TRANSIENT_RATIO))
         raised = min(raised, a_cap)
         if raised > a:
             self._a_learned = raised
