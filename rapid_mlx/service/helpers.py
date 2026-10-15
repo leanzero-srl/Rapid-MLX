@@ -878,6 +878,7 @@ def _should_start_in_thinking(
     *,
     unconditional: bool = False,
     tools_requested: bool = False,
+    rendered: bool = False,
 ) -> bool:
     """Shared predicate: does this chat template start the assistant
     response inside an implicit ``<think>`` block?
@@ -920,7 +921,12 @@ def _should_start_in_thinking(
         return False
     if enable_thinking is False and not unconditional:
         return False
-    if unconditional:
+    # ``rendered`` asks for the same render-based answer as ``unconditional``
+    # (does the generation prompt END inside an open think block?) while
+    # still honouring an explicit ``enable_thinking=False`` above. A source
+    # scan only says the template MENTIONS ``<think>``, which a template that
+    # renders history think blocks also does without priming the next turn.
+    if unconditional or rendered:
         present_pairs = [
             pair for pair in _IMPLICIT_THINK_MARKER_PAIRS if pair[0] in chat_template
         ]

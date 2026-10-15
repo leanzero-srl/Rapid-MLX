@@ -28,6 +28,30 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         Output: reasoning="reasoning content", content="final answer"
     """
 
+    #: Ask the request configuration for the RENDERED priming answer (see
+    #: ``_should_start_in_thinking(rendered=True)``), not the template scan.
+    prompt_priming_rendered = True
+
+    def configure_request(
+        self,
+        *,
+        enable_thinking: bool | None = None,
+        prompt_thinking_active: bool | None = None,
+    ) -> None:
+        """Start a request knowing whether the prompt already opened ``<think>``.
+
+        Qwen3.5/3.6/3.8 templates end the generation prompt with ``<think>\n``
+        whenever thinking is on, so the model's output starts INSIDE the
+        thought and carries no opening tag. Without this signal the no-tag
+        threshold below routed every character past the 64th to content: a
+        Qwen3.8 turn streamed ~60 characters of reasoning and then thousands
+        of characters of its own thinking as the visible answer (T12 bake-off,
+        2026-10-15: "...Context usage is at 7" | "9% - should conserve").
+        """
+        del enable_thinking
+        self.reset_state()
+        self._prompt_primed_thinking = prompt_thinking_active is True
+
     @property
     def start_token(self) -> str:
         return "<think>"
@@ -303,16 +327,6 @@ class DeepSeekR1DistillReasoningParser(DeepSeekR1ReasoningParser):
 
     implicit_reasoning_until_close = True
     sanitize_when_thinking_disabled = True
-
-    def configure_request(
-        self,
-        *,
-        enable_thinking: bool | None = None,
-        prompt_thinking_active: bool | None = None,
-    ) -> None:
-        del enable_thinking
-        self.reset_state()
-        self._prompt_primed_thinking = prompt_thinking_active is True
 
     def extract_reasoning(
         self,

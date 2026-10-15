@@ -160,6 +160,7 @@ def _should_start_in_thinking(
     *,
     unconditional: bool = False,
     tools_requested: bool = False,
+    rendered: bool = False,
 ) -> bool:
     """Thin wrapper over the shared
     ``service.helpers._should_start_in_thinking`` predicate.
@@ -178,6 +179,7 @@ def _should_start_in_thinking(
         enable_thinking,
         unconditional=unconditional,
         tools_requested=tools_requested,
+        rendered=rendered,
     )
 
 
@@ -2168,6 +2170,14 @@ async def _stream_anthropic_messages(
                     chat_kwargs.get("enable_thinking"),
                     unconditional=True,
                     tools_requested=bool(chat_kwargs.get("tools")),
+                )
+            elif getattr(reasoning_parser, "prompt_priming_rendered", False):
+                configure_kwargs["prompt_thinking_active"] = _should_start_in_thinking(
+                    getattr(getattr(engine, "tokenizer", None), "chat_template", "")
+                    or "",
+                    chat_kwargs.get("enable_thinking"),
+                    tools_requested=bool(chat_kwargs.get("tools")),
+                    rendered=True,
                 )
             configure_request(**configure_kwargs)
         else:
