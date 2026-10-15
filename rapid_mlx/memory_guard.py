@@ -821,24 +821,33 @@ class MemoryGuard:
         # E5: [context_threshold, extra_bytes, original] decaying margins.
         self._backstop: list[list[float]] = []
 
-    @property
-    def _whole_kv_layers(self) -> float:
+    def _whole_kv_layers(
+        self, context: int = 0, kv_footprint: Callable[[int], int] | None = None
+    ) -> float:
         """A whole copy of the KV, in full-attention layers (the cap of every
-        per-context term)."""
+        decode term): the engine's own KV footprint per token where it is
+        given, else the model config's."""
         g = self.model.prior.kv_copy_bytes_per_context
         if g <= 0:
             return MAX_PRIOR_MULTIPLE
         whole = self.model.prior.kv_bytes_per_token or MAX_PRIOR_MULTIPLE * g
+        if kv_footprint is not None and context > 0:
+            whole = max(whole, int(kv_footprint(int(context))) / int(context))
         return max(g, whole) / g
 
-    @property
-    def decode_growth_layers(self) -> float:
+    def growth_layers(
+        self, context: int = 0, kv_footprint: Callable[[int], int] | None = None
+    ) -> float:
         """Full-attention layers of the context a KV-growth decode step holds
         beyond the footprint: the largest of the recent measured growth
         steps, a whole copy of the KV before the first one."""
         if self._growth_layers:
             return max(self._growth_layers)
-        return self._whole_kv_layers
+        return self._whole_kv_layers(context, kv_footprint)
+
+    @property
+    def decode_growth_layers(self) -> float:
+        return self.growth_layers()
 
     # -- arithmetic -----------------------------------------------------
     def margin(self, transient: int, ceiling: int) -> int:
@@ -1224,7 +1233,8 @@ class MemoryGuard:
         step = kv_growth_step()
         rows = max(1, int(batch))
         layer = self.model.prior.kv_copy_bytes_per_context
-        grown = self.decode_growth_layers * layer * (int(context) + step) * rows
+        layers = self.growth_layers(int(context), kv_footprint)
+        grown = layers * layer * (int(context) + step) * rows
         if kv_footprint is not None:
             block = int(kv_footprint(int(context) + step)) - int(
                 kv_footprint(int(context))
@@ -1275,7 +1285,8 @@ class MemoryGuard:
         planned = max(0, int(planned))
         rows = max(1, int(batch))
         g = self.model.prior.kv_copy_bytes_per_context
-        cap = g * self._whole_kv_layers
+        whole = self._whole_kv_layers(int(context), kv_footprint)
+        cap = g * whole
         step_term = self.decode_step(context, batch=rows)
         if grew:
             step = kv_growth_step()
@@ -1290,10 +1301,11 @@ class MemoryGuard:
             if unit <= 0:
                 return False
             layers = (int(transient) - step_term - block * rows) / unit
-            layers = min(self._whole_kv_layers, max(0.0, layers))
-            before_layers = self.decode_growth_layers
+            layers = min(whole, max(0.0, layers))
+            before_layers = self.growth_layers(int(context), kv_footprint)
             self._growth_layers.append(layers)
-            if self.decode_growth_layers > before_layers * (1.0 + REAPPLY_RATIO):
+            after_layers = self.growth_layers(int(context), kv_footprint)
+            if abs(after_layers - before_layers) > before_layers * REAPPLY_RATIO:
                 logger.warning(
                     "[memory_guard] KV-growth decode step measured %.2fGB beyond "
                     "the footprint at context %d (planned %.2fGB): growth "
@@ -1302,7 +1314,7 @@ class MemoryGuard:
                     int(context),
                     _gb(planned),
                     before_layers,
-                    self.decode_growth_layers,
+                    after_layers,
                 )
             return True
         if int(transient) <= planned + self.margin(planned, ceiling):
