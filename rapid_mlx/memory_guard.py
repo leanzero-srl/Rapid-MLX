@@ -318,8 +318,23 @@ class PeakModel:
     see :meth:`MemoryGuard.record_backstop`.
     """
 
-    def __init__(self, prior: PeakPrior) -> None:
+    def __init__(
+        self, prior: PeakPrior, *, fit_floor_tokens: int | None = None
+    ) -> None:
         self.prior = prior
+        # The smallest chunk whose context slope says anything about ``a``:
+        # the guard's floor chunk (mlx-lm's KVCache growth step, read at
+        # runtime, unless the operator chose one). A smaller chunk usually
+        # writes inside the KV buffer's slack and pays no growth copy, so
+        # its slope is not ``a*u + g`` (review 10: the 12-48-token tails of
+        # every goose turn, plus a few measurement outliers, drove ``a`` to
+        # 0.00 on Gabee -- a 2046 x 95,146 step planned 4.07 GB short).
+        if fit_floor_tokens is None:
+            try:
+                fit_floor_tokens = kv_growth_step()
+            except Exception:  # noqa: BLE001 -- no mlx-lm: no floor to read
+                fit_floor_tokens = 1
+        self.fit_floor_tokens = max(1, int(fit_floor_tokens))
         self._a_learned: float | None = None
         self._b_learned: float | None = None
         self._groups: dict[tuple[int, int], deque[_Obs]] = {}
@@ -360,6 +375,8 @@ class PeakModel:
         one group ``dT/dX = a * batch * chunk + b`` (the linear terms cancel)."""
         out: list[tuple[int, float]] = []
         for (batch, chunk), group in self._groups.items():
+            if chunk < self.fit_floor_tokens:
+                continue  # below the floor chunk: see ``fit_floor_tokens``
             obs = list(group)
             slopes: list[float] = []
             for i in range(len(obs)):
@@ -410,7 +427,10 @@ class PeakModel:
             if var > 0:
                 a = sum((u - mu) * (sl - ms) for u, sl in groups) / var
                 b = ms - a * mu
-            if a is None or a < 0 or b is None or b < g:
+            # A context term outside [one layer's copy, a whole copy of the
+            # KV] is no separation: it is ``a`` leaking into ``b`` (a tiny
+            # ``a`` with a huge, clamped ``b`` -- review 10). Fall through.
+            if a is None or a < 0 or b is None or b < g or b > b_cap:
                 a = b = None  # not separable on this data: fall through
         if a is None:
             # Not separable: b = the analytic copy, a = the MEDIAN over chunk
@@ -442,6 +462,9 @@ class PeakModel:
                 a = self._bounded(a, self._a_learned)
                 b = self._bounded(b, self._b_learned)
             self._a_learned, self._b_learned = a, b
+        self._rebuild_envelope()
+
+    def _rebuild_envelope(self) -> None:
         a = self.attention_bytes_per_unit
         running = 0.0
         env: list[tuple[int, float]] = []
@@ -491,6 +514,7 @@ class PeakModel:
             self.worst_transient = transient
             self.worst_shape = shape
         obs = _Obs(shape, transient)
+        projected_before = self.project(shape)
         if fit:
             self._groups.setdefault(
                 (shape.batch, shape.chunk), deque(maxlen=OBS_PER_GROUP)
@@ -500,7 +524,36 @@ class PeakModel:
         )
         before = (self._a_learned, self._b_learned, list(self._envelope))
         self._rebuild()
+        self._raise_on_overshoot(shape, transient, projected_before, fit)
         return before != (self._a_learned, self._b_learned, self._envelope)
+
+    def _raise_on_overshoot(
+        self, shape: StepShape, transient: int, projected_before: int, fit: bool
+    ) -> None:
+        """A step at or above the floor chunk that measured beyond the
+        model's own error bound (MARGIN_TRANSIENT_RATIO) over its plan RAISES
+        ``a`` -- toward explaining the excess by attention, by at most that
+        same error bound per observation, so repeated overshoots compound and
+        a one-off moves it little. The pair medians follow only once a group
+        holds enough pairs, and an under-plan is the one error that becomes
+        an OOM (review 10: Gabee planned 8.53 GB, measured 12.45 GB, and the
+        coefficient went 0.00 -> 0.00). The robust fit pulls it back, one
+        bounded step per observation, if the overshoot was a one-off."""
+        if not fit or self._a_learned is None or shape.chunk < self.fit_floor_tokens:
+            return
+        excess = transient - projected_before
+        if excess <= MARGIN_TRANSIENT_RATIO * projected_before or shape.units <= 0:
+            return
+        a = self._a_learned
+        a_cap = MAX_PRIOR_MULTIPLE * self.prior.attention_bytes_per_unit
+        if a <= 0:
+            raised = excess / shape.units
+        else:
+            raised = min(a + excess / shape.units, a * (1.0 + MARGIN_TRANSIENT_RATIO))
+        raised = min(raised, a_cap)
+        if raised > a:
+            self._a_learned = raised
+            self._rebuild_envelope()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -640,7 +693,7 @@ class MemoryGuard:
     """Decision procedure + bookkeeping for the step-peak guard."""
 
     def __init__(self, prior: PeakPrior, *, floor_tokens: int) -> None:
-        self.model = PeakModel(prior)
+        self.model = PeakModel(prior, fit_floor_tokens=floor_tokens)
         # The floor: mlx-lm's KVCache grows in 256-token steps, so a chunk
         # below that buys no KV-growth relief, and each chunk re-reads every
         # weight once, so chunks this small already cost throughput. The
