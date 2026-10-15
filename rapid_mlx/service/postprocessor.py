@@ -347,29 +347,18 @@ class StreamingPostProcessor:
                 except (TypeError, ValueError):
                     configure_parameters = {}
                 if "prompt_thinking_active" in configure_parameters:
-                    from .helpers import _should_start_in_thinking
+                    from .helpers import _prompt_thinking_active_for
 
                     tokenizer = getattr(cfg.engine, "tokenizer", None)
                     template = getattr(tokenizer, "chat_template", "") or ""
                     configure_kwargs["prompt_thinking_active"] = (
-                        _should_start_in_thinking(
+                        _prompt_thinking_active_for(
+                            self.reasoning_parser,
                             template,
                             enable_thinking,
-                            unconditional=bool(
-                                getattr(
-                                    self.reasoning_parser,
-                                    "implicit_reasoning_until_close",
-                                    False,
-                                )
-                            ),
                             tools_requested=self.tools_requested,
-                            rendered=bool(
-                                getattr(
-                                    self.reasoning_parser,
-                                    "prompt_priming_rendered",
-                                    False,
-                                )
-                            ),
+                            model_name=getattr(cfg, "model_path", None)
+                            or getattr(cfg, "model_name", None),
                         )
                     )
                 if "json_mode" in configure_parameters:
@@ -2514,29 +2503,18 @@ class StreamingPostProcessor:
                 except (TypeError, ValueError):
                     configure_parameters = {}
                 if "prompt_thinking_active" in configure_parameters:
-                    from .helpers import _should_start_in_thinking
+                    from .helpers import _prompt_thinking_active_for
 
                     tokenizer = getattr(self.cfg.engine, "tokenizer", None)
                     template = getattr(tokenizer, "chat_template", "") or ""
                     configure_kwargs["prompt_thinking_active"] = (
-                        _should_start_in_thinking(
+                        _prompt_thinking_active_for(
+                            self.reasoning_parser,
                             template,
                             self.enable_thinking,
-                            unconditional=bool(
-                                getattr(
-                                    self.reasoning_parser,
-                                    "implicit_reasoning_until_close",
-                                    False,
-                                )
-                            ),
                             tools_requested=self.tools_requested,
-                            rendered=bool(
-                                getattr(
-                                    self.reasoning_parser,
-                                    "prompt_priming_rendered",
-                                    False,
-                                )
-                            ),
+                            model_name=getattr(self.cfg, "model_path", None)
+                            or getattr(self.cfg, "model_name", None),
                         )
                     )
                 if "json_mode" in configure_parameters:

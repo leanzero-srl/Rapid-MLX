@@ -52,6 +52,7 @@ from ..service.helpers import (
     _check_admission_or_503,
     _disconnect_guard,
     _effective_enable_thinking,
+    _prompt_thinking_active_for,
     _finalize_content_and_reasoning,
     _parse_tool_calls_with_parser,
     _raise_lifecycle_cancel_or_reraise,
@@ -2163,21 +2164,16 @@ async def _stream_anthropic_messages(
         configure_request = getattr(reasoning_parser, "configure_request", None)
         if callable(configure_request):
             configure_kwargs = {"enable_thinking": chat_kwargs.get("enable_thinking")}
-            if getattr(reasoning_parser, "implicit_reasoning_until_close", False):
-                configure_kwargs["prompt_thinking_active"] = _should_start_in_thinking(
-                    getattr(getattr(engine, "tokenizer", None), "chat_template", "")
-                    or "",
-                    chat_kwargs.get("enable_thinking"),
-                    unconditional=True,
-                    tools_requested=bool(chat_kwargs.get("tools")),
-                )
-            elif getattr(reasoning_parser, "prompt_priming_rendered", False):
-                configure_kwargs["prompt_thinking_active"] = _should_start_in_thinking(
+            if getattr(
+                reasoning_parser, "implicit_reasoning_until_close", False
+            ) or getattr(reasoning_parser, "prompt_priming_rendered", False):
+                configure_kwargs["prompt_thinking_active"] = _prompt_thinking_active_for(
+                    reasoning_parser,
                     getattr(getattr(engine, "tokenizer", None), "chat_template", "")
                     or "",
                     chat_kwargs.get("enable_thinking"),
                     tools_requested=bool(chat_kwargs.get("tools")),
-                    rendered=True,
+                    model_name=cfg.model_path or cfg.model_name,
                 )
             configure_request(**configure_kwargs)
         else:
