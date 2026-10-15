@@ -369,8 +369,8 @@ def test_a_long_session_keeps_hitting_turn_after_turn(llama, monkeypatch):
     end-of-turn entry TAKES OVER the finished request's KV (no second copy),
     the next turn takes it over in turn when copying it would not fit, and
     the turn's own prompt entry is redundant once the end-of-turn entry is
-    in. The decode step at which the KV grows (~2 layers of the context
-    beyond the footprint) is in the plan and in the window.
+    in. The decode step at which the KV grows (its measured growth layers
+    of the context beyond the footprint) is in the plan and in the window.
 
     RED on 605548ef6 (same device): end-of-turn stores skipped from 8.1k,
     0 prefix entries left from 10.1k, every later turn a full re-prefill.
