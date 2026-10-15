@@ -34,6 +34,7 @@ from typing import Any
 from ..api.tool_calling import _decode_json_like, _schema_type
 from ..tool_call_scan import (
     CallShape,
+    cut_call_name,
     find_value_close,
     inside_code,
     scan_marked_parameters,
@@ -45,6 +46,7 @@ from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
     ToolParserManager,
+    settle_cut_call,
 )
 
 logger = logging.getLogger(__name__)
@@ -316,14 +318,22 @@ class Qwen3CoderToolParser(ToolParser):
         """Text withheld after an opener that never became a call.
 
         Called by the postprocessor at stream end when no call reached the
-        wire: ``Hmm <tool_call> is the opener.``, a stream cut mid-header, a
-        header followed by a ``{`` that never closed. The buffered parser
-        returns those bytes as content; the stream used to drop them.
+        wire: ``Hmm <tool_call> is the opener.``, a header followed by a
+        ``{`` that never closed. The buffered parser returns those bytes as
+        content. A stream CUT inside call markup (``<tool_call>``,
+        ``<function=sh``) releases only the text before it: a cut call is a
+        call when its name is known, and nothing otherwise — never raw
+        markup in the answer.
         """
         start = self._pending_tool_start
         if start is None or self.header_sent or self._first_call_start is not None:
             return ""
-        return full_text[start:] if start < len(full_text) else ""
+        if start >= len(full_text):
+            return ""
+        cut = cut_call_name(full_text, self._streaming_request)
+        if cut is not None and cut[0] >= start:
+            return full_text[start : cut[0]]
+        return full_text[start:]
 
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
@@ -906,6 +916,18 @@ class Qwen3CoderToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         """``extract_tool_calls``; the legacy-raw stream finalizer passes
         ``warn_undeclared=False`` and warns only for the calls it emits."""
+        result = self._extract_tool_calls_core(
+            model_output, request, warn_undeclared=warn_undeclared
+        )
+        return settle_cut_call(model_output, request, result, warn_undeclared, "qwen3")
+
+    def _extract_tool_calls_core(
+        self,
+        model_output: str,
+        request: dict[str, Any] | None,
+        *,
+        warn_undeclared: bool,
+    ) -> ExtractedToolCallInformation:
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output

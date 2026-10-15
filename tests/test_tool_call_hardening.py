@@ -752,9 +752,14 @@ PAIR_CALLS = [
 )
 def test_text_after_real_calls_never_merges_them(trailer):
     """The merge pass counted ANY header (or a quoted close) after a call as
-    its value running on, and folded the shell call into the write."""
+    its value running on, and folded the shell call into the write. A call
+    CUT after them is a third call with empty arguments (the cut-call rule
+    below), never part of the shell call and never markup."""
+    expected = list(PAIR_CALLS)
+    if trailer.startswith("\n<tool_call>"):
+        expected.append((trailer.split("<function=")[1].split(">")[0], {}))
     for path, calls in _all_paths(PAIR + trailer, _request(), size=7).items():
-        assert calls == PAIR_CALLS, (path, calls)
+        assert calls == expected, (path, calls)
 
 
 @pytest.mark.parametrize(
@@ -812,7 +817,6 @@ def test_a_long_call_whose_content_names_a_tool_is_still_a_call(content):
     "text",
     [
         "Hmm <tool_call> is the opener. Nothing more.",
-        "Let me check.\n<tool_call>\n<function=sh",
         "Write <function=shell>{like this} in prose.",
     ],
 )
@@ -820,3 +824,112 @@ def test_qwen_releases_withheld_text_that_never_became_a_call(text):
     out = _parser_stream("qwen3_coder_xml", text, 3, _request())
     assert out["calls"] == []
     assert out["content"] == text
+
+
+# ---------------------------------------------------------------------------
+# RC2 review of c88275f9c: a stream CUT inside call markup. A cut call is a
+# call with broken arguments when its name is known and callable, and
+# NOTHING otherwise — never raw markup in the answer, streamed or not.
+# ---------------------------------------------------------------------------
+
+from rapid_mlx.engine.base import GenerationOutput as _Output  # noqa: E402
+
+
+class _BufferedEngine(_Engine):
+    def __init__(self, text: str):
+        super().__init__([text])
+        self._text = text
+
+    async def chat(self, messages, **kwargs):
+        return _Output(
+            text=self._text,
+            raw_text=self._text,
+            prompt_tokens=4,
+            completion_tokens=8,
+            finished=True,
+            finish_reason="stop",
+        )
+
+
+def _non_stream(model_text: str, request: dict, parser: str) -> dict:
+    cfg = reset_config()
+    cfg.engine = _BufferedEngine("<think>plan</think>\n" + model_text)
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    cfg.enable_auto_tool_choice = True
+    cfg.tool_call_parser = parser
+    cfg.reasoning_parser_name = "deepseek_r1"
+    app = FastAPI()
+    app.include_router(chat_router)
+    resp = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "go"}],
+            **request,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    choice = resp.json()["choices"][0]
+    return {
+        "content": choice["message"].get("content") or "",
+        "calls": [
+            {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}
+            for c in choice["message"].get("tool_calls") or []
+        ],
+        "finish": [choice["finish_reason"]],
+    }
+
+
+CUTS = {
+    "at-wrapper": ("Let me check.\n<tool_call>", None),
+    "mid-header": ("Let me check.\n<tool_call>\n<function=sh", None),
+    "at-header": ("Let me check.\n<tool_call>\n<function=shell>", "shell"),
+    "after-header": ("Let me check.\n<tool_call>\n<function=shell>\n", "shell"),
+    "in-first-value": (
+        "Let me check.\n<tool_call>\n<function=shell>\n<parameter=command>\nl",
+        "shell",
+    ),
+    "undeclared-at-header": ("Let me check.\n<tool_call>\n<function=run>", "run"),
+}
+
+
+def _assert_cut(out: dict, name: str | None, where: str) -> None:
+    assert "<tool_call>" not in out["content"], (where, out)
+    assert "<function=" not in out["content"], (where, out)
+    assert out["content"].strip() == "Let me check.", (where, out)
+    if name is None:
+        assert out["calls"] == [], (where, out)
+        assert out["finish"][-1] == "stop", (where, out)
+    else:
+        assert [c["name"] for c in out["calls"]] == [name], (where, out)
+        assert "<" not in out["calls"][0]["arguments"], (where, out)
+        assert out["finish"][-1] == "tool_calls", (where, out)
+
+
+@pytest.mark.parametrize("parser", ["qwen3_coder_xml", "nemotron"])
+@pytest.mark.parametrize("cut", sorted(CUTS))
+def test_a_cut_call_is_a_call_or_nothing_never_markup(parser, cut):
+    text, name = CUTS[cut]
+    for size in (1, 3, 100000):
+        _assert_cut(_stream(text, size, _request(), parser), name, f"stream/{size}")
+    out = _non_stream(text, _request(), parser)
+    _assert_cut(out, name, "non-stream")
+    if name is not None:
+        assert json.loads(out["calls"][0]["arguments"]) == {}
+    result = ToolParserManager.get_tool_parser(parser)(None).extract_tool_calls(
+        text, _request()
+    )
+    assert "<tool_call>" not in (result.content or ""), result
+    assert [c["name"] for c in result.tool_calls] == ([name] if name else [])
+    _, calls = parse_tool_calls(text, _request())
+    assert [c.function.name for c in calls or []] == ([name] if name else [])
+
+
+def test_a_cut_header_under_tool_choice_none_is_left_verbatim():
+    """``tool_choice="none"`` passes the model's text through as written."""
+    text, _ = CUTS["at-header"]
+    out = _stream(text, 3, _request(tool_choice="none"), "qwen3_coder_xml")
+    assert out["calls"] == []
