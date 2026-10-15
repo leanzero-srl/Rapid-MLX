@@ -22,7 +22,8 @@ buffers (``mx.contiguous`` does not copy a whole contiguous buffer), so
 the bytes the store's room check made room for were allocated at the live
 cache's next write -- the first decode step of every turn (+60.5 MB at
 7,100 tokens against 17.2 MB planned). RC6's slack hid it; a fixed cost
-planned beside it crossed. The store now copies there.
+planned beside it crossed. The buffers stay shared and the guard plans
+them until that write (tests/test_memory_guard_shared_store.py).
 """
 
 from __future__ import annotations
@@ -270,49 +271,6 @@ def test_the_window_includes_the_verify_on_gabee_not_on_128():
     assert window(BIG_CEILING) == 262_144
 
 
-# -- the store: an entry owns its bytes when it is stored -------------------
-
-
-def test_a_store_from_a_live_cache_with_no_slack_copies_now(cpu):
-    from unittest.mock import MagicMock
-
-    from mlx_lm.models.cache import KVCache
-
-    from rapid_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
-
-    tokens, layers = 2048, 8
-    live = []
-    for _ in range(layers):
-        layer = KVCache()
-        layer.keys = mx.random.normal((1, 4, tokens, 64))
-        layer.values = mx.random.normal((1, 4, tokens, 64))
-        layer.offset = tokens  # no slack: the buffer IS the content
-        live.append(layer)
-    mx.eval([c.keys for c in live] + [c.values for c in live])
-    kv = sum(c.keys.nbytes + c.values.nbytes for c in live)
-    cache = MemoryAwarePrefixCache(
-        model=MagicMock(), config=MemoryCacheConfig(max_memory_mb=4096)
-    )
-    # what extraction hands over for a row with no slack: new layer objects
-    # over the SAME buffers
-    extracted = []
-    for c in live:
-        e = KVCache()
-        e.keys, e.values, e.offset = c.keys, c.values, c.offset
-        extracted.append(e)
-    before = mx.get_active_memory()
-    assert cache.store(list(range(tokens)), extracted, evict_prefixes=False)
-    assert mx.get_active_memory() - before >= 0.99 * kv  # copied at store
-    # the live cache's next in-place write allocates nothing more
-    before = mx.get_active_memory()
-    mx.reset_peak_memory()
-    for c in live:
-        c.keys[..., tokens - 1 : tokens, :] = mx.zeros((1, 4, 1, 64))
-        c.values[..., tokens - 1 : tokens, :] = mx.zeros((1, 4, 1, 64))
-    mx.eval([c.keys for c in live] + [c.values for c in live])
-    assert mx.get_peak_memory() - before < 0.1 * kv
-
-
 # -- the whole path: the review's fixed-cost sim -----------------------------
 
 
@@ -369,9 +327,10 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
     """The review's scenario: a FIXED 0.9 of the KV at 65% of the sim's
     "84k" (6,500 sim tokens = Gabee's window; 84k = 0.65 of it). RC6 with
     the cost unplanned: 20 crossings on Gabee, 12 on 128 GB; planned
-    exactly but with the shared-store copy deferred: 5 and 3. Now 0, the
-    window shrinks by what the cost occupies and no more, and the 128 GB
-    arm takes no protective action beyond the plain session's."""
+    exactly but with the shared buffers of mid-turn stores unplanned: 5
+    and 3. Now 0, the window shrinks by what the cost occupies and no more,
+    and the 128 GB arm takes no protective action beyond the plain
+    session's."""
     physical = GABEE_PHYSICAL if arm == "gabee" else int(M4_MAX_128_CEILING / 0.97) + 1
     device = _Device(physical=physical)
     s = _auto_budget_scheduler(llama, monkeypatch, device)
@@ -379,8 +338,10 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
     kv_fn = s._kv_footprint_fn()
     nbytes = int(0.9 * kv_fn(int(0.65 * 6500)))
     _fixed_verify(s, nbytes)
+    shared = _count_shared(s)
     history, windows = _session(s, delta=500, native=65536)
     guard = s._memguard()
+    assert shared["bytes"] > 0  # mid-turn stores shared live buffers
     assert device.ooms == 0
     assert guard.steps_over_ceiling == 0, guard.steps_over_ceiling
     assert device.max_seen <= device.ceiling
@@ -390,6 +351,32 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
         lost = nbytes / (kv_fn(1000) / 1000)
         assert min(windows) >= 18_008 - 1.1 * lost, (windows, lost)
         assert len(history) >= 20, len(history)
+
+
+def _count_shared(s) -> dict[str, int]:
+    seen = {"bytes": 0}
+    real = s._memguard_note_shared
+
+    def note(tokens):
+        before = set(getattr(s, "_memguard_shared", {}) or {})
+        real(tokens)
+        after = getattr(s, "_memguard_shared", {}) or {}
+        seen["bytes"] += sum(r.nbytes for a, r in after.items() if a not in before)
+
+    s._memguard_note_shared = note
+    return seen
+
+
+def test_the_shared_buffers_are_what_the_plan_was_missing(llama, monkeypatch):
+    """Negative control: the same Gabee run with the shared buffers left out
+    of the footprint crosses the ceiling (5 times at review time)."""
+    device = _Device(physical=GABEE_PHYSICAL)
+    s = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, s)
+    _fixed_verify(s, int(0.9 * s._kv_footprint_fn()(int(0.65 * 6500))))
+    monkeypatch.setattr(Scheduler, "_memguard_shared_pending", lambda self: 0)
+    _session(s, delta=500, native=65536)
+    assert s._memguard().steps_over_ceiling > 0
 
 
 def test_the_scheduler_reads_the_restore_point_from_the_live_cache(cpu):
