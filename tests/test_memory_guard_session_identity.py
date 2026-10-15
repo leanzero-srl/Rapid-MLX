@@ -145,9 +145,10 @@ def test_the_frame_is_measured_with_the_template_not_a_block(monkeypatch, stream
     text = "".join(map(chr, main_tokens))
     assert text[: main_hint.frame].endswith("<|im_start|>user\n")
     assert "MAIN" in text[: main_hint.frame]
-    assert text[: main_hint.first_end].endswith(
-        "fix the bug<|im_end|>\n<|im_start|>assistant\n"
-    )
+    # first_end: where the first message ENDS, not the next row's opening
+    # (Qwen opens an assistant row with a think block that turn 1's prompt
+    # does not have: test_memory_guard_frame_identity)
+    assert text[: main_hint.first_end].endswith("fix the bug<|im_end|>\n")
     assert main_tokens[: main_hint.frame] != sub_tokens[: sub_hint.frame]
     assert main_hint.session_id == "20261014_7" and main_hint.turn_start
     assert sub_hint.session_id == "20261014_8"
