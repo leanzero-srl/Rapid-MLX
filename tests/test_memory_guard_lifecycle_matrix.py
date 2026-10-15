@@ -52,6 +52,7 @@ FRAME = 48  # the rendered system/tools frame of each conversation
 MAIN = 5  # goose's main-agent frame (system prompt + tools)
 SUBAGENT = 6  # a subagent's frame (its own system prompt)
 OTHER = 9  # another agent's frame (an async delegate, another tool set)
+THIRD = 13  # a second subagent's frame
 HELPER_FRAME = 40
 
 
@@ -610,14 +611,15 @@ def sc_user_types_in_an_older_window(w, header, end):
 
 
 def sc_main_on_its_subagent_beside_a_left_window(w, header, order):
-    """Review 11: an older window X of ANOTHER kind runs tool rounds after
-    main hands off to its subagent, then stops, and the user opens a new
-    window of X's kind -- X is released. Main ran after nothing of X's: it
-    is waiting on its OWN subagent (a conversation of a third kind that began
-    after main's hand-off), so the chain release (a pending conversation goes
-    with the older one that outlived it) must not take it. ``order``: the
-    subagent starts right after main's hand-off (goose), or only after the
-    user opened the new window."""
+    """Reviews 11-12, a DOCUMENTED TRADE-OFF: an older window X of another
+    kind runs tool rounds after main hands off to its subagent, then stops,
+    and the user opens a new window of X's kind -- X is released, and main
+    (pending, outlived by X) goes with it by the chain release, although it
+    is waiting on its own subagent. On the wire that is the finished
+    subagent whose main was left; every rule tried to tell them apart pinned
+    a finished subagent forever. What is asserted is the BOUNDED cost: no
+    loss without pressure; under duress at most ONE re-prefill of main (its
+    resume), after which it hits again, and never an OOM."""
     w.chat("X", size=1500, header=header, kind=OTHER)
     w.turn("X", outcome="tool_calls")
     w.chat("main", size=2500, header=header)
@@ -640,10 +642,59 @@ def sc_main_on_its_subagent_beside_a_left_window(w, header, order):
             add=1500,
             outcome="stop" if last else "tool_calls",
         )
-        if not last:
-            w.protected("main", "waiting on its own subagent")
+    cached, length = w.turn("main", user=False, outcome="tool_calls")
+    if w.arm == "nopressure":
+        assert _hit(cached, length, before), (cached, before)
+    resumed = len(w.convs["main"].tokens)
     cached, length = w.turn("main", user=False, outcome="stop")
-    assert _hit(cached, length, before), (cached, before)
+    assert _hit(cached, length, resumed), ("a second re-prefill", cached, resumed)
+    w.flush(header)
+
+
+def sc_tool_ended_subagent_left_for_any_kind(w, header, bkind):
+    """Review 12: a subagent ends on a tool call; main takes the result and
+    stops; the user opens a window B of ANY kind. Main is released, and the
+    subagent with it -- never pinned (the third-kind exemption kept it
+    forever when B was of another kind)."""
+    w.chat("main", size=2500, header=header)
+    w.turn("main", outcome="tool_calls")
+    w.chat("sub", size=1800, header=header, kind=SUBAGENT)
+    w.turn("sub", outcome="tool_calls")
+    for _t in range(2):
+        w.turn("sub", user=False, add=500, outcome="tool_calls")
+    w.turn("sub", user=False, add=500, outcome="tool_calls")  # its last
+    w.turn("main", user=False, outcome="stop")
+    w.chat("B", size=600, header=header, kind=bkind)
+    w.turn("B", add=200, outcome="stop")
+    w.turn("B", add=200, outcome="stop")
+    w.evictable("main", "left for B")
+    w.evictable("sub", "its main was left")
+    for _t in range(8):
+        w.turn("B", add=500, outcome="stop")
+    w.flush(header)
+
+
+def sc_tool_ended_subagent_then_a_second_one(w, header, _arg):
+    """Review 12: subagent S ends on a tool call; main takes it and runs a
+    second subagent S2 of a third kind, which finishes; main stops; the user
+    leaves main. S goes with main."""
+    w.chat("main", size=2500, header=header)
+    w.turn("main", outcome="tool_calls")
+    w.chat("sub", size=1800, header=header, kind=SUBAGENT)
+    w.turn("sub", outcome="tool_calls")
+    w.turn("sub", user=False, add=500, outcome="tool_calls")  # its last
+    w.turn("main", user=False, outcome="tool_calls")
+    w.chat("sub2", size=900, header=header, kind=THIRD)
+    w.turn("sub2", outcome="tool_calls")
+    w.turn("sub2", user=False, add=300, outcome="stop")
+    w.turn("main", user=False, outcome="stop")
+    w.chat("B", size=600, header=header)
+    w.turn("B", add=200, outcome="stop")
+    w.evictable("main", "left for B")
+    w.evictable("sub2", "finished")
+    w.evictable("sub", "its main was left")
+    for _t in range(8):
+        w.turn("B", add=500, outcome="stop")
     w.flush(header)
 
 
@@ -760,6 +811,18 @@ for header in (True, False):
             )
     SCENARIOS.append(
         (f"olderwindow-{tag}", sc_user_types_in_an_older_window, header, "stop")
+    )
+    for bkind, tag2 in ((MAIN, "main"), (OTHER, "other")):
+        SCENARIOS.append(
+            (
+                f"subtoolend-leftfor{tag2}-{tag}",
+                sc_tool_ended_subagent_left_for_any_kind,
+                header,
+                bkind,
+            )
+        )
+    SCENARIOS.append(
+        (f"secondsub-{tag}", sc_tool_ended_subagent_then_a_second_one, header, None)
     )
     for order in ("subagent-first", "window-first"):
         SCENARIOS.append(

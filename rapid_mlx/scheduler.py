@@ -6739,12 +6739,11 @@ class Scheduler:
           that ran after it (its main) was itself released or forgotten (all
           its entries evicted: a tombstone of it is kept while it matters):
           a subagent that ended on a tool call (goose's turn limit, a
-          sub-recipe's final_output) whose main the user left -- unless a
-          conversation of a third kind began after its last request (its
-          own subagent, still at work). Trade-off, wire-identical to the
-          left-mid-tool-call case: a SIBLING of another kind waiting on its
-          own long tool (no subagent) goes with an older window the user
-          left.
+          sub-recipe's final_output) whose main the user left. Trade-offs,
+          both wire-identical to that case and both costing at most one
+          re-prefill under duress: a main waiting on its OWN subagent whose
+          older window of another kind was left, and a SIBLING of another
+          kind waiting on its own long tool, go too.
 
         A conversation's user turns are its OWN frames' (a helper call ends
         in a user message too). Inside one session, a one-shot frame (a
@@ -6816,51 +6815,83 @@ class Scheduler:
         for line in state:
             forgotten.pop(line, None)  # active again
         gone: set[Any] = set()
+        # Tombstones that DECIDED a release (no conversation still recorded
+        # would have released it): only these are kept -- at most one per
+        # released conversation, so never more than the conversations held.
+        deciding: set[Any] = set()
+
+        def _release(line: Any, witnesses: list[Any]) -> bool:
+            if not witnesses:
+                return False
+            gone.add(line)
+            if all(w in forgotten for w in witnesses):
+                deciding.add(max(witnesses, key=lambda w: forgotten[w]["last"]))
+            return True
+
         for line, st in state.items():
             if line in live:
                 continue
             others = [
                 (o, ost) for o, ost in [*state.items(), *forgotten.items()] if o != line
             ]
-            if any(
-                ost["first"] < st["first"]
-                and ost["last"] > st["last"]
-                and ost["continues"]
-                # a PENDING one is waiting on its own tool: an older
-                # conversation's tool rounds say nothing about it, only that
-                # one's next user turn does (review 9: a younger swarm worker,
-                # an async delegate, a newer chat mid-build re-prefilled
-                # 2,308 of 2,356 tokens on the 64 GB arm)
-                # ... and only one of ANOTHER kind (its main): a user turn in
-                # an older window of the same kind is not the build's parent
-                # (review 10: the waiting build re-prefilled 48 of 3,856)
-                and (
-                    not st["pending"]
-                    or (ost["turn"] > st["last"] and not ost["kinds"] & st["kinds"])
+            if _release(
+                line,
+                [
+                    o
+                    for o, ost in others
+                    if ost["first"] < st["first"]
+                    and ost["last"] > st["last"]
+                    and ost["continues"]
+                    # a PENDING one is waiting on its own tool: an older
+                    # conversation's tool rounds say nothing about it, only
+                    # that one's next user turn does (review 9: a younger
+                    # swarm worker, an async delegate, a newer chat
+                    # mid-build re-prefilled 2,308 of 2,356 tokens on the
+                    # 64 GB arm) ... and only one of ANOTHER kind (its main):
+                    # a user turn in an older window of the same kind is not
+                    # the build's parent (review 10: 48 of 3,856)
+                    and (
+                        not st["pending"]
+                        or (ost["turn"] > st["last"] and not ost["kinds"] & st["kinds"])
+                    )
+                ],
+            ):
+                continue
+            if not st["pending"]:
+                _release(
+                    line,
+                    [
+                        o
+                        for o, ost in others
+                        if ost["first"] > st["first"]
+                        and ost["turn"] > st["last"]
+                        and (ost["continues"] or ost["kinds"] & st["kinds"])
+                    ],
                 )
-                for _o, ost in others
-            ):
-                gone.add(line)
-            elif not st["pending"]:
-                if any(
-                    ost["first"] > st["first"]
-                    and ost["turn"] > st["last"]
-                    and (ost["continues"] or ost["kinds"] & st["kinds"])
-                    for _o, ost in others
-                ):
-                    gone.add(line)
-            elif any(
-                ost["first"] > st["last"]
-                and ost["turn"] > st["last"]
-                and ost["kinds"] & st["kinds"]
-                for _o, ost in others
-            ):
-                gone.add(line)
+            else:
+                _release(
+                    line,
+                    [
+                        o
+                        for o, ost in others
+                        if ost["first"] > st["last"]
+                        and ost["turn"] > st["last"]
+                        and ost["kinds"] & st["kinds"]
+                    ],
+                )
         # Chain: a PENDING conversation of another kind that an older,
         # continuing conversation outlived (a subagent that ended on a tool
         # call -- goose's turn limit, a sub-recipe's final_output -- whose
         # main took the result) goes when that conversation is itself
         # released, or forgotten (its entries all evicted under duress).
+        #
+        # Trade-off, kept on purpose (reviews 11-12): a main still waiting on
+        # its OWN subagent whose older window of another kind was left looks
+        # exactly like that on the wire, and goes too. Worst case: one
+        # re-prefill of main, under duress only. Every rule tried to tell the
+        # two apart (a "third kind began after it" exemption) pinned a
+        # finished subagent with no end instead -- a bounded worst case beats
+        # an unbounded one.
         parents = [*state.items(), *forgotten.items()]
         changed = True
         while changed:
@@ -6868,34 +6899,27 @@ class Scheduler:
             for line, st in state.items():
                 if line in live or line in gone or not st["pending"]:
                     continue
-                if any(
-                    other != line
-                    and (other in gone or other in forgotten)
-                    and ost["first"] < st["first"]
-                    and ost["last"] > st["last"]
-                    and ost["continues"]
-                    and not ost["kinds"] & st["kinds"]
-                    # ... unless a conversation of a THIRD kind began after
-                    # this one's last request: its own subagent, still at
-                    # work (review 11: main re-prefilled 0 of 2,952 when an
-                    # older window of another kind was left meanwhile)
-                    and not any(
-                        child != line
-                        and child != other
-                        and cst["first"] > st["last"]
-                        and cst["kinds"]
-                        and not cst["kinds"] & st["kinds"]
-                        and not cst["kinds"] & ost["kinds"]
-                        for child, cst in state.items()
-                    )
-                    for other, ost in parents
-                ):
-                    gone.add(line)
-                    changed = True
-        # A tombstone is kept while it acted after some conversation still
-        # held (released or not: every release is recomputed each time).
+                changed |= _release(
+                    line,
+                    [
+                        other
+                        for other, ost in parents
+                        if other != line
+                        and (other in gone or other in forgotten)
+                        and ost["first"] < st["first"]
+                        and ost["last"] > st["last"]
+                        and ost["continues"]
+                        and not ost["kinds"] & st["kinds"]
+                    ],
+                )
+        # Keep only the deciding tombstones (review 12: one stale held line
+        # kept every later tombstone -- 8,000 of them, 80 ms a call under the
+        # cache lock). A release depends only on the released conversation's
+        # own state, which changes only when it acts again (and then every
+        # older tombstone is moot), so a tombstone that decides nothing now
+        # never will. At most one per held conversation.
         for line in list(forgotten):
-            if not any(st["last"] < forgotten[line]["last"] for st in state.values()):
+            if line not in deciding:
                 forgotten.pop(line, None)
         outlived = {owner for owner in lines if owner[0] in gone}
         for line, members in by_line.items():
