@@ -334,9 +334,18 @@ def test_rows_from_different_responses_are_never_joined():
         [answer, user, call],
         [call, tool, call],
         [answer, worded_call],
-        [{"role": "assistant", "content": "   "}, call],
     ):
         assert _join_split_assistant_turns(messages) == messages
+
+
+def test_a_blank_text_row_before_a_call_is_the_same_turn():
+    # goose 3.0.111 on the T12 control (2026-10-15 22:2x): most calls arrive as
+    # {"content": "\n\n"} then {"content": null, "tool_calls": [...]}.
+    messages = _split_goose_turn()
+    messages[1]["content"] = "\n\n"
+    prompt = _render(messages)
+    assert prompt.count("<|im_start|>assistant") == 3  # joined turn, "Done.", generation prompt
+    assert "<think>\n\n</think>\n\n<|im_end|>" not in prompt
 
 
 def test_reasoning_copied_onto_both_rows_is_kept_once():

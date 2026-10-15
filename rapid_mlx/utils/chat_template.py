@@ -2369,12 +2369,13 @@ def _template_puts_narration_before_calls(template_applicator) -> bool:
 
 
 def _is_narration_row(message) -> bool:
+    # A blank text row ("\n\n" - goose sends one before most calls) is the same
+    # response too; left apart it renders as an EMPTY finished turn before the call.
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and not message.get("tool_calls")
         and isinstance(message.get("content"), str)
-        and bool(message["content"].strip())
     )
 
 
