@@ -247,21 +247,13 @@ class World:
 
     def flush(self, header=True):
         """(d): a younger chat completes a turn and starts the next one; only
-        it may then hold NEEDED heads -- and lines with POSITIVE evidence
-        (their last completion a tool call or a length cut) of a kind the
-        flush chat is not (with no session id, a helper of another system
-        prompt that ended on "length" is its own line; the client owes it a
-        continuation)."""
+        it may then hold NEEDED heads."""
         self.chat("zflush", header=header, size=300, seed=97)
         self.turn("zflush", add=100, outcome="stop")
         self.turn("zflush", add=100, outcome="stop")
-        records = self.s.__dict__.get("_memguard_lines", {})
-        flush_record = records.get(self.convs["zflush"].owner)
-        flush_kind = (
-            flush_record.get("kind") if isinstance(flush_record, dict) else None
-        )
         owners = {c.owner for c in self.convs.values() if c.name != "zflush"}
         owners |= set(self.helpers.values())
+        records = self.s.__dict__.get("_memguard_lines", {})
         for owner in owners:
             if owner is None or not self._entries(owner):
                 continue
@@ -269,10 +261,16 @@ class World:
             record = record if isinstance(record, dict) else {}
             holder = getattr(record.get("hint"), "outcome", None) or [None]
             if (
-                holder[0] in ("tool_calls", "length")
-                and record.get("kind") != flush_kind
+                owner[0][0] != "session"
+                and not record.get("continues")
+                and holder[0] in ("tool_calls", "length")
             ):
-                continue  # positive evidence, another kind
+                # The one exemption: a ONE-SHOT line with no session id that
+                # ended on a tool call / length cut. Nothing on the request
+                # ties it to a conversation (with no header a helper call is
+                # its own line), and main's own first request waiting on a
+                # subagent looks exactly like it.
+                continue
             assert self.level(owner) < EVICT_NEEDED, ("pinned", owner)
 
     # Counters that are bookkeeping, not protective actions.
@@ -538,6 +536,79 @@ def sc_helper_beside_a_younger_turn(w, header, end):
     w.flush(header)
 
 
+def sc_subagent_ends_on_a_tool_call(w, header, main_next):
+    """Review 10: the subagent's LAST request ends on a tool call (goose's
+    turn limit, a sub-recipe's final_output) -- positive evidence that never
+    gets an answer. Main takes the result; then either the user's next turn
+    in main, or the user leaves main for another chat. The subagent is
+    released either way (on the duress arm: its entries go before any chunk
+    is reduced)."""
+    w.chat("main", size=2500, header=header)
+    w.turn("main", outcome="tool_calls")
+    w.chat("sub", size=1800, header=header, kind=SUBAGENT)
+    w.turn("sub", outcome="tool_calls")
+    for _t in range(2):
+        w.turn("sub", user=False, add=500, outcome="tool_calls")
+    w.turn("sub", user=False, add=500, outcome="tool_calls")  # its last
+    w.turn("main", user=False, outcome="stop")
+    if main_next == "user_turn":
+        w.turn("main", add=300, outcome="stop")
+        w.evictable("sub", "main's next user turn")
+        for _t in range(6):
+            w.turn("main", add=500, outcome="stop")
+    else:
+        w.chat("B", size=600, header=header)
+        w.turn("B", add=200, outcome="stop")
+        w.evictable("main", "left for B")
+        w.evictable("sub", "its main was left")
+        for _t in range(8):
+            w.turn("B", add=500, outcome="stop")
+    w.flush(header)
+
+
+def sc_younger_waits_beside_an_older_helper(w, header, helper):
+    """Review 10: the younger conversation (another kind) waits on its own
+    tool while the older one runs tool rounds AND a long helper of its own
+    session (FactCheck ending on "length", PermissionCheck answering with a
+    tool call) -- a helper's user message is not the older one's user turn.
+    The waiter keeps its head and hits."""
+    w.chat("W1", size=1500, header=header)
+    w.chat("W2", size=2500, header=header, kind=OTHER)
+    w.turn("W1", outcome="tool_calls")
+    w.turn("W1", user=False, outcome="tool_calls")
+    w.turn("W2", outcome="tool_calls")
+    w.turn("W2", user=False, outcome="tool_calls")
+    before = len(w.convs["W2"].tokens)
+    for t in range(6):
+        w.turn("W1", user=False, add=600, outcome="tool_calls")
+        if t == 1:
+            out = "tool_calls" if helper == "permission" else "length"
+            w.helper(helper, "W1", outcome=out, size=3000)
+        w.protected("W2", "an older conversation's helper")
+    cached, length = w.turn("W2", user=False, outcome="stop")
+    assert _hit(cached, length, before), (cached, before)
+    w.flush(header)
+
+
+def sc_user_types_in_an_older_window(w, header, end):
+    """Review 10: B (younger, the same kind) is mid-build, its long tool
+    running; meanwhile the user chats in the older window A. A user turn in
+    a window of B's own kind is not B's parent taking a result: B keeps its
+    head and hits when its tool returns."""
+    w.chat("A", size=1500, header=header)
+    w.turn("A", outcome="stop")
+    w.chat("B", size=3000, header=header)
+    w.turn("B", outcome="tool_calls")
+    w.turn("B", user=False, outcome="tool_calls")
+    before = len(w.convs["B"].tokens)
+    for _t in range(4):
+        w.turn("A", add=700, outcome=end)
+        w.protected("B", "a user turn in an older window")
+    cached, length = w.turn("B", user=False, outcome="stop")
+    assert _hit(cached, length, before), (cached, before)
+    w.flush(header)
+
+
 def sc_two_chats_alternating(w, header, end):
     """The user alternates between two chats: each one being used is
     protected and hits; the other is evictable under duress only."""
@@ -630,6 +701,28 @@ for header in (True, False):
                     end,
                 )
             )
+    for main_next in ("user_turn", "left"):
+        SCENARIOS.append(
+            (
+                f"subtoolend-{main_next}-{tag}",
+                sc_subagent_ends_on_a_tool_call,
+                header,
+                main_next,
+            )
+        )
+    if header:  # with no session id a helper is its own line
+        for helper in ("permission", "factcheck"):
+            SCENARIOS.append(
+                (
+                    f"waiterhelper-{helper}-{tag}",
+                    sc_younger_waits_beside_an_older_helper,
+                    header,
+                    helper,
+                )
+            )
+    SCENARIOS.append(
+        (f"olderwindow-{tag}", sc_user_types_in_an_older_window, header, "stop")
+    )
     for kind in ("same", "other"):
         SCENARIOS.append(
             (f"youngerwaits-{kind}-{tag}", sc_younger_waits_on_its_tool, header, kind)

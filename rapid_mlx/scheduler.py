@@ -6718,31 +6718,37 @@ class Scheduler:
         a running or queued request is LIVE and never abandoned. Otherwise:
 
         * an OLDER conversation (one whose requests continue each other) ran
-          after this one's latest activity -- for a PENDING one, started a
-          user turn: a finished subagent (its main took the result and went
-          on); a younger conversation waiting on its own tool is not
-          released by an older one's tool rounds;
+          after this one's latest activity: a finished subagent (its main
+          took the result). For a PENDING one only that older one's own next
+          USER turn counts, and only if it is of ANOTHER kind (its main): a
+          younger conversation waiting on its own tool is released neither
+          by an older one's tool rounds, nor by a helper call of its session,
+          nor by a user turn in an older window of its own kind;
         * IDLE, and a YOUNGER conversation started a user turn after it --
           one of the same kind, or one whose requests continue each other:
           the user left the chat (or the next benchmark task began). A
           one-shot call of another kind (a title, a summary: with no session
           id each is its own line) says nothing about it;
-        * PENDING, and a conversation of the SAME kind (the same rendered
-          system/tools frame: another goose chat window, the next task) that
-          BEGAN after this one's latest activity started a user turn: the
-          chat was left mid tool call. One already running beside it (a
-          concurrent swarm worker of the same kind) does not release it. A session of another kind -- a subagent, whose task and
-          mid-task nudges (a tool image, a FINAL_OUTPUT / goal / grind
-          continuation after a reply) look exactly like a user's turns --
-          never releases it.
+        * PENDING, and a conversation of the SAME kind that BEGAN after this
+          one's latest activity started a user turn: the chat was left mid
+          tool call. One already running beside it (a concurrent worker of
+          the same kind) does not release it, and a session of another kind
+          -- a subagent, whose task and nudges look exactly like a user's
+          turns -- never does;
+        * PENDING, and an older continuing conversation of another kind
+          that ran after it (its main) was itself released or forgotten (all
+          its entries evicted: a tombstone of it is kept while it matters):
+          a subagent that ended on a tool call (goose's turn limit, a
+          sub-recipe's final_output) whose main the user left.
 
-        Inside one session, a one-shot frame (a helper call) is outlived once
-        a conversation frame of the session ran after it, whichever was
-        admitted first; a conversation frame is never outlived by its own
-        session. Reviews 6-8: each lifecycle rule built on a single signal
-        broke a sibling goose shape; test_memory_guard_lifecycle_matrix runs
-        all of them on both device arms. Lines with no entry and no request
-        are forgotten."""
+        A conversation's user turns are its OWN frames' (a helper call ends
+        in a user message too). Inside one session, a one-shot frame (a
+        helper call) is outlived once a conversation frame of the session
+        ran after it, whichever was admitted first; a conversation frame is
+        never outlived by its own session. Reviews 6-10: each lifecycle rule
+        built on a single signal broke a sibling goose shape;
+        test_memory_guard_lifecycle_matrix runs all of them on both device
+        arms. Lines with no entry and no request are forgotten."""
         lines = self.__dict__.get("_memguard_lines")
         if not lines:
             return set()
@@ -6757,11 +6763,28 @@ class Scheduler:
             present.add(owner)
             live.add(owner[0])
         kept = self.__dict__.get("_memguard_turn_boundaries", {})
+        # A conversation whose every entry was evicted (and that has no
+        # request) is forgotten -- but a lightweight tombstone of it stays
+        # while a pending conversation it outlived could still need it as
+        # the parent that released it (review 10: under duress main's record
+        # vanished with its entries and its finished subagent stayed NEEDED).
+        forgotten = self.__dict__.setdefault("_memguard_forgotten", {})
+        dropped: dict[Any, list[dict]] = {}
         for owner in [k for k in lines if k not in present]:
-            lines.pop(owner, None)
+            dropped.setdefault(owner[0], []).append(lines.pop(owner))
             kept.pop(owner, None)
             if not any(o[0] == owner[0] for o in lines):
                 self.__dict__.get("_memguard_rewriting_lines", set()).discard(owner[0])
+        for line, records in dropped.items():
+            if any(o[0] == line for o in lines):
+                continue
+            convo = [r for r in records if r["continues"]] or records
+            forgotten[line] = {
+                "first": min(r["first"] for r in records),
+                "last": max(r["last"] for r in records),
+                "continues": any(r["continues"] for r in records),
+                "kinds": {r["kind"] for r in convo if r["kind"] is not None},
+            }
         by_line: dict[Any, list[tuple[Any, dict]]] = {}
         for owner, record in lines.items():
             by_line.setdefault(owner[0], []).append((owner, record))
@@ -6773,7 +6796,9 @@ class Scheduler:
             state[line] = {
                 "first": min(r["first"] for _o, r in members),
                 "last": max(r["last"] for _o, r in members),
-                "turn": max(r["turn"] for _o, r in members),
+                # its OWN user turns: a helper call of the session (a
+                # FactCheck, a retitle) ends in a user message too (review 10)
+                "turn": max(r["turn"] for r in convo),
                 "pending": any(
                     _memguard_outcome(r["hint"]) in _MEMGUARD_MID_TURN for r in convo
                 ),
@@ -6794,7 +6819,13 @@ class Scheduler:
                 # one's next user turn does (review 9: a younger swarm worker,
                 # an async delegate, a newer chat mid-build re-prefilled
                 # 2,308 of 2,356 tokens on the 64 GB arm)
-                and (not st["pending"] or ost["turn"] > st["last"])
+                # ... and only one of ANOTHER kind (its main): a user turn in
+                # an older window of the same kind is not the build's parent
+                # (review 10: the waiting build re-prefilled 48 of 3,856)
+                and (
+                    not st["pending"]
+                    or (ost["turn"] > st["last"] and not ost["kinds"] & st["kinds"])
+                )
                 for _o, ost in others
             ):
                 gone.add(line)
@@ -6813,6 +6844,40 @@ class Scheduler:
                 for _o, ost in others
             ):
                 gone.add(line)
+        for line in state:
+            forgotten.pop(line, None)  # active again
+        # Chain: a PENDING conversation of another kind that an older,
+        # continuing conversation outlived (a subagent that ended on a tool
+        # call -- goose's turn limit, a sub-recipe's final_output -- whose
+        # main took the result) goes when that conversation is itself
+        # released, or forgotten (its entries all evicted under duress).
+        parents = [*state.items(), *forgotten.items()]
+        changed = True
+        while changed:
+            changed = False
+            for line, st in state.items():
+                if line in live or line in gone or not st["pending"]:
+                    continue
+                if any(
+                    other != line
+                    and (other in gone or other in forgotten)
+                    and ost["first"] < st["first"]
+                    and ost["last"] > st["last"]
+                    and ost["continues"]
+                    and not ost["kinds"] & st["kinds"]
+                    for other, ost in parents
+                ):
+                    gone.add(line)
+                    changed = True
+        # A tombstone is kept while a pending conversation it outlived still
+        # exists (released or not: the release is recomputed every time).
+        for line in list(forgotten):
+            t = forgotten[line]
+            if not any(
+                st["pending"] and t["first"] < st["first"] and t["last"] > st["last"]
+                for st in state.values()
+            ):
+                forgotten.pop(line, None)
         outlived = {owner for owner in lines if owner[0] in gone}
         for line, members in by_line.items():
             if line in gone:
