@@ -80,6 +80,6 @@ def test_e2e(llama, monkeypatch, ssize, zadd):
     w.turn("O", add=100)
     for _i in range(3):
         w.turn("Z", add=200)
-    assert not (_ent(w, "sub") and w.level(w.convs["sub"].owner) == EVICT_NEEDED), (
+    assert not (_ent(w, "sub") and w.level(w.convs["sub"].owner) >= EVICT_NEEDED), (
         "dead sub pinned NEEDED"
     )

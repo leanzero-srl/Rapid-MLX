@@ -152,6 +152,7 @@ from .memory_guard import (  # noqa: E402
     ALLOCATOR_CACHE_SHARE,
     CACHE_LIMIT_FLOOR_RATIO,
     EVICT_HEAD,
+    EVICT_LAST,
     EVICT_NEEDED,
     EVICT_REDUNDANT,
     EVICT_UNUSED,
@@ -2561,6 +2562,12 @@ def _install_mtp_vendored(
                         else None
                     ),
                     prompt_lookup_policy=prompt_lookup_policy,
+                    # The memory guard narrows the verify under duress
+                    # (``Scheduler._memguard_room_for_decode``); read every
+                    # round, None = the generator's own choice.
+                    verify_rows_cap=lambda: getattr(
+                        batch_gen, "_lz_verify_rows_cap", None
+                    ),
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -6800,7 +6807,9 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             return 0
 
-    def _metal_footprint_bytes(self, *, reclaim_over: int = 0) -> int:
+    def _metal_footprint_bytes(
+        self, *, reclaim_over: int = 0, shared: bool = True
+    ) -> int:
         """Active + allocator cache. With ``reclaim_over > 0`` and the sum at
         or above it, the cache is cleared first and the sum re-read (E2: the
         cache counts wherever pressure is checked, and it is given back
@@ -6808,14 +6817,14 @@ class Scheduler:
         # Plus the live buffers a mid-turn prefix entry still shares: they
         # are allocated again at the live layer's next write
         # (``_memguard_note_shared``). 0 with no guard or no such store.
-        shared = self._memguard_shared_pending()
+        pending = self._memguard_shared_pending() if shared else 0
         active = self._current_metal_active_bytes()
         cache = self._current_metal_cache_bytes()
-        if reclaim_over > 0 and active + cache + shared >= reclaim_over and cache > 0:
+        if reclaim_over > 0 and active + cache + pending >= reclaim_over and cache > 0:
             mx.clear_cache()
             active = self._current_metal_active_bytes()
             cache = self._current_metal_cache_bytes()
-        return active + cache + shared
+        return active + cache + pending
 
     def _memguard_prefix_entry_count(self) -> int:
         mac = getattr(self, "memory_aware_cache", None)
@@ -7300,6 +7309,27 @@ class Scheduler:
             reps.append((line, frame, key))  # a newer head for older ones
         protected |= self._memguard_kept_turn_boundaries(outlived)
         branches -= protected
+        # What each running or queued request resumes from next turn: its
+        # longest entry (the decoding conversation's own newest).
+        newest: set[tuple] = set()
+        for tokens, _fetched in live:
+            best = None
+            for key in entries:
+                if (best is None or len(key) > len(best)) and self._memguard_is_prefix(
+                    key, tokens
+                ):
+                    best = key
+            if best is not None:
+                newest.add(best)
+        for tokens in waiting:
+            best = None
+            for key in entries:
+                if (best is None or len(key) > len(best)) and self._memguard_is_prefix(
+                    key, tokens
+                ):
+                    best = key
+            if best is not None:
+                newest.add(best)
         ranked = []
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
@@ -7316,6 +7346,8 @@ class Scheduler:
                 )
             ):
                 level = EVICT_NEEDED if key in protected else EVICT_HEAD
+            if level == EVICT_NEEDED and (key in protected or key in newest):
+                level = EVICT_LAST
             cost = int(getattr(entry, "memory_bytes", 0) or 0)
             ranked.append((level, len(key), position, key, cost))
         if recency:
@@ -7333,17 +7365,112 @@ class Scheduler:
             key for key, _level, _cost in self._memguard_ranked_entries(recency=True)
         ]
 
+    def _memguard_freeable_bytes(self) -> dict[tuple, int]:
+        """Bytes evicting each prefix entry ACTUALLY frees for the coming
+        step: its charge, less the share of its arrays something else still
+        holds -- the live batch (the same array objects: a loan admitted in
+        place), a queued request's loan, or another entry (the same buffer).
+        Such an eviction frees nothing, so it is never credited and never
+        taken for room (Gabee T12: an entry evicted for room it did not
+        give). A buffer the entry shares with a live layer since a mid-turn
+        store (``_memguard_shared_pending``) DOES count: the plan charges its
+        re-allocation at that layer's next write, and the eviction cancels
+        exactly that (credited 0, the 1/100 sim crossed 3 times on Gabee
+        and 2 on 128 GB with an allocation the guard knew was coming). Caller
+        holds the cache lock. Reads buffer addresses of the ENTRIES' arrays
+        only (always evaluated); live and queued arrays are matched by
+        identity, never evaluated."""
+        mac = self.memory_aware_cache
+        entries = mac._entries  # noqa: SLF001
+        held_ids: set[int] = set()
+        bg = getattr(self, "batch_generator", None)
+        holders: list[Any] = []
+        for batch in (
+            getattr(bg, "_generation_batch", None),
+            getattr(bg, "_prompt_batch", None),
+        ):
+            holders.append(getattr(batch, "prompt_cache", None))
+        for item in list(getattr(bg, "_unprocessed_sequences", ()) or ()):
+            try:
+                holders.append(item[3])
+            except (IndexError, TypeError):
+                continue
+        for request in [
+            *list(getattr(self, "running", {}).values()),
+            *list(getattr(self, "waiting", ())),
+        ]:
+            holders.append(getattr(request, "prompt_cache", None))
+            holders.append(getattr(request, "_extracted_cache", None))
+        for caches in holders:
+            if isinstance(caches, (list, tuple)):
+                for _layer, _slot, a in _layer_arrays(caches):
+                    held_ids.add(id(a))
+        arrays: dict[tuple, list[tuple[Any, int | None]]] = {}
+        counts: dict[int, int] = {}
+        for key, entry in entries.items():
+            items = []
+            for _layer, _slot, a in _layer_arrays(getattr(entry, "cache", None)):
+                address = None if id(a) in held_ids else _buffer_address(a)
+                items.append((a, address))
+                if address is not None:
+                    counts[address] = counts.get(address, 0) + 1
+            arrays[key] = items
+        out: dict[tuple, int] = {}
+        for key, entry in entries.items():
+            charge = int(getattr(entry, "memory_bytes", 0) or 0)
+            items = arrays[key]
+            total = sum(int(a.nbytes) for a, _addr in items)
+            if total <= 0:
+                out[key] = charge
+                continue
+            held = sum(
+                int(a.nbytes)
+                for a, address in items
+                if id(a) in held_ids
+                or (address is not None and counts.get(address, 0) > 1)
+            )
+            out[key] = int(charge * max(0, total - held) / total)
+        return out
+
     def _memguard_evictable_bytes(self, max_level: int) -> int:
-        """Bytes the ONE policy could free evicting up to ``max_level``."""
+        """Bytes the ONE policy could free evicting up to ``max_level``:
+        only what those evictions ACTUALLY free."""
         mac = getattr(self, "memory_aware_cache", None)
         if mac is None:
             return 0
         with mac._lock:  # noqa: SLF001
+            freeable = self._memguard_freeable_bytes()
             return sum(
-                cost
-                for _k, level, cost in self._memguard_ranked_entries()
+                freeable.get(key, 0)
+                for key, level, _cost in self._memguard_ranked_entries()
                 if level <= max_level
             )
+
+    def _memguard_next_eviction(
+        self, max_level: int, ranked: list | None = None, freeable: dict | None = None
+    ) -> tuple[tuple, int, int] | None:
+        """``(key, level, bytes it frees)`` of the entry the ONE policy takes
+        next at ``max_level``: the first in eviction order whose eviction
+        frees something. Caller holds the cache lock."""
+        if ranked is None:
+            ranked = self._memguard_ranked_entries()
+        if freeable is None:
+            freeable = self._memguard_freeable_bytes()
+        for key, level, _cost in ranked:
+            if level > max_level:
+                return None
+            frees = freeable.get(key, 0)
+            if frees > 0:
+                return key, level, frees
+        return None
+
+    def _memguard_peek(self, max_level: int) -> tuple[int, int] | None:
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is None:
+            return None
+        with mac._lock:  # noqa: SLF001
+            nxt = self._memguard_next_eviction(max_level)
+        return None if nxt is None else (nxt[2], nxt[1])
 
     def _memguard_evict_ordered(
         self,
@@ -7377,9 +7504,17 @@ class Scheduler:
                 ranked = self._memguard_ranked_entries(storing, finished, storing_line)
                 if not ranked or (keep_last and len(ranked) <= 1):
                     return False
-                best_key, best_level, _cost = ranked[0]
-                if best_level > max_level:
+                # The first entry in order whose eviction frees something: one
+                # whose buffers a live cache, a loan or another entry still
+                # holds would give no room and cost what it holds.
+                nxt = self._memguard_next_eviction(max_level, ranked)
+                if nxt is None:
                     return False
+                best_key, best_level, _frees = nxt
+                if best_level == EVICT_LAST:
+                    guard = getattr(self, "_memory_guard", None)
+                    if guard is not None:
+                        guard.counts["newest_evictions"] += 1
                 if best_key == next(iter(mac._entries)):  # noqa: SLF001
                     # The plain LRU entry: the cache's own path (its failures
                     # propagate to the engine's rate-limited warning).
@@ -7416,6 +7551,11 @@ class Scheduler:
             entry_count=self._memguard_prefix_entry_count,
             evictable=(
                 self._memguard_evictable_bytes
+                if getattr(self, "memory_aware_cache", None) is not None
+                else None
+            ),
+            peek=(
+                self._memguard_peek
                 if getattr(self, "memory_aware_cache", None) is not None
                 else None
             ),
@@ -7569,6 +7709,9 @@ class Scheduler:
         ceiling = self._memguard_ceiling()
         if ceiling <= 0:
             return None, refusals
+        # The verify width is the generator's own choice unless THIS step's
+        # decode plan narrows it (``_memguard_room_for_decode``).
+        self._memguard_set_verify_cap(None)
         for _ in range(_PLAN_ATTEMPTS):
             # Finding 3 (review 2026-10-14): a row that joins a DECODING batch
             # is merged into it (padded to the longest row; the singleton
@@ -7772,7 +7915,9 @@ class Scheduler:
             )
         return handed
 
-    def _memguard_decode_growth(self, guard: MemoryGuard) -> int:
+    def _memguard_decode_growth(
+        self, guard: MemoryGuard, writes: int | None = None
+    ) -> int:
         """Bytes the decoding batch allocates beyond its footprint in the
         coming ``next()`` -- nonzero only at a step where its KV grows: a
         full-attention layer's write position reaches its buffer's capacity
@@ -7788,7 +7933,8 @@ class Scheduler:
             return 0
         from mlx_lm.models.cache import RotatingKVCache
 
-        writes = self._memguard_decode_write_rows()
+        if writes is None:
+            writes = self._memguard_decode_write_rows()
         guard.decode_verify_bytes_per_row = self._memguard_verify_bytes_per_row(writes)
         growing = False
         for layer in _exact_data_layers(getattr(gen, "prompt_cache", None)):
@@ -7881,17 +8027,58 @@ class Scheduler:
         self._memguard_state_bytes_per_row = best
         return best
 
+    def _memguard_verify_rows_range(self) -> tuple[int, int] | None:
+        """``(floor, widest)`` rows the guard may let one MTP verify write,
+        or None when the verify is no knob (off MTP, no restore-point cost).
+        The floor is the MTP chain's own depth + 1: a chain already drafted
+        is verified whole (its positions are in the MTP cache); only a
+        prompt-lookup copy draft is cut at the verify."""
+        widest = self._memguard_decode_write_rows()
+        if widest <= 1 or self._memguard_verify_bytes_per_row(2) <= 0:
+            return None
+        depth = max(0, int(getattr(self.config, "mtp_max_k", 0) or 0))
+        return max(2, min(widest, depth + 1)), widest
+
+    def _memguard_set_verify_cap(self, rows: int | None) -> None:
+        bg = getattr(self, "batch_generator", None)
+        if bg is not None:
+            try:
+                bg._lz_verify_rows_cap = rows
+            except AttributeError:
+                pass
+
     def _memguard_room_for_decode(
         self, guard: MemoryGuard, decode: int, ceiling: int
     ) -> None:
-        """A decode-only step whose KV grows: footprint + growth + margin
-        under the ceiling, in the one order -- clear the allocator cache,
-        evict with the ONE policy. There is no prefill to defer; a decoding
-        row is never aborted, so if even that does not fit it decodes
-        anyway, counted and logged (the window and every admission include
-        the growth, so this is a defect signal, not a path)."""
-        if self._memguard_make_room(decode, ceiling, EVICT_NEEDED):
+        """A decode-only step: footprint + growth + verify + margin under the
+        ceiling, by the LEAST costly action that gives real room, in order:
+
+        1. the allocator cache, then entries no live session needs (unused,
+           or already copied into the live cache);
+        2. a narrower MTP verify (the widest that fits): it costs this
+           step's speculation, not a conversation's cache (Gabee T12
+           control, b06: the conversation's only entry was evicted under
+           MTP duress and every later turn re-prefilled ~98k tokens);
+        3. abandoned heads, then entries a live session still needs;
+        4. the last resort: a conversation's NEWEST entry (EVICT_LAST).
+
+        Every eviction must free real bytes (``_memguard_freeable_bytes``).
+        A decoding row is never aborted, so if even that does not fit it
+        decodes anyway, counted and logged (a defect signal). The verify
+        is widened back as soon as room returns (every plan resets it)."""
+        knob = self._memguard_verify_rows_range()
+        if self._memguard_make_room(decode, ceiling, EVICT_REDUNDANT):
             return
+        if knob is not None and self._memguard_narrow_verify(guard, ceiling, knob):
+            return
+        if knob is not None:
+            decode = self._memguard_decode_growth(guard, writes=knob[0])
+            self._memguard_set_verify_cap(knob[0])
+        for level in (EVICT_HEAD, EVICT_NEEDED, EVICT_LAST):
+            if self._memguard_make_room(decode, ceiling, level):
+                if knob is not None:
+                    self._memguard_narrow_verify(guard, ceiling, knob)
+                return
         guard.counts["decode_over_ceiling"] += 1
         logger.warning(
             "[memory_guard] decode KV growth %.2fGB: footprint %.2fGB + growth "
@@ -7901,6 +8088,47 @@ class Scheduler:
             self._metal_footprint_bytes() / 1e9,
             ceiling / 1e9,
         )
+
+    def _memguard_narrow_verify(
+        self, guard: MemoryGuard, ceiling: int, knob: tuple[int, int]
+    ) -> bool:
+        """Cap the verify at the widest width whose decode step fits (no
+        eviction). Returns False when even the floor does not fit."""
+        floor, widest = knob
+        margin = int(MARGIN_CEILING_RATIO * ceiling)
+
+        def fits(rows: int) -> bool:
+            need = self._memguard_decode_growth(guard, writes=rows)
+            footprint = self._metal_footprint_bytes(
+                reclaim_over=ceiling - need - margin
+            )
+            return footprint + need + margin <= ceiling
+
+        if not fits(floor):
+            self._memguard_decode_growth(guard)  # restore the full-width charge
+            return False
+        lo, hi = floor, widest
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        self._memguard_decode_growth(guard, writes=lo)
+        if lo < widest:
+            if getattr(self, "_memguard_last_verify_cap", None) != lo:
+                logger.warning(
+                    "[memory_guard] MTP verify narrowed to %d of %d rows to fit "
+                    "the decode step (instead of evicting a prefix entry)",
+                    lo,
+                    widest,
+                )
+            guard.counts["verify_narrowed"] += 1
+            self._memguard_set_verify_cap(lo)
+        else:
+            self._memguard_set_verify_cap(None)
+        self._memguard_last_verify_cap = lo if lo < widest else None
+        return True
 
     def _memguard_generation_lengths(self) -> list[int]:
         """Context length of every row in mlx-lm's generation (decode) batch."""
@@ -7930,9 +8158,21 @@ class Scheduler:
         promote = int(kv_fn(gen_lengths[0])) if len(gen_lengths) == 1 else 0
         return merged + promote
 
-    def _memguard_make_room(self, extra: int, ceiling: int, max_level: int) -> bool:
+    def _memguard_make_room(
+        self,
+        extra: int,
+        ceiling: int,
+        max_level: int,
+        *,
+        deferrable: bool = False,
+        reason: str = "join",
+    ) -> bool:
         """Footprint + ``extra`` + margin under the ceiling, clearing the
-        allocator cache and evicting with the ONE policy up to ``max_level``."""
+        allocator cache and evicting with the ONE policy up to ``max_level``
+        (only entries whose eviction frees real bytes). ``deferrable``: the
+        caller can defer the request that needs the room instead; then an
+        entry a live session needs is not traded for less than the
+        shortfall (returns False: defer)."""
         margin = int(MARGIN_CEILING_RATIO * ceiling)
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - extra - margin)
         if footprint + extra + margin <= ceiling:
@@ -7944,7 +8184,13 @@ class Scheduler:
         if footprint - reclaim + extra + margin > ceiling:
             return False
         while footprint + extra + margin > ceiling:
-            if not self._memguard_evict_ordered(max_level, reason="join"):
+            if deferrable and max_level >= EVICT_NEEDED:
+                nxt = self._memguard_peek(max_level)
+                if nxt is not None and nxt[1] >= EVICT_NEEDED and nxt[0] < (
+                    footprint + extra + margin - ceiling
+                ):
+                    return False
+            if not self._memguard_evict_ordered(max_level, reason=reason):
                 return False
             mx.clear_cache()
             footprint = self._metal_footprint_bytes()
@@ -7990,7 +8236,7 @@ class Scheduler:
             batch=len(gen_lengths) + len(joined),
             kv_footprint=kv_fn,
         )
-        if self._memguard_make_room(extra, ceiling, EVICT_NEEDED):
+        if self._memguard_make_room(extra, ceiling, EVICT_NEEDED, deferrable=True):
             return False
         for request in joiners:
             self._memguard_defer_request(
@@ -8522,7 +8768,7 @@ class Scheduler:
         if level < SYSTEM_PRESSURE_WARN:
             return
         guard = self._memguard()
-        max_level = EVICT_NEEDED if level >= SYSTEM_PRESSURE_CRITICAL else EVICT_HEAD
+        max_level = EVICT_LAST if level >= SYSTEM_PRESSURE_CRITICAL else EVICT_HEAD
         evicted = 0
         while self._memguard_evict_ordered(
             max_level, keep_last=True, reason="system pressure", count=False
@@ -9175,6 +9421,24 @@ class Scheduler:
             total += record.nbytes
         return total
 
+    def _memguard_own_decode_floor(self, request: Request) -> int:
+        """Bytes ``request``'s next decode step needs beyond the footprint at
+        the narrowest verify the guard can set (KV growth, restore points),
+        when it is decoding now; 0 otherwise."""
+        guard = getattr(self, "_memory_guard", None)
+        uid = self.request_id_to_uid.get(request.request_id) if guard else None
+        gen = getattr(self.batch_generator, "_generation_batch", None)
+        if uid is None or uid not in list(getattr(gen, "uids", None) or ()):
+            return 0
+        knob = self._memguard_verify_rows_range()
+        try:
+            need = self._memguard_decode_growth(
+                guard, writes=knob[0] if knob is not None else None
+            )
+        finally:
+            self._memguard_decode_growth(guard)  # the plan's own charge back
+        return max(0, int(need))
+
     def _memguard_room_for_store(
         self,
         request: Request | None,
@@ -9208,6 +9472,12 @@ class Scheduler:
                 need = int(estimate_kv_cache_memory(cache))
         except Exception:  # noqa: BLE001
             return True
+        if not handoff and not turn_end and request is not None:
+            # A mid-turn entry must leave room for its OWN session's next
+            # decode step at the narrowest verify the guard can set: else the
+            # store is made and that step evicts it again (the session's
+            # newest entry, as a last resort) -- copy/churn for nothing.
+            need += self._memguard_own_decode_floor(request)
         margin = int(MARGIN_CEILING_RATIO * ceiling)
         storing = None
         finished = None
@@ -10500,7 +10770,11 @@ class Scheduler:
             if metal_threshold > 0:
                 # Memory guard E2: active + allocator cache, the cache given
                 # back first so a full cache never costs a prefix entry.
-                active = self._metal_footprint_bytes(reclaim_over=metal_threshold)
+                # MEASURED pressure: the shared bytes a later write will
+                # allocate are the plan's business, not a reason to evict now.
+                active = self._metal_footprint_bytes(
+                    reclaim_over=metal_threshold
+                ) - self._memguard_shared_pending()
                 if active >= metal_threshold:
                     should_evict = True
                     triggered_metal = True
@@ -10526,7 +10800,7 @@ class Scheduler:
                 if not self._evict_one_prefix_cache_entry():
                     break
             elif not self._memguard_evict_ordered(
-                EVICT_NEEDED if hard or over_own_budget else EVICT_REDUNDANT,
+                EVICT_LAST if hard or over_own_budget else EVICT_REDUNDANT,
                 keep_last=not hard,
                 reason="pressure",
                 count=False,  # counted below, with the clear_cache contract

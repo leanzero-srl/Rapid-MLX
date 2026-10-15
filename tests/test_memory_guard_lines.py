@@ -48,7 +48,7 @@ def test_a_helper_turn_keeps_mains_turn_boundary(cpu):
         session="main",
         frame=200,
     )
-    assert _levels(s)[tuple(first)] == EVICT_NEEDED
+    assert _levels(s)[tuple(first)] >= EVICT_NEEDED
     # Duress: everything below NEEDED goes.
     while s._memguard_evict_ordered(EVICT_HEAD, reason="E1"):
         pass
@@ -99,7 +99,7 @@ def test_a_helper_frame_is_outlived_once_main_runs_again(cpu):
     helper = [lv for k, lv in levels.items() if k[:200] == tuple(summary[:200])]
     mains = [lv for k, lv in levels.items() if k[:300] == tuple(frame) and len(k) > 700]
     assert helper and max(helper) < EVICT_NEEDED, helper
-    assert EVICT_NEEDED in mains, mains
+    assert mains and max(mains) >= EVICT_NEEDED, mains  # NEEDED or EVICT_LAST
 
 
 # -- item 1: chat A finished, chat B opened (64 GB duress) ----------------
@@ -203,7 +203,7 @@ def test_main_waiting_on_a_subagent_stays_protected(cpu, main_outcome):
         nxt = sp + o + [904] + _hybrid_tokens(400 + j, 300)
         b = len(nxt)
         sp = nxt + _GEN_PROMPT
-        assert _levels(s)[head] == EVICT_NEEDED, j
+        assert _levels(s)[head] >= EVICT_NEEDED, j
     assert ("session", "main") not in {o[0] for o in s._memguard_outlived_lines()}
     while s._memguard_evict_ordered(EVICT_HEAD, reason="E1"):
         pass
@@ -241,14 +241,14 @@ def test_a_title_helper_admitted_first_never_demotes_main(cpu):
         lv = _levels(s)
         return [v for k, v in lv.items() if k[:200] == tuple(title)]
 
-    assert max(mains()) == EVICT_NEEDED, mains()
+    assert max(mains()) >= EVICT_NEEDED, mains()
     # The next user turn: main is a conversation and ran after the title.
     nxt = main + _GEN_PROMPT + out + [904] + _hybrid_tokens(40, 80)
     _hybrid_run(s, "m1", nxt + _GEN_PROMPT, len(nxt), turn_start=True, **_MAIN)
-    assert max(mains()) == EVICT_NEEDED, mains()
+    assert max(mains()) >= EVICT_NEEDED, mains()
     assert titles() and max(titles()) < EVICT_NEEDED, titles()
     retitle("t2")  # another retitle: still never above main
-    assert max(mains()) == EVICT_NEEDED, mains()
+    assert max(mains()) >= EVICT_NEEDED, mains()
 
 
 # -- item 2: the hybrid entry-count bound, NO memory pressure -------------
