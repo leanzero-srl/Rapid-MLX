@@ -2243,6 +2243,150 @@ def _retain_tool_loop_think_blocks(prompt: str, messages: list) -> str:
     return "".join(pieces)
 
 
+def _join_split_assistant_turns(messages: list) -> list:
+    """Rejoin one assistant response that a client sent back as several rows.
+
+    goose (3.0.x) stores a streamed response as the visible text, then the
+    tool call carrying the turn's reasoning, and sends them as two assistant
+    rows; a /v1/responses ``message`` item followed by its ``function_call``
+    items converts the same way. Rendered apart, the model reads its own
+    narration as a finished turn ("Now let me write the ledger module:" then
+    end of turn), then a turn that only calls a tool, with the reasoning after
+    the text it produced: the exact shape it then imitates by ending a turn on
+    narration with no call. Assistant rows with nothing between them can only
+    be one response, so a text-only row and the bare tool-call rows right
+    after it become the single row the model generated.
+
+    The caller joins only for templates that render a row's text before its
+    calls (``_template_puts_narration_before_calls``).
+    """
+    joined: list = []
+    for message in messages:
+        previous = joined[-1] if joined else None
+        if _is_bare_tool_call_row(message) and (
+            _is_narration_row(previous) or _is_joined_turn(previous)
+        ):
+            merged = dict(previous)
+            merged["tool_calls"] = list(previous.get("tool_calls") or []) + list(
+                message["tool_calls"]
+            )
+            reasoning = _one_reasoning(
+                previous.get("reasoning_content"), message.get("reasoning_content")
+            )
+            if reasoning:
+                merged["reasoning_content"] = reasoning
+            merged[_JOINED] = True
+            joined[-1] = merged
+            continue
+        joined.append(message)
+    return [
+        {k: v for k, v in m.items() if k != _JOINED} if _is_joined_turn(m) else m
+        for m in joined
+    ]
+
+
+#: Marks a row this pass built, so later bare calls of the same response fold
+#: into it; stripped before the list leaves the function.
+_JOINED = "__rapid_mlx_joined_turn__"
+
+
+def _is_joined_turn(message) -> bool:
+    return isinstance(message, dict) and message.get(_JOINED) is True
+
+
+def _one_reasoning(first, second) -> str:
+    """The reasoning of one response that a client copied onto several rows.
+
+    goose copies a turn's reasoning onto every row of that turn, so the same
+    text often arrives twice; it is kept once, never concatenated with itself.
+    """
+    texts = [t for t in (first, second) if isinstance(t, str) and t.strip()]
+    if len(texts) < 2:
+        return texts[0] if texts else ""
+    a, b = texts
+    if a.strip() == b.strip() or a.strip().startswith(b.strip()):
+        return a
+    if b.strip().startswith(a.strip()):
+        return b
+    return a + "\n\n" + b
+
+
+_NARRATION_ORDER_CACHE: dict[int, bool] = {}
+_PROBE_NARRATION = "Narration before the call."
+_PROBE_TOOL = "narration_order_probe"
+
+
+def _template_puts_narration_before_calls(template_applicator) -> bool:
+    """Does this template render an assistant row's text before its calls?
+
+    Measured once per template by rendering one joined row. Qwen3.5/3.8,
+    Qwen3-Coder-Next and Nemotron do; Gemma 4 renders the text after the tool
+    result and Llama 3.2 drops it, so joining there would move or lose the
+    narration and the rows stay as the client sent them.
+    """
+    template = getattr(template_applicator, "chat_template", None)
+    key = hash(template if isinstance(template, str) else repr(template))
+    if key in _NARRATION_ORDER_CACHE:
+        return _NARRATION_ORDER_CACHE[key]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": _PROBE_TOOL,
+                "description": "probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    probe = [
+        {"role": "user", "content": "Go."},
+        {
+            "role": "assistant",
+            "content": _PROBE_NARRATION,
+            "tool_calls": [
+                {
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {"name": _PROBE_TOOL, "arguments": {}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_probe", "content": "probe result"},
+    ]
+    try:
+        rendered = _render_chat_template(
+            template_applicator, probe, tools=tools, add_generation_prompt=True
+        )
+        text_at = rendered.find(_PROBE_NARRATION)
+        call_at = rendered.find(_PROBE_TOOL, rendered.find("Go."))
+        result_at = rendered.find("probe result")
+        verdict = 0 <= text_at < call_at and (result_at < 0 or text_at < result_at)
+    except Exception as e:
+        logger.debug("narration-order probe failed (%s); rows stay split", e)
+        verdict = False
+    _NARRATION_ORDER_CACHE[key] = verdict
+    return verdict
+
+
+def _is_narration_row(message) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and not message.get("tool_calls")
+        and isinstance(message.get("content"), str)
+        and bool(message["content"].strip())
+    )
+
+
+def _is_bare_tool_call_row(message) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and bool(message.get("tool_calls"))
+        and not message.get("content")
+    )
+
+
 def apply_chat_template(
     template_applicator,
     messages: list[dict],
@@ -2258,6 +2402,10 @@ def apply_chat_template(
     that afterwards gives Qwen3.5-style templates a stable rendering for
     tool-loop assistant rows (see ``_retain_tool_loop_think_blocks``).
     """
+    if any(_is_bare_tool_call_row(m) for m in messages) and (
+        _template_puts_narration_before_calls(template_applicator)
+    ):
+        messages = _join_split_assistant_turns(messages)
     prompt = _render_chat_template(
         template_applicator,
         messages,
