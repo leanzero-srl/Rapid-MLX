@@ -564,14 +564,17 @@ class PeakModel:
         """A step at or above the floor chunk that measured beyond the
         model's own error bound (MARGIN_TRANSIENT_RATIO) over its plan RAISES
         ``a`` -- toward explaining the excess by attention, by at most that
-        same error bound per observation, so repeated overshoots compound and
-        a one-off moves it little. The pair medians follow only once a group
-        holds enough pairs, and an under-plan is the one error that becomes
-        an OOM (review 10: Gabee planned 8.53 GB, measured 12.45 GB, and the
-        coefficient went 0.00 -> 0.00). If the overshoot was a one-off, the
-        pair fit pulls it back one bounded step per observation -- or, where
-        the fit is silent (long contexts), it decays back to the last fitted
-        value (``_rebuild``)."""
+        same error bound, so a one-off moves it little. Repeated overshoots
+        do NOT compound: each observation first returns the coefficient
+        toward the fit (``_rebuild``: the pair fit by its bounded step, or,
+        where the fit is silent at long contexts, straight back to the last
+        fitted value), so a raise holds the coefficient at most one bound
+        above the fit, for as long as the overshoots last. A persistent
+        under-plan is corrected by the pair fit itself (its medians move
+        once a group holds enough pairs) and by the residual window.
+        An under-plan is the one error that becomes an OOM (review 10:
+        Gabee planned 8.53 GB, measured 12.45 GB, and the coefficient went
+        0.00 -> 0.00)."""
         if not fit or self._a_learned is None or shape.chunk < self.fit_floor_tokens:
             return
         excess = transient - projected_before
