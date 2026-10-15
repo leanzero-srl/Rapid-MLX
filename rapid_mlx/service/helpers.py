@@ -981,6 +981,42 @@ def _should_start_in_thinking(
     )
 
 
+def _prompt_thinking_active_for(
+    parser,
+    chat_template,
+    enable_thinking: bool | None,
+    *,
+    tools_requested: bool,
+    model_name: str | None,
+) -> bool:
+    """The ``prompt_thinking_active`` a reasoning parser's ``configure_request``
+    takes, decided the way that parser asks for it.
+
+    ONE place for every configure site (both postprocessor sites, /v1/messages,
+    /v1/responses) so the routes cannot drift. A parser with
+    ``implicit_reasoning_until_close`` (R1-Distill) asks for the unconditional
+    render; one with ``prompt_priming_rendered`` (DeepSeek-R1 and its other
+    subclasses) asks for the render under the flag the engine will actually
+    render with: an unset flag means thinking on unless the model name contains
+    "coder", exactly as ``apply_chat_template`` resolves it, so a coder-named
+    checkpoint whose prompt ends with a CLOSED think block is not mistaken for a
+    primed one.
+    """
+    implicit = bool(getattr(parser, "implicit_reasoning_until_close", False))
+    rendered = bool(getattr(parser, "prompt_priming_rendered", False))
+    if rendered and not implicit:
+        enable_thinking = _effective_enable_thinking(
+            enable_thinking, model_name if isinstance(model_name, str) else None
+        )
+    return _should_start_in_thinking(
+        chat_template,
+        enable_thinking,
+        unconditional=implicit,
+        tools_requested=tools_requested,
+        rendered=rendered,
+    )
+
+
 def _rescue_silent_drop_from_reasoning(
     final_content: str | None,
     reasoning_text: str | None,

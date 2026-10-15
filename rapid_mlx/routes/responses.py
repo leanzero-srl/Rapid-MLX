@@ -95,6 +95,7 @@ from ..service.helpers import (
     _consume_guided_lifecycle_cancel,
     _disconnect_guard,
     _effective_enable_thinking,
+    _prompt_thinking_active_for,
     _extract_thinking_from_request,
     _finalize_content_and_reasoning,
     _is_structured_output_requested,
@@ -3106,16 +3107,19 @@ async def _stream_responses(
                 configure_kwargs = {
                     "enable_thinking": chat_kwargs.get("enable_thinking")
                 }
-                if getattr(reasoning_parser, "implicit_reasoning_until_close", False):
+                if getattr(
+                    reasoning_parser, "implicit_reasoning_until_close", False
+                ) or getattr(reasoning_parser, "prompt_priming_rendered", False):
                     configure_kwargs["prompt_thinking_active"] = (
-                        _should_start_in_thinking(
+                        _prompt_thinking_active_for(
+                            reasoning_parser,
                             getattr(
                                 getattr(engine, "tokenizer", None), "chat_template", ""
                             )
                             or "",
                             chat_kwargs.get("enable_thinking"),
-                            unconditional=True,
                             tools_requested=bool(chat_kwargs.get("tools")),
+                            model_name=cfg.model_path or cfg.model_name,
                         )
                     )
                 configure_parameters: Mapping[str, inspect.Parameter] = (

@@ -107,3 +107,167 @@ def test_a_template_that_only_renders_history_thoughts_does_not_prime():
     answer = "The capital of France is Paris, and it has been since the tenth century."
     reasoning, content = _stream(_HISTORY_ONLY, answer)
     assert content  # not swallowed whole as a primed thought
+
+
+def test_a_coder_named_checkpoint_is_not_primed_when_the_flag_is_unset():
+    # apply_chat_template renders an unset flag as thinking OFF for a model
+    # whose name contains "coder": the prompt ends with a CLOSED think block,
+    # so a tagless answer must stay the answer.
+    from rapid_mlx.service.helpers import _prompt_thinking_active_for
+
+    parser = DeepSeekR1ReasoningParser()
+    assert not _prompt_thinking_active_for(
+        parser, _QWEN38, None, tools_requested=False, model_name="/m/Qwen3.8-27B-coder-sft"
+    )
+    assert _prompt_thinking_active_for(
+        parser, _QWEN38, None, tools_requested=False, model_name="/m/Qwen3.8-27B"
+    )
+    assert _prompt_thinking_active_for(
+        parser, _QWEN38, True, tools_requested=False, model_name="/m/Qwen3.8-27B-coder-sft"
+    )
+
+
+# --- route level: /v1/messages and /v1/responses configure the parser too ----
+
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import pytest  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from rapid_mlx.config import reset_config  # noqa: E402
+
+_ROUTE_THOUGHT = _THOUGHT + " " + "Now the manifest, then the ledger module. " * 4
+
+
+class _Qwen38Tokenizer:
+    chat_template = _QWEN38
+
+
+class _PrimedQwen38Engine:
+    """Streams a primed Qwen3.8 thought (no opening tag), the closing token,
+    then a short answer."""
+
+    preserve_native_tool_format = False
+    is_mllm = False
+    supports_guided_generation = False
+    supports_tool_calls = True
+    tokenizer = _Qwen38Tokenizer()
+
+    def build_prompt(self, messages, tools=None, enable_thinking=None):
+        return "PROMPT"
+
+    async def stream_chat(self, messages, **kwargs):
+        pieces = [_ROUTE_THOUGHT[i : i + 5] for i in range(0, len(_ROUTE_THOUGHT), 5)]
+        pieces += ["</think>", "\n\nDone."]
+        for index, piece in enumerate(pieces, start=1):
+            yield SimpleNamespace(
+                new_text=piece,
+                text="".join(pieces[:index]),
+                prompt_tokens=10,
+                completion_tokens=index,
+                finish_reason=None,
+                finished=False,
+                channel=None,
+                tool_calls=None,
+                tokens=[],
+                logprobs=None,
+            )
+        yield SimpleNamespace(
+            new_text="",
+            text="".join(pieces),
+            prompt_tokens=10,
+            completion_tokens=len(pieces),
+            finish_reason="stop",
+            finished=True,
+            channel=None,
+            tool_calls=None,
+            tokens=[],
+            logprobs=None,
+        )
+
+
+@pytest.fixture
+def _route_cfg():
+    from rapid_mlx.middleware.auth import rate_limiter
+
+    saved = rate_limiter.enabled
+    rate_limiter.enabled = False
+    cfg = reset_config()
+    cfg.engine = _PrimedQwen38Engine()
+    cfg.model_name = "Qwen3.8-27B"
+    cfg.model_path = None
+    cfg.reasoning_parser_name = "deepseek_r1"
+    cfg.model_registry = None
+    cfg.no_thinking = False
+    cfg.tool_call_parser = None
+    cfg.enable_auto_tool_choice = False
+    yield cfg
+    reset_config()
+    rate_limiter.enabled = saved
+
+
+def _sse(text: str) -> list[dict]:
+    events = []
+    for line in text.splitlines():
+        if line.startswith("data: ") and line != "data: [DONE]":
+            try:
+                events.append(json.loads(line[6:]))
+            except json.JSONDecodeError:
+                pass
+    return events
+
+
+def test_the_messages_route_keeps_a_primed_thought_as_thinking(_route_cfg):
+    from rapid_mlx.routes.anthropic import router
+
+    app = FastAPI()
+    app.include_router(router)
+    response = TestClient(app).post(
+        "/v1/messages",
+        json={
+            "model": "Qwen3.8-27B",
+            "max_tokens": 4000,
+            "stream": True,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "messages": [{"role": "user", "content": "Build it."}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    deltas = [e.get("delta", {}) for e in _sse(response.text) if e.get("type") == "content_block_delta"]
+    thinking = "".join(d.get("thinking", "") for d in deltas if d.get("type") == "thinking_delta")
+    text = "".join(d.get("text", "") for d in deltas if d.get("type") == "text_delta")
+    assert "79% — should conserve" in thinking
+    assert "should conserve" not in text
+    assert text.strip() == "Done."
+
+
+def test_the_responses_route_keeps_a_primed_thought_as_reasoning(_route_cfg):
+    from rapid_mlx.middleware.exception_handlers import install_exception_handlers
+    from rapid_mlx.routes.responses import router
+
+    app = FastAPI()
+    install_exception_handlers(app)
+    app.include_router(router)
+    response = TestClient(app).post(
+        "/v1/responses",
+        json={
+            "model": "Qwen3.8-27B",
+            "stream": True,
+            "max_output_tokens": 4000,
+            "reasoning": {"effort": "medium"},
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Build it."}]}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    events = _sse(response.text)
+    reasoning = "".join(
+        e.get("delta", "") for e in events if "reasoning" in str(e.get("type", "")) and isinstance(e.get("delta"), str)
+    )
+    text = "".join(
+        e.get("delta", "") for e in events if e.get("type") == "response.output_text.delta"
+    )
+    assert "79% — should conserve" in reasoning
+    assert "should conserve" not in text
+    assert text.strip() == "Done."
