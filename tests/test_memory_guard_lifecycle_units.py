@@ -356,3 +356,38 @@ def test_a_second_needed_tombstone_is_kept_while_there_is_room():
     out = s._memguard_outlived_lines()
     assert p not in out
     assert S in out
+
+
+def test_a_forgotten_session_keeps_only_its_own_kinds():
+    """A session's helper call (another frame, one-shot) is not of the
+    session's KIND. Once the session is forgotten its tombstone carries its
+    conversation frames' kinds only: a pending one-shot line of the helper's
+    kind is not released by it, before or after the forgetting."""
+    s = _sched()
+    x = _line(s, (("frame", 5, 1), KH), KH, 1, 1, 1, "tool_calls", continues=False)
+    m = _line(s, M, KA, 2, 4, 4)
+    mh = _line(s, (("session", "M"), KH), KH, 3, 3, 3, continues=False)
+    assert x not in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{m}"]
+    del s.memory_aware_cache._entries[f"e{mh}"]
+    assert x not in s._memguard_outlived_lines()
+
+
+def test_past_the_bound_the_most_recently_active_tombstone_stays():
+    """Past the bound only the latest needed tombstone of a (conversation,
+    rule) is sure to stay: the one most recently active, the likeliest to
+    come back. Build X waits on its tool; two older windows of its kind are
+    forgotten; the user goes back to the latest of them: it is still older
+    than X, so X stays held."""
+    s = _sched()
+    r1 = _line(s, (("session", "R1"), KA), KA, 1, 2, 2)
+    r2 = _line(s, (("session", "R2"), KA), KA, 3, 4, 4)
+    x = _line(s, (("session", "X"), KA), KA, 5, 7, 5, outcome="tool_calls")
+    assert x not in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{r1}"]
+    s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{r2}"]
+    assert x not in s._memguard_outlived_lines()
+    assert len(s._memguard_forgotten) == 1  # one recorded conversation
+    _line(s, r2, KA, 8, 8, 8, continues=False)  # back to R2: the user types
+    assert x not in s._memguard_outlived_lines()
