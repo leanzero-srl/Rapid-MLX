@@ -7417,6 +7417,11 @@ class Scheduler:
             arrays[key] = items
         out: dict[tuple, int] = {}
         for key, entry in entries.items():
+            if not hasattr(entry, "memory_bytes"):
+                # No ledger to read (a cache variant's own entry): nothing
+                # proves it frees nothing, so it stays evictable.
+                out[key] = 1
+                continue
             charge = int(getattr(entry, "memory_bytes", 0) or 0)
             items = arrays[key]
             total = sum(int(a.nbytes) for a, _addr in items)
@@ -8069,16 +8074,19 @@ class Scheduler:
         knob = self._memguard_verify_rows_range()
         if self._memguard_make_room(decode, ceiling, EVICT_REDUNDANT):
             return
-        if knob is not None and self._memguard_narrow_verify(guard, ceiling, knob):
-            return
         if knob is not None:
+            # Room is made only for the NARROWEST verify: an entry goes only
+            # when even that does not fit (make_room evicts nothing when it
+            # does); then the verify is widened to what the room allows.
             decode = self._memguard_decode_growth(guard, writes=knob[0])
             self._memguard_set_verify_cap(knob[0])
-        for level in (EVICT_HEAD, EVICT_NEEDED, EVICT_LAST):
-            if self._memguard_make_room(decode, ceiling, level):
-                if knob is not None:
-                    self._memguard_narrow_verify(guard, ceiling, knob)
-                return
+        # The ONE order does the staging: abandoned heads, then entries a
+        # live session needs, then the newest entries (EVICT_LAST), each only
+        # while the step still does not fit and only for real bytes.
+        if self._memguard_make_room(decode, ceiling, EVICT_LAST):
+            if knob is not None:
+                self._memguard_narrow_verify(guard, ceiling, knob)
+            return
         guard.counts["decode_over_ceiling"] += 1
         logger.warning(
             "[memory_guard] decode KV growth %.2fGB: footprint %.2fGB + growth "

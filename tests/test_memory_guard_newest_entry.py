@@ -251,6 +251,25 @@ def test_the_newest_entry_goes_last_and_only_for_real_bytes(cpu):
     assert cap is None or cap >= 4  # widened again once the room was real
 
 
+def test_an_entry_that_frees_nothing_is_skipped_for_one_that_does(cpu):
+    """The running request's own loan still holds an older entry's arrays:
+    evicting it would give nothing, so the next one in order goes and the
+    held one stays (rule 1)."""
+    live = CEILING - ENTRY - int(0.5 * GB) - MARGIN + int(0.6 * GB)
+    s = _scheduler(CEILING, live=live)
+    main = _entry(s, list(range(BOUNDARY)), ENTRY)
+    older = _entry(s, list(range(95_000)), int(0.5 * GB))
+    held = s.memory_aware_cache._entries[older]
+    held._test_shared = True  # its bytes are the loan's, not the entry's
+    s.running["main"].prompt_cache = list(held.cache)
+    with s.memory_aware_cache._lock:
+        assert s._memguard_freeable_bytes()[older] == 0
+    _plan(s)
+    assert older in s.memory_aware_cache._entries
+    assert main not in s.memory_aware_cache._entries  # the last resort, real bytes
+    assert s._memguard().counts["newest_evictions"] == 1
+
+
 def test_the_128_gb_arm_takes_no_action(cpu):
     s = _scheduler(BIG_CEILING)
     main = _entry(s, list(range(BOUNDARY)), ENTRY)
@@ -358,6 +377,16 @@ def test_a_concurrent_request_is_deferred_before_a_needed_entry_goes():
     world = _World(44 * GB, [(1 * GB, EVICT_NEEDED), (6 * GB, EVICT_LAST)])
     plan = guard.plan(ROWS, configured_chunk=2048, ceiling=48 * GB, probe=world.probe())
     assert world.log == [EVICT_NEEDED] and plan.refuse is None
+
+
+def test_with_a_concurrent_request_the_newest_entry_waits_for_the_deferral():
+    """Only a conversation's newest entry could cover the step: with a
+    concurrent request to defer, it is not touched (rule 3)."""
+    guard = _plain_guard()
+    world = _World(44 * GB, [(6 * GB, EVICT_LAST)])
+    plan = guard.plan(ROWS, configured_chunk=2048, ceiling=48 * GB, probe=world.probe())
+    assert plan.refuse is not None and plan.refuse.request_id == "side"
+    assert world.log == []
 
 
 def test_alone_the_newest_entry_goes_after_the_needed_one():
