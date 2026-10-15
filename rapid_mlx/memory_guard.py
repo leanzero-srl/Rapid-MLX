@@ -39,11 +39,11 @@ model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
   MARGIN_TRANSIENT_RATIO        0.10   measured (2x the 5% run-to-run spread)
   CACHE_LIMIT_FLOOR_RATIO       0.02   ratio of the device ceiling
   ALLOCATOR_CACHE_SHARE         0.25   ratio of the device ceiling (lz boot)
-  decode KV-growth layers       --     MEASURED: the largest of the last
-                                       OBS_PER_GROUP growth steps; a whole
-                                       copy of the KV until the first one
+  DECODE_GROWTH_LAYERS          2.0    measured (2.12 layers, sim at 20k); the
+                                       prior only: a growth step that peaks
+                                       over the ceiling raises it (measured)
   decode step per context token --     MEASURED only (0 until a decode step
-                                       overshoots its plan; see
+                                       peaks over the ceiling; see
                                        MemoryGuard.observe_decode)
   WINDOW_BAND_RATIO             0.03   measured (Q4 window jitter)
   MAX_STEP_FACTOR               1.25   measured motive (Gabee 103->360 jump)
@@ -195,18 +195,19 @@ BACKSTOP_DECAY = 0.97
 BACKSTOP_DROP_FRACTION = 0.01
 # A decode step at which mlx-lm grows the KV (a row's write reaches its
 # buffer's capacity; KVCache grows by KVCache.step tokens by concatenation)
-# holds part of the KV again beyond the resident footprint -- how much
-# depends on the decode graph and the device, so it is MEASURED (the
-# guard's ``decode_growth_layers``), starting from a whole copy of the KV.
-# History, kept because the old constant read authoritative: it was
-# DECODE_GROWTH_LAYERS = 2.0, "measured 2.12 layers" in the 1/100 session
-# sim -- whose llama has TWO layers, so it measured the whole KV, and the
-# 27B (16 full-attention layers) was planned 2 of 16. The real allocator
-# holds every layer's old and new buffer in one lazily built graph (scratch
-# grow_probe.py, mlx 0.32.2: 8.3 layers of an 8-layer KVCache stack, rows 1,
-# 4 and 32 alike), and Gabee's MTP decode at 84k measured >= 4.85 GB beyond
-# the footprint = ~0.9 of its 5.3 GB KV (MLX throttles at its memory limit,
-# so that is a lower bound).
+# holds this many full-attention LAYERS of the whole context beyond the
+# resident footprint: the layer being concatenated (old + new buffer) and
+# the previous layer still referenced by the in-flight async step.
+# measured: real MLX allocator, session sim at 1/100 of Gabee, peak - resident
+# on the growth step = 42.54 MB at 19,600 tokens and 43.58 MB at 20,100
+# (one layer 20.07 / 20.58 MB): 2.12 layers each, of which 0.10 is the new
+# KVCache.step block (charged separately). It is the PRIOR only: how much a
+# growth step holds depends on the decode graph (a lazily built stack of
+# concatenations holds every layer: scratch grow_probe.py, 8.3 of 8 layers;
+# Gabee's MTP decode at 84k held >= 4.85 GB = ~0.9 of its 5.3 GB KV), so a
+# growth step that peaks over the ceiling raises it to what it measured
+# (MemoryGuard.observe_decode).
+DECODE_GROWTH_LAYERS = 2.0  # measured prior: see above
 
 
 def guard_enabled() -> bool:
@@ -809,11 +810,10 @@ class MemoryGuard:
         # keeps it at 0 and plans exactly as before.
         self.decode_step_bytes_per_context = 0.0
         self.decode_step_raises = 0
-        # Layers of the context (in units of one full-attention layer's KV)
-        # a KV-growth decode step held beyond the footprint, measured on the
-        # last growth steps (:meth:`observe_decode`); until the first one, a
-        # whole copy of the KV (:attr:`decode_growth_layers`).
-        self._growth_layers: deque[float] = deque(maxlen=OBS_PER_GROUP)
+        # Full-attention layers of the context a KV-growth decode step holds
+        # beyond the footprint: DECODE_GROWTH_LAYERS until a growth step
+        # peaks over the ceiling, then what it measured (observe_decode).
+        self.decode_growth_layers = float(DECODE_GROWTH_LAYERS)
         # The advertised window and a pending (candidate, model version).
         self._published_window: int | None = None
         self._published_calibrated = False
@@ -834,20 +834,6 @@ class MemoryGuard:
         if kv_footprint is not None and context > 0:
             whole = max(whole, int(kv_footprint(int(context))) / int(context))
         return max(g, whole) / g
-
-    def growth_layers(
-        self, context: int = 0, kv_footprint: Callable[[int], int] | None = None
-    ) -> float:
-        """Full-attention layers of the context a KV-growth decode step holds
-        beyond the footprint: the largest of the recent measured growth
-        steps, a whole copy of the KV before the first one."""
-        if self._growth_layers:
-            return max(self._growth_layers)
-        return self._whole_kv_layers(context, kv_footprint)
-
-    @property
-    def decode_growth_layers(self) -> float:
-        return self.growth_layers()
 
     # -- arithmetic -----------------------------------------------------
     def margin(self, transient: int, ceiling: int) -> int:
@@ -1233,8 +1219,7 @@ class MemoryGuard:
         step = kv_growth_step()
         rows = max(1, int(batch))
         layer = self.model.prior.kv_copy_bytes_per_context
-        layers = self.growth_layers(int(context), kv_footprint)
-        grown = layers * layer * (int(context) + step) * rows
+        grown = self.decode_growth_layers * layer * (int(context) + step) * rows
         if kv_footprint is not None:
             block = int(kv_footprint(int(context) + step)) - int(
                 kv_footprint(int(context))
@@ -1259,34 +1244,35 @@ class MemoryGuard:
         batch: int,
         planned: int,
         ceiling: int,
+        peak: int,
         grew: bool = False,
         kv_footprint: Callable[[int], int] | None = None,
     ) -> bool:
         """One measured decode step: ``transient`` = its peak - the active
         memory before it, ``planned`` = the bytes its plan charged beyond the
-        footprint (KV growth when it grew, plus :meth:`decode_step`).
+        footprint (KV growth when it grew, plus :meth:`decode_step`),
+        ``peak`` = the step's peak.
 
-        A step that GREW the KV is a measurement of the growth term: it
-        joins the last OBS_PER_GROUP growth steps, whose largest is the
-        term (both directions -- the device and the decode graph decide).
-
-        Any other step teaches only when it overshoots its plan beyond the
-        margin: it raises the every-step term to what it measured -- a
-        LOWER bound: MLX throttles at its memory limit (the guard's
-        ceiling), so a step over the ceiling reports about the ceiling, and
-        the next overshoot (planned for, with room made) raises it further.
-        Never lowered: it is a property of the decode graph on this device,
-        and lowering it would re-expose the overshoot that taught it.
-
-        Both are capped at a whole copy of the KV per token, the prefill's
-        per-context cap (beyond it is another lane allocating)."""
-        if context <= 0 or ceiling <= 0:
+        It teaches only when its peak CROSSED the ceiling: below the ceiling
+        an unplanned byte costs nothing, so a Mac with room (or a decode
+        graph that keeps its promise) is planned exactly as before -- no
+        protective action can follow from a step that fit. A crossing raises
+        the term that step belongs to, to what it measured beyond the rest of
+        its plan: the growth layers for a step that grew the KV, the
+        every-step term per context token for any other. The measurement is
+        a LOWER bound -- MLX throttles at its memory limit (the guard's
+        ceiling), so a crossing reports about the ceiling -- and the next
+        crossing (planned for, with room made) raises it further. Never
+        lowered: it is a property of the decode graph on this device, and
+        lowering it would re-expose the crossing that taught it. Both are
+        capped at a whole copy of the KV (beyond it is another lane
+        allocating)."""
+        if context <= 0 or ceiling <= 0 or int(peak) <= ceiling:
             return False
         planned = max(0, int(planned))
         rows = max(1, int(batch))
         g = self.model.prior.kv_copy_bytes_per_context
         whole = self._whole_kv_layers(int(context), kv_footprint)
-        cap = g * whole
         step_term = self.decode_step(context, batch=rows)
         if grew:
             step = kv_growth_step()
@@ -1300,38 +1286,35 @@ class MemoryGuard:
             unit = g * (int(context) + step) * rows
             if unit <= 0:
                 return False
-            layers = (int(transient) - step_term - block * rows) / unit
-            layers = min(whole, max(0.0, layers))
-            before_layers = self.growth_layers(int(context), kv_footprint)
-            self._growth_layers.append(layers)
-            after_layers = self.growth_layers(int(context), kv_footprint)
-            if abs(after_layers - before_layers) > before_layers * REAPPLY_RATIO:
-                logger.warning(
-                    "[memory_guard] KV-growth decode step measured %.2fGB beyond "
-                    "the footprint at context %d (planned %.2fGB): growth "
-                    "layers %.2f -> %.2f",
-                    _gb(int(transient)),
-                    int(context),
-                    _gb(planned),
-                    before_layers,
-                    after_layers,
-                )
+            layers = min(whole, (int(transient) - step_term - block * rows) / unit)
+            if layers <= self.decode_growth_layers:
+                return False
+            before, self.decode_growth_layers = self.decode_growth_layers, layers
+            self.decode_step_raises += 1
+            logger.warning(
+                "[memory_guard] KV-growth decode step peaked over the ceiling: "
+                "%.2fGB beyond the footprint at context %d (planned %.2fGB); "
+                "growth layers %.2f -> %.2f",
+                _gb(int(transient)),
+                int(context),
+                _gb(planned),
+                before,
+                layers,
+            )
             return True
-        if int(transient) <= planned + self.margin(planned, ceiling):
-            return False
         measured = (int(transient) - max(0, planned - step_term)) / (
             int(context) * rows
         )
-        raised = min(cap, measured)
+        raised = min(g * whole, measured)
         if raised <= self.decode_step_bytes_per_context:
             return False
         before = self.decode_step_bytes_per_context
         self.decode_step_bytes_per_context = raised
         self.decode_step_raises += 1
         logger.warning(
-            "[memory_guard] decode step measured %.2fGB beyond the footprint at "
-            "context %d (planned %.2fGB): per-context decode term %.1f -> %.1f "
-            "B/token",
+            "[memory_guard] decode step peaked over the ceiling: %.2fGB beyond "
+            "the footprint at context %d (planned %.2fGB); per-context decode "
+            "term %.1f -> %.1f B/token",
             _gb(int(transient)),
             int(context),
             _gb(planned),
