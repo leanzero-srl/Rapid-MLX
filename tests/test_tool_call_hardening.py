@@ -893,6 +893,20 @@ CUTS = {
         "shell",
     ),
     "undeclared-at-header": ("Let me check.\n<tool_call>\n<function=run>", "run"),
+    # Cut before the header's ``=`` (RC3 review 11): no name was written.
+    **{
+        f"before-equals-{len(part)}": (f"Let me check.\n<tool_call>{sep}{part}", None)
+        for sep, part in (
+            ("\n", "<"),
+            ("\n", "<f"),
+            ("\n", "<fun"),
+            ("\n", "<func"),
+            ("\n", "<functio"),
+            ("\n", "<function"),
+            ("", "<fu"),
+            ("", "<funct"),
+        )
+    },
 }
 
 

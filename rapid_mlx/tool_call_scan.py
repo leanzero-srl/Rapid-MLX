@@ -497,7 +497,11 @@ def trailing_cut_call(text: str) -> tuple[int, str | None, bool] | None:
     tail = text[start:]
     if "</function>" in tail or "</tool_call>" in tail or inside_code(text, start):
         return None
-    if not tail[len("<tool_call>") :].strip() and tail.startswith("<tool_call>"):
+    if tail.startswith("<tool_call>") and "<function=".startswith(
+        tail[len("<tool_call>") :].lstrip()
+    ):
+        # Cut at the wrapper or before the header's ``=`` (``<``, ``<f``,
+        # ``<function``): no name was written (RC3 review 11).
         return start, None, True
     match = _TRAILING_CUT.fullmatch(tail)
     if match is None:
