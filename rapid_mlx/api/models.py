@@ -939,9 +939,17 @@ class Message(BaseModel):
     # Templates with ``preserve_thinking`` (Qwen3.8 defaults it on) render it
     # inside every history row's ``<think>`` block; dropping it here rendered
     # an empty block on every past turn. ``reasoning`` is the LiteLLM /
-    # OpenRouter spelling of the same field; only a string is used.
+    # OpenRouter spelling of the same field. A non-string value (some
+    # clients send an object) is treated as absent, never rejected, and so is
+    # blank text: Qwen3.5-style templates take the ``<think>`` span out of
+    # ``content`` only while ``reasoning_content`` is not a string.
     reasoning_content: str | None = None
-    reasoning: object | None = None
+    reasoning: str | None = None
+
+    @field_validator("reasoning_content", "reasoning", mode="before")
+    @classmethod
+    def _reasoning_text_or_absent(cls, value):
+        return value if isinstance(value, str) and value.strip() else None
 
     @model_validator(mode="after")
     def _validate_content_not_null(self) -> "Message":

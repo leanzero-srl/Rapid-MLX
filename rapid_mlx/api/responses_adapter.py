@@ -520,7 +520,9 @@ def responses_to_openai(
         - ``message`` → assistant or user message (joined text content)
         - ``function_call`` → assistant message with ``tool_calls``
         - ``function_call_output`` → tool-role message with ``tool_call_id``
-        - ``reasoning`` → dropped (encrypted blobs we can't replay)
+        - ``reasoning`` → its plain ``summary_text`` becomes the next
+          assistant row's ``reasoning_content`` (this server emits reasoning
+          items as plain text); an encrypted-only item carries nothing
     - ``tools`` (Responses-flat) → Chat-nested ``{type, function:{name, ...}}``
     - ``text.format`` (JSON-schema output) → ``response_format``
     - ``max_output_tokens`` → ``max_tokens``
@@ -534,10 +536,18 @@ def responses_to_openai(
     if isinstance(request.input, str):
         messages.append(Message(role="user", content=request.input))
     else:
+        pending_reasoning: str | None = None
         for item in request.input:
+            if item.type == "reasoning":
+                pending_reasoning = _reasoning_item_text(item) or pending_reasoning
+                continue
             converted = _convert_input_item(
                 item, preserve_developer_role=preserve_developer_role
             )
+            for message in converted:
+                if pending_reasoning and message.role == "assistant":
+                    message.reasoning_content = pending_reasoning
+                pending_reasoning = None
             messages.extend(converted)
 
     # Codex 0.136.0 sends BOTH `instructions` (the big system prompt)
@@ -1161,9 +1171,8 @@ def _convert_input_item(
     if item.type == "function_call_output":
         return [_function_call_output_to_chat(item)]
     if item.type == "reasoning":
-        # The encrypted_content payload is opaque to non-OpenAI backends;
-        # dropping reasoning items is the documented fallback. Codex
-        # tolerates the absence — it doesn't re-display them anyway.
+        # A reasoning item is not a row of its own: the request converter
+        # attaches its text to the next assistant row (``_reasoning_item_text``).
         return []
     # Unknown item types (local_shell_call, tool_search_call, etc.) are
     # OpenAI-side features Codex won't send to a third-party backend.
@@ -1221,6 +1230,22 @@ def _message_item_to_chat(
         chat_content = parts
 
     return Message(role=role, content=chat_content)
+
+
+def _reasoning_item_text(item: ResponsesInputItem) -> str | None:
+    """The plain-text reasoning a client echoed back in a ``reasoning`` item.
+
+    This server writes its reasoning into ``summary[].text`` and never sets
+    ``encrypted_content``; an OpenAI encrypted blob is opaque here and yields
+    nothing.
+    """
+    parts = [
+        part.get("text")
+        for part in item.summary or []
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
+    ]
+    text = "\n".join(part for part in parts if part.strip())
+    return text or None
 
 
 def _function_call_to_chat(item: ResponsesInputItem) -> Message:

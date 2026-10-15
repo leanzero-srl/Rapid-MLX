@@ -2093,10 +2093,12 @@ def _history_reasoning(msg) -> str | None:
     """The reasoning a client sent back on an assistant history row.
 
     ``reasoning_content`` (DeepSeek / vLLM / goose) wins over ``reasoning``
-    (LiteLLM / OpenRouter). Only a string counts; anything else is absent.
+    (LiteLLM / OpenRouter). Only non-blank text counts: an empty string would
+    stop Qwen3.5-style templates from taking the ``<think>`` span out of
+    ``content``.
     """
     for field in ("reasoning_content", "reasoning"):
         value = msg.get(field) if isinstance(msg, dict) else getattr(msg, field, None)
-        if isinstance(value, str):
+        if isinstance(value, str) and value.strip():
             return value
     return None
