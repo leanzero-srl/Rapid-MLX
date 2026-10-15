@@ -24,7 +24,7 @@ the heads of other conversations."""
 
 import pytest
 
-from rapid_mlx.memory_guard import EVICT_HEAD, EVICT_NEEDED, EVICT_UNUSED
+from rapid_mlx.memory_guard import EVICT_HEAD, EVICT_LAST, EVICT_NEEDED, EVICT_UNUSED
 from tests.test_memory_guard_session import (  # noqa: F401
     _GEN_PROMPT,
     _hybrid_run,
@@ -108,9 +108,11 @@ def test_duress_at_main_admission_evicts_the_dead_branch_first(ladder):
 
 def test_the_live_conversations_newest_heads_stay_needed(ladder):
     """Review 5 controls stay: main's boundary (what main-2 resumes from)
-    is NEEDED, never ranked with the dead branch."""
+    is never ranked with the dead branch. As the newest entry of a live
+    conversation it is EVICT_LAST: after every cheaper action (Gabee T12
+    control: the conversation's only entry evicted under MTP duress)."""
     s, boundary, turn_end, _side_keys, _side, _m2 = ladder
     with s.memory_aware_cache._lock:
         levels = {k: lv for k, lv, _c in s._memguard_ranked_entries()}
-    assert levels[boundary] == EVICT_NEEDED
+    assert levels[boundary] == EVICT_LAST
     assert levels[turn_end] < levels[boundary]

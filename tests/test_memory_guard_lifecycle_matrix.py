@@ -227,7 +227,8 @@ class World:
         return max(levels) if levels else 0
 
     def needed(self, name) -> bool:
-        return self.level(self.convs[name].owner) == EVICT_NEEDED
+        # NEEDED, or EVICT_LAST: a live conversation's newest entry
+        return self.level(self.convs[name].owner) >= EVICT_NEEDED
 
     def protected(self, name, why=""):
         """(a): the newest head is NEEDED (or already in no entry is not

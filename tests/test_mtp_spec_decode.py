@@ -5914,3 +5914,79 @@ def test_prompt_lookup_exports_everything_it_asks_callers_to_use():
     assert declared - public == set(), (
         f"exported but not defined here: {sorted(declared - public)}"
     )
+
+
+def test_generator_prompt_lookup_honours_the_memory_guards_verify_cap(monkeypatch):
+    """The memory guard narrows the verify under duress
+    (``verify_rows_cap``): a copy-draft is cut to cap - 1 rows -- including
+    one already proposed when the cap dropped -- and the output is the
+    target's own tokens either way."""
+    from rapid_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from rapid_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "2")
+
+    class CompositeCache:
+        def __init__(self):
+            self.caches = [_CountingKVCache()]
+
+        @property
+        def offset(self):
+            return self.caches[0].offset
+
+        @offset.setter
+        def offset(self, value):
+            self.caches[0].offset = value
+
+    class SnapshottingModel(_CacheAdvancingQwen35Model):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.verify_widths: list[int] = []
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            self.verify_widths.append(int(inputs.shape[1]))
+            result = super().__call__(inputs, cache=cache, **kwargs)
+            if cache and inputs.shape[1] > 2:
+                cache[0].caches[0].rollback_state = object()
+            return result
+
+    def run(cap, timing=None):
+        model = SnapshottingModel(
+            backbone_outputs=[0, 0, 0, 7, 8, 0, 20, 21, 22],
+            mtp_outputs=[0, 0, 0, 99, 0, 0],
+        )
+        timing = {} if timing is None else timing
+        emitted = list(
+            mtp_generate_step(
+                mx.array([7, 8, 20, 21], dtype=mx.uint32),
+                model,
+                max_tokens=4,
+                max_k=1,
+                disable_auto_k=True,
+                prompt_cache=[CompositeCache(), _CountingKVCache()],
+                accept_counter=MTPAcceptCounter(),
+                timing_stats=timing,
+                prompt_lookup_history=mx.array([7, 8, 20, 21], dtype=mx.uint32),
+                verify_rows_cap=cap,
+            )
+        )
+        return [t for t, _lp, _d in emitted], timing, model.verify_widths
+
+    free_tokens, free_timing, free_widths = run(None)
+    tokens, timing, widths = run(lambda: 2)
+    assert tokens == free_tokens == [7, 8, 20, 21]
+    assert free_timing["prompt_lookup_drafted_tokens"] == 2
+    assert timing["prompt_lookup_drafted_tokens"] == 1
+    assert max(free_widths[1:]) == 3  # the uncapped copy-draft verify: 3 rows
+    assert max(widths[1:]) == 2  # never more than the cap
+    # the cap drops AFTER the copy-draft was proposed: cut at the verify
+    late: dict[str, float] = {}
+    tokens, timing, widths = run(
+        lambda: 2 if late.get("prompt_lookup_proposals") else None, late
+    )
+    assert tokens == free_tokens
+    assert timing["prompt_lookup_drafted_tokens"] == 2  # proposed uncapped
+    assert max(widths[1:]) == 2  # verified capped

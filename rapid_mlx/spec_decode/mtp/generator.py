@@ -372,6 +372,7 @@ def mtp_generate_step(
     prompt_lookup_enabled: bool | None = None,
     prompt_lookup_history: list[int] | mx.array | None = None,
     prompt_lookup_policy: PromptLookupPolicy | None = None,
+    verify_rows_cap: Callable[[], int | None] | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Generator that uses the model's native MTP head for spec decode.
 
@@ -410,6 +411,14 @@ def mtp_generate_step(
             :class:`MTPAcceptCounter`. Tests pass a fresh counter to
             isolate measurements; production callers pass ``None``
             and the module-global counter is used.
+        verify_rows_cap: Optional callable read every round: the most rows
+            one verify may write (the committed token plus its drafts), or
+            ``None`` for no cap. The memory guard sets it under memory
+            duress: a hybrid target's verify of S rows holds S - 1 restore
+            points of every recurrent layer until the round ends (4.77 GB at
+            32 rows on a 27B), so a narrower verify is how a step fits
+            without evicting a prefix entry. Never widens what the
+            controller or the copy-draft gate chose.
     """
     import inspect as _inspect
 
@@ -1130,10 +1139,27 @@ def mtp_generate_step(
             mx.async_eval(*arrays)
         return result
 
+    def _verify_rows_limit() -> int | None:
+        """The memory guard's cap on the rows one verify writes, or None."""
+        if verify_rows_cap is None:
+            return None
+        try:
+            cap = verify_rows_cap()
+        except Exception:  # noqa: BLE001 -- a broken cap must not stop decode
+            return None
+        return None if cap is None else max(1, int(cap))
+
+    def _capped_k(k: int) -> int:
+        limit = _verify_rows_limit()
+        return k if limit is None else max(0, min(k, limit - 1))
+
     def _prompt_lookup_drafts() -> list | None:
         """Return point-mass prompt drafts, or ``None`` when no suffix matches."""
 
         if _prompt_lookup_index is None:
+            return None
+        limit = _verify_rows_limit()
+        if limit is not None and limit < 2:
             return None
         remaining = max_tokens - ntoks
         match = _prompt_lookup_index.propose(
@@ -1147,6 +1173,8 @@ def mtp_generate_step(
         # only this turn's own accepted rows can say that. See
         # ``CopyDraftGate.width_cap``.
         proposed_tokens = match.tokens[: _copy_draft_gate.width_cap(len(match.tokens))]
+        if limit is not None:
+            proposed_tokens = proposed_tokens[: limit - 1]
         safe_count = _safe_prompt_lookup_draft_count(
             model_cache,
             len(proposed_tokens),
@@ -1232,7 +1260,7 @@ def mtp_generate_step(
             # (codex #1441 guarded the same invariant when drafting was the
             # last thing a round did).
             if not round_done:
-                next_k = (
+                next_k = _capped_k(
                     _controller.pick_k()
                     if _select_k and _controller is not None
                     else max_k_effective
@@ -1290,6 +1318,18 @@ def mtp_generate_step(
             # SSM targets use per-position snapshots; attention targets
             # use KVCache.trim() for the same accepted-prefix boundary.
             # -------------------------------------------------------
+            # A copy-draft proposed before the memory guard narrowed the
+            # verify: drop its tail now (point masses: nothing was drafted
+            # into mtp_cache for them, so the rollback below stays exact).
+            # An MTP chain is never cut here -- its K positions are already
+            # in mtp_cache; the cap applies to the next chain.
+            limit = _verify_rows_limit()
+            if (
+                pending_is_prompt_lookup
+                and limit is not None
+                and len(pending_drafts) > max(1, limit - 1)
+            ):
+                pending_drafts = pending_drafts[: max(1, limit - 1)]
             k_len = len(pending_drafts)
             draft_toks_arr = [rec[0] for rec in pending_drafts]
             draft_alps_arr = [rec[2] for rec in pending_drafts]
@@ -1638,7 +1678,7 @@ def mtp_generate_step(
                     _restore_processor_state(emissions[-1][2])
                 # Decide K for the next round BEFORE generating the
                 # next chain (a park decision skips drafter cost).
-                next_k = (
+                next_k = _capped_k(
                     _controller.pick_k()
                     if _select_k and _controller is not None
                     else max_k_effective

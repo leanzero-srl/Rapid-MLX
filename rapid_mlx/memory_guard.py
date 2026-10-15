@@ -51,7 +51,7 @@ model config, or measurement. NUMERIC CONSTANTS ON THE GUARD PATH (owner:
   ROBUST_MIN_OBS                4 / 0.25, 3, 16, 4   algorithm (statistics)
   BACKSTOP_CONTEXT_FRACTION / _DECAY / _DROP_FRACTION
                                 0.75 / 0.97 / 0.01   algorithm (decay)
-  EVICT_UNUSED..EVICT_NEEDED    1..4   enumeration (eviction order)
+  EVICT_UNUSED..EVICT_LAST      1..5   enumeration (eviction order)
   _PLAN_ATTEMPTS (scheduler)    64     algorithm bound: re-plans per step
                                        (each defers / refuses / hands over /
                                        evicts one thing); exhausting it is a
@@ -676,7 +676,12 @@ class GuardProbe:
     entry_count: Callable[[], int]
     # Bytes evicting every entry of level <= ``max_level`` would free (the
     # feasibility test runs BEFORE anything is evicted). ``None``: unknown.
+    # Only bytes an eviction ACTUALLY frees count: an entry sharing its
+    # buffers with a live cache, a queued loan or another entry frees none.
     evictable: Callable[[int], int] | None = None
+    # ``(bytes it frees, level)`` of the entry ``evict_one(max_level)`` would
+    # take next, or None. ``None``: unknown.
+    peek: Callable[[int], tuple[int, int] | None] | None = None
 
 
 # The ONE prefix-cache eviction order every path uses (E1, the pressure
@@ -708,6 +713,15 @@ EVICT_HEAD = 3
 #    recently used session head. Evicted only after the chunk is at the floor,
 #    before refusing a prefill, or under hard pressure at the cap.
 EVICT_NEEDED = 4
+# 5: the NEWEST entry of a conversation -- what its next turn resumes from:
+#    the longest entry on a running or queued request's path, and the newest
+#    head of every live conversation line. Losing it costs that conversation
+#    a whole re-prefill (Gabee T12 control, b06 guard: the only entry, 95,813
+#    tokens, evicted under MTP duress -> every later turn re-prefilled ~98k,
+#    11 minutes to the first token). The LAST resort: after the verify is
+#    narrowed, the chunk reduced and a concurrent request deferred, and only
+#    when evicting it frees real bytes.
+EVICT_LAST = 5
 
 
 @dataclass
@@ -763,6 +777,12 @@ class MemoryGuard:
             # Plans that evicted prefix entries and then deferred the request
             # anyway (feasibility is decided first, so expected 0).
             "evictions_then_deferred": 0,
+            # MTP decode steps whose verify the guard narrowed to fit (instead
+            # of evicting an entry a conversation needs). 0 with room.
+            "verify_narrowed": 0,
+            # Evictions of a conversation's newest entry (EVICT_LAST): the
+            # last resort, after every cheaper action.
+            "newest_evictions": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
@@ -995,7 +1015,7 @@ class MemoryGuard:
             # two entries, one the main session's 36k, then deferred anyway).
             reclaim = int(probe.cache())
             if probe.evictable is not None:
-                reclaim += int(probe.evictable(EVICT_NEEDED))
+                reclaim += int(probe.evictable(EVICT_LAST))
             elif probe.entry_count() > 0:
                 reclaim = fp  # unknown: do not pre-empt the evictions
             infeasible = not fits_plain(floor, fp - reclaim)
@@ -1016,10 +1036,24 @@ class MemoryGuard:
             actions.append(f"clear_cache footprint {_gb(before):.2f}->{_gb(fp):.2f}GB")
             ok, shape, transient, margin = fits(chunk, fp)
 
+        active_rows = [r for r in rows if r.segment > 0]
+        concurrent = len(active_rows) > 1
+
         def evict(max_level: int) -> None:
             nonlocal fp, ok, shape, transient, margin, evicted
             while not ok and not infeasible and probe.entry_count() > 0:
                 before = fp
+                if (
+                    max_level >= EVICT_NEEDED
+                    and concurrent
+                    and probe.peek is not None
+                ):
+                    # Deferring the latest arrival covers the step: never
+                    # trade an entry a conversation needs for less than the
+                    # shortfall when it does.
+                    nxt = probe.peek(max_level)
+                    if nxt is not None and nxt[0] < fp + transient + margin - ceiling:
+                        break
                 if not probe.evict_one(max_level):
                     break
                 probe.clear_cache()
@@ -1061,9 +1095,14 @@ class MemoryGuard:
                     f"reduce chunk {start}->{chunk} (largest that fits; projected "
                     f"step {_gb(transient):.2f}GB at context {shape.context})"
                 )
-        # (b') entries a live session still needs, and session heads, go
-        # before anyone is refused -- re-prefill cost order (cheapest first).
+        # (b') entries a live session still needs go before anyone is
+        # refused -- re-prefill cost order (cheapest first). Then, with a
+        # concurrent request, deferring the latest arrival (below) comes
+        # before any conversation's NEWEST entry; alone, the newest entries
+        # are the last resort before a refusal.
         evict(EVICT_NEEDED)
+        if not concurrent:
+            evict(EVICT_LAST)
         if not ok and self.backstop_extra(shape):
             # Only a decaying E5 margin stands in the way at the floor: the
             # structural projection fits, so dispatch (a repeat OOM aborts

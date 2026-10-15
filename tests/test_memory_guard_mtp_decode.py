@@ -343,6 +343,10 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
     guard = s._memguard()
     assert shared["bytes"] > 0  # mid-turn stores shared live buffers
     assert device.ooms == 0
+    # the conversation resumes from its entry every turn; its newest entry
+    # is never the price of a step
+    assert all(cached >= prev - 8 for (_t, prev, _c), (_t2, _n, cached) in zip(history, history[1:])), history
+    assert guard.counts["newest_evictions"] == 0
     assert guard.steps_over_ceiling == 0, guard.steps_over_ceiling
     assert device.max_seen <= device.ceiling
     assert not _actions(guard), _actions(guard)
@@ -351,6 +355,66 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
         lost = nbytes / (kv_fn(1000) / 1000)
         assert min(windows) >= 18_008 - 1.1 * lost, (windows, lost)
         assert len(history) >= 20, len(history)
+
+
+def _knob_verify(s, nbytes: int, widest: int = 32, depth: int = 3) -> None:
+    """An MTP verify of up to ``widest`` rows holding ``(rows - 1) x
+    nbytes / (widest - 1)`` (restore points, context-independent), as a
+    real allocation that honours the guard's verify cap -- the vendored
+    generator's ``verify_rows_cap``."""
+    per_row = nbytes // (widest - 1)
+    s.config.mtp_max_k = depth
+    s._memguard_decode_write_rows = lambda: widest
+    s._memguard_verify_bytes_per_row = lambda writes: max(0, writes - 1) * per_row
+    real_step = s.step
+
+    def step():
+        bg = s.batch_generator
+        if bg is not None and not getattr(bg, "_lz_fixed", False):
+            real_next = bg.next
+
+            def next_():
+                gen = getattr(bg, "_generation_batch", None)
+                prompting = len(getattr(bg, "_prompt_batch", ()) or ()) or len(
+                    getattr(bg, "_unprocessed_sequences", ()) or ()
+                )
+                decoding = gen is not None and len(gen) > 0 and not prompting
+                rows = getattr(bg, "_lz_verify_rows_cap", None) or widest
+                out = real_next()
+                if decoding:
+                    extra = mx.zeros(((rows - 1) * per_row,), mx.uint8)
+                    mx.eval(extra)
+                    del extra
+                return out
+
+            bg.next = next_
+            bg._lz_fixed = True
+        return real_step()
+
+    s.step = step
+
+
+@pytest.mark.parametrize("arm", ["gabee", "m4max128"])
+def test_a_narrower_verify_keeps_the_conversations_entry(llama, monkeypatch, arm):
+    """The same session with the verify a knob (32 rows at most, the MTP
+    chain's 4 at least): where the decode step does not fit beside the
+    session's entry the verify narrows; nothing crosses, no newest entry is
+    evicted, every turn resumes from its entry, on both arms."""
+    physical = GABEE_PHYSICAL if arm == "gabee" else int(M4_MAX_128_CEILING / 0.97) + 1
+    device = _Device(physical=physical)
+    s = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, s)
+    _knob_verify(s, int(0.9 * s._kv_footprint_fn()(int(0.65 * 6500))))
+    history, windows = _session(s, delta=500, native=65536)
+    guard = s._memguard()
+    assert device.ooms == 0 and guard.steps_over_ceiling == 0
+    assert device.max_seen <= device.ceiling
+    assert guard.counts["newest_evictions"] == 0
+    assert guard.counts["decode_over_ceiling"] == 0
+    assert guard.counts["verify_narrowed"] > 0
+    assert all(cached >= prev - 8 for (_t, prev, _c), (_t2, _n, cached) in zip(history, history[1:])), history
+    if arm == "gabee":
+        assert len(history) >= 20
 
 
 def _count_shared(s) -> dict[str, int]:
@@ -369,12 +433,15 @@ def _count_shared(s) -> dict[str, int]:
 
 def test_the_shared_buffers_are_what_the_plan_was_missing(llama, monkeypatch):
     """Negative control: the same Gabee run with the shared buffers left out
-    of the footprint crosses the ceiling (5 times at review time)."""
+    of the footprint, and a mid-turn store no longer leaving room for its
+    own session's next decode step, crosses the ceiling (5 times at review
+    time). Either one alone holds this run's decode steps."""
     device = _Device(physical=GABEE_PHYSICAL)
     s = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, s)
     _fixed_verify(s, int(0.9 * s._kv_footprint_fn()(int(0.65 * 6500))))
     monkeypatch.setattr(Scheduler, "_memguard_shared_pending", lambda self: 0)
+    monkeypatch.setattr(Scheduler, "_memguard_own_decode_floor", lambda self, r: 0)
     _session(s, delta=500, native=65536)
     assert s._memguard().steps_over_ceiling > 0
 
