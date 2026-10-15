@@ -17,6 +17,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -485,6 +486,74 @@ def _held_rollback_bytes(caches: Any) -> int:
         elif getattr(c, "rollback_state", None) is not None:
             total += size(c.rollback_state)
     return total
+
+
+def _layer_arrays(caches: Any):
+    """``(layer, slot, array)`` for every array a cache list holds: a K/V
+    layer's ``keys``/``values``, a recurrent layer's ``cache[i]``
+    (wrappers such as CacheList recursed)."""
+    import mlx.core as mx
+
+    for c in caches or ():
+        sub = getattr(c, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            yield from _layer_arrays(sub)
+            continue
+        keys = getattr(c, "keys", None)
+        if isinstance(keys, mx.array):
+            yield c, "keys", keys
+            values = getattr(c, "values", None)
+            if isinstance(values, mx.array):
+                yield c, "values", values
+            continue
+        arrays = getattr(c, "cache", None)
+        if isinstance(arrays, list):
+            for i, a in enumerate(arrays):
+                if isinstance(a, mx.array):
+                    yield c, i, a
+
+
+def _slot_array(layer: Any, slot: Any) -> Any:
+    if isinstance(slot, int):
+        arrays = getattr(layer, "cache", None)
+        return arrays[slot] if isinstance(arrays, list) and slot < len(arrays) else None
+    return getattr(layer, slot, None)
+
+
+def _write_mark(layer: Any) -> tuple:
+    """A layer's write position(s): they move on every write, including an
+    in-place one that keeps the array object (a sliding-window ring)."""
+    return tuple(
+        v for v in (getattr(layer, "_idx", None), getattr(layer, "offset", None))
+        if isinstance(v, int)
+    )
+
+
+def _buffer_address(a: Any) -> int | None:
+    """Start address of an evaluated array's data buffer (the buffer
+    protocol; no copy). None when unreadable."""
+    import ctypes
+
+    try:
+        view = memoryview(a)
+        if view.nbytes <= 0 or view.readonly:
+            return None
+        return ctypes.addressof(ctypes.c_char.from_buffer(view))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@dataclass
+class _SharedBuffer:
+    """A live cache buffer a prefix entry stored mid-turn still shares (see
+    ``Scheduler._memguard_note_shared``)."""
+
+    nbytes: int
+    layer: Any  # weakref to the live layer
+    slot: Any
+    array: Any  # weakref to the live array object
+    mark: tuple
+    entries: list = field(default_factory=list)  # (key, weakref to entry)
 
 
 def _model_recurrent_state_bytes(model: Any) -> int:
@@ -5477,6 +5546,7 @@ class Scheduler:
             )
             _dt = _time.monotonic() - _t0
             if stored:
+                self._memguard_note_shared(prompt_tokens)
                 logger.info(
                     f"[prompt_cache_save] request={request_id[:12]} "
                     f"prompt_tokens={len(prompt_tokens)} "
@@ -5808,6 +5878,7 @@ class Scheduler:
             request._cache_snapshot_stored = stored
 
             if stored:
+                self._memguard_note_shared(prefix_tokens)
                 logger.info(
                     f"[boundary_snapshot] request={request_id[:12]} "
                     f"saved {prefix_boundary} tokens at message boundary "
@@ -6734,13 +6805,17 @@ class Scheduler:
         or above it, the cache is cleared first and the sum re-read (E2: the
         cache counts wherever pressure is checked, and it is given back
         before anything with value is evicted or refused)."""
+        # Plus the live buffers a mid-turn prefix entry still shares: they
+        # are allocated again at the live layer's next write
+        # (``_memguard_note_shared``). 0 with no guard or no such store.
+        shared = self._memguard_shared_pending()
         active = self._current_metal_active_bytes()
         cache = self._current_metal_cache_bytes()
-        if reclaim_over > 0 and active + cache >= reclaim_over and cache > 0:
+        if reclaim_over > 0 and active + cache + shared >= reclaim_over and cache > 0:
             mx.clear_cache()
             active = self._current_metal_active_bytes()
             cache = self._current_metal_cache_bytes()
-        return active + cache
+        return active + cache + shared
 
     def _memguard_prefix_entry_count(self) -> int:
         mac = getattr(self, "memory_aware_cache", None)
@@ -7332,7 +7407,9 @@ class Scheduler:
 
     def _memguard_probe(self) -> GuardProbe:
         return GuardProbe(
-            active=self._current_metal_active_bytes,
+            active=lambda: (
+                self._current_metal_active_bytes() + self._memguard_shared_pending()
+            ),
             cache=self._current_metal_cache_bytes,
             clear_cache=mx.clear_cache,
             evict_one=self._memguard_evict_one,
@@ -7509,7 +7586,7 @@ class Scheduler:
             self._memguard_last_decode_growth = decode
             rows = self._memguard_rows()
             if not rows:
-                if decode > 0:
+                if decode > 0 or self._memguard_shared_pending() > 0:
                     self._memguard_room_for_decode(guard, decode, ceiling)
                 return None, refusals
             if self._memguard_admit_handoffs(guard, ceiling, rows):
@@ -8236,6 +8313,8 @@ class Scheduler:
                 int(getattr(self, "_memguard_step_acc", 0) or 0), before
             )
             mx.reset_peak_memory()
+            self._memguard_shared_pending()
+            self._memguard_shared_written = 0
             gen = getattr(self.batch_generator, "_generation_batch", None)
             try:
                 mixed = int(len(gen) > 0) if gen is not None else 0
@@ -8362,7 +8441,13 @@ class Scheduler:
             getattr(self, "_memguard_process_peak", 0), peak
         )
         active_before, prefix_before, mixed = begin
-        transient = max(0, peak - active_before)
+        # A live layer that wrote in this step re-allocated the buffer a
+        # prefix entry kept (``_memguard_note_shared``): planned through the
+        # footprint, not a transient of the step's shape.
+        self._memguard_shared_pending()
+        written = int(getattr(self, "_memguard_shared_written", 0) or 0)
+        self._memguard_shared_written = 0
+        transient = max(0, peak - active_before - written)
         base = getattr(self, "_memguard_idle_base_bytes", 0)
         live = max(0, active_before - prefix_before - base) if base > 0 else 0
         guard = self._memguard()
@@ -8987,6 +9072,108 @@ class Scheduler:
                 "y" if superseded == 1 else "ies",
                 abandoned,
             )
+
+    def _memguard_note_shared(self, tokens: Any) -> None:
+        """After a MID-TURN store (prompt-end or message-boundary snapshot):
+        record the live buffers the new entry still shares.
+
+        ``mx.contiguous`` does not copy an array that already is one whole
+        contiguous buffer (mlx 0.32.2: 0 bytes), so an entry stored from a
+        live cache with no slack -- a solo row, sized exactly by
+        ``BatchKVCache.merge``, or a recurrent state -- holds no bytes of its
+        own yet. The live layer's next write (a growth by concatenation, a
+        recurrent state's update, a ring's copy-on-write) allocates a new
+        buffer and the old one stays with the entry: the bytes the store's
+        room check made room for land THEN, on the first step after the
+        store, which nothing planned (the 1/100 sim: +60.5 MB at 7,100
+        tokens against 17.2 MB planned, every turn; RC6's slack hid it).
+        Copying at the store instead costs a memcpy of the session per turn
+        and a higher peak at the growth (independent review, 27B at 100k:
+        217-493 ms and 8.2-8.4 GB over the live cache, against 2-12 ms and
+        6.12 GB shared). So the buffers stay shared and the guard plans
+        them: each counts in the footprint until the live layer writes or
+        the entry is gone (``_memguard_shared_pending``). Identified by
+        buffer address, per array: never by a process-wide memory reading,
+        which an asynchronous step in flight moves."""
+        if getattr(self, "_memory_guard", None) is None:
+            return
+        mac = getattr(self, "memory_aware_cache", None)
+        key = tuple(tokens)
+        entry = getattr(mac, "_entries", {}).get(key) if mac is not None else None
+        if entry is None:
+            return
+        stored: dict[int, int] = {}
+        for _layer, _slot, a in _layer_arrays(entry.cache):
+            address = _buffer_address(a)
+            if address is not None:
+                stored[address] = int(a.nbytes)
+        if not stored:
+            return
+        sizes = set(stored.values())
+        bg = self.batch_generator
+        records = self.__dict__.setdefault("_memguard_shared", {})
+        for batch in (
+            getattr(bg, "_generation_batch", None),
+            getattr(bg, "_prompt_batch", None),
+        ):
+            for layer, slot, a in _layer_arrays(getattr(batch, "prompt_cache", None)):
+                # Sharing needs the WHOLE buffer: a smaller slice is copied.
+                # (Checked first so an array still in flight is not waited on.)
+                if int(a.nbytes) not in sizes:
+                    continue
+                address = _buffer_address(a)
+                if address is None or stored.get(address) != int(a.nbytes):
+                    continue
+                record = records.get(address)
+                if record is None or record.array() is not a:
+                    record = _SharedBuffer(
+                        nbytes=int(a.nbytes),
+                        layer=weakref.ref(layer),
+                        slot=slot,
+                        array=weakref.ref(a),
+                        mark=_write_mark(layer),
+                    )
+                    records[address] = record
+                record.entries.append((key, weakref.ref(entry)))
+
+    def _memguard_shared_pending(self) -> int:
+        """Bytes of live buffers a prefix entry shares and the live layer has
+        not written yet (``_memguard_note_shared``): allocated at that write.
+        A record ends when the live array is replaced or its write position
+        moves (written: the bytes are now the entry's own, in the measured
+        footprint), when the live layer is gone, or when no entry holding it
+        is left (nothing will be kept)."""
+        records = getattr(self, "_memguard_shared", None)
+        if not records:
+            return 0
+        mac = getattr(self, "memory_aware_cache", None)
+        entries = getattr(mac, "_entries", None) or {}
+        total = 0
+        for address, record in list(records.items()):
+            layer = record.layer()
+            array = record.array()
+            held = False
+            for key, ref in record.entries:
+                entry = ref()
+                if entry is not None and entries.get(key) is entry:
+                    held = True
+                    break
+            gone = layer is None
+            written = not gone and (
+                array is None
+                or _slot_array(layer, record.slot) is not array
+                or _write_mark(layer) != record.mark
+            )
+            if gone or written or not held:
+                if written and held:
+                    self._memguard_shared_written = (
+                        int(getattr(self, "_memguard_shared_written", 0) or 0)
+                        + record.nbytes
+                    )
+                del records[address]
+                continue
+            total += record.nbytes
+        return total
 
     def _memguard_room_for_store(
         self,
