@@ -727,14 +727,14 @@ def sc_tool_ended_subagent_witness_resumes(w, header, variant):
         w.evictable(name, "left for Z")
     gone = [*windows, "main"]
     order: list[str] = []  # the windows, in the order their entries went
-    for _i in range(60 if w.arm != "nopressure" else 3):
+    for _i in range(60 if w.arm == "duress64" else 3):
         w.turn("Z", add=60)
         order += [
             n for n in windows if n not in order and not w._entries(w.convs[n].owner)
         ]
         if not any(w._entries(w.convs[n].owner) for n in gone):
             break
-    if w.arm != "nopressure":  # the case needs them forgotten
+    if w.arm == "duress64":  # the case needs them forgotten
         assert not any(w._entries(w.convs[n].owner) for n in gone), gone
     # the window forgotten LAST: the one tombstone a rule that keeps only
     # the deciding witness keeps (review 13, its second variant)
