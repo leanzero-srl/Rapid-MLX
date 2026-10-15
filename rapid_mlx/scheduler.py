@@ -3080,14 +3080,11 @@ def _install_dspark(
                 gb.tokens[row].append(token)
                 gb._num_tokens[row] += 1
                 finish_reason = None
-                match_sequence = None
-                current_state = None
                 try:
-                    new_state, match_sequence, current_state = gb.state_machines[
-                        row
-                    ].match(gb._matcher_states[row], token)
-                    gb._matcher_states[row] = new_state
-                    if match_sequence is not None and current_state is None:
+                    # mlx-lm 0.32: one Aho-Corasick matcher per row
+                    # (``StopSequences.Matcher``); it replaced the
+                    # ``state_machines`` / ``_matcher_states`` pair.
+                    if gb._matchers[row].advance(token):
                         finish_reason = "stop"
                 except Exception:  # noqa: BLE001
                     pass
@@ -3109,8 +3106,6 @@ def _install_dspark(
                             token=token,
                             logprobs=logprobs,
                             finish_reason=finish_reason,
-                            current_state=current_state,
-                            match_sequence=match_sequence,
                             prompt_cache=gb.extract_cache(row),
                             all_tokens=gb.tokens[row],
                         )
@@ -3124,8 +3119,6 @@ def _install_dspark(
                         token=token,
                         logprobs=logprobs,
                         finish_reason=None,
-                        current_state=current_state,
-                        match_sequence=match_sequence,
                         prompt_cache=None,
                         all_tokens=None,
                     )
@@ -3782,14 +3775,11 @@ def _install_suffix_decoding(
 
                 # Run the stop-machine on this token to detect stop seqs.
                 finish_reason = None
-                match_sequence = None
-                current_state = None
                 try:
-                    new_state, match_sequence, current_state = gb.state_machines[
-                        row
-                    ].match(gb._matcher_states[row], tok)
-                    gb._matcher_states[row] = new_state
-                    if match_sequence is not None and current_state is None:
+                    # mlx-lm 0.32: one Aho-Corasick matcher per row
+                    # (``StopSequences.Matcher``); it replaced the
+                    # ``state_machines`` / ``_matcher_states`` pair.
+                    if gb._matchers[row].advance(tok):
                         finish_reason = "stop"
                 except Exception:  # noqa: BLE001
                     # If the matcher is in an unexpected state for any
@@ -3823,8 +3813,6 @@ def _install_suffix_decoding(
                             token=tok,
                             logprobs=lp,
                             finish_reason=finish_reason,
-                            current_state=current_state,
-                            match_sequence=match_sequence,
                             prompt_cache=gb.extract_cache(row),
                             all_tokens=gb.tokens[row],
                         )
@@ -3850,8 +3838,6 @@ def _install_suffix_decoding(
                         token=tok,
                         logprobs=lp,
                         finish_reason=None,
-                        current_state=current_state,
-                        match_sequence=match_sequence,
                         prompt_cache=None,
                         all_tokens=None,
                     )
@@ -5983,21 +5969,25 @@ class Scheduler:
             raw_cache: List of KVCache objects from mlx-lm
 
         Returns:
-            List of dicts with {state: (keys, values), meta_state: (offset,), class_name: str}
+            List of dicts with {state, meta_state (``cache_meta``: None for an
+            mlx-lm class, whose scalars are in ``state``), class_name, class_ref}
         """
         if not raw_cache:
             return []
 
+        from .cache_state_codec import cache_meta
+
         extracted = []
         for layer_cache in raw_cache:
             try:
-                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
-                    state = layer_cache.state  # (keys, values) or more for Mamba
-                    meta = layer_cache.meta_state  # (offset,) as strings
+                # mlx-lm 0.32 keeps every scalar in ``state`` and has no
+                # ``meta_state``; Rapid's own classes still keep one, which
+                # ``cache_meta`` records (children included for a CacheList).
+                if hasattr(layer_cache, "state"):
                     extracted.append(
                         {
-                            "state": state,
-                            "meta_state": meta,
+                            "state": layer_cache.state,
+                            "meta_state": cache_meta(layer_cache),
                             "class_name": type(layer_cache).__name__,
                             "class_ref": type(layer_cache),
                         }
@@ -6014,9 +6004,10 @@ class Scheduler:
         """
         Reconstruct cache objects from extracted cache states.
 
-        This is the inverse of _extract_cache_states(). Uses mlx-lm's
-        _BaseCache.from_state() to reconstruct any cache type (KVCache,
-        MambaCache, etc.) from its state/meta_state.
+        This is the inverse of _extract_cache_states(). Uses
+        ``cache_state_codec.restore_cache`` to rebuild any cache type
+        (KVCache, ArraysCache, CacheList, Rapid's own classes) from its
+        state and recorded meta.
 
         Args:
             extracted_states: List of dicts from _extract_cache_states()
@@ -6077,47 +6068,29 @@ class Scheduler:
                             cache.values = values
                             cache.offset = keys.shape[2]
                     elif cache_cls is _BatchKVCache:
-                        # BatchKVCache.state = (keys, values, offset, left_padding)
+                        # mlx-lm 0.32: BatchKVCache.state = (keys, values,
+                        # offset, left_padding, _idx) with the WHOLE buffers;
+                        # the row's tokens are [left_padding, _idx).
                         keys, values = state[0], state[1]
                         cache = _KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2] if hasattr(keys, "shape") else 0
-                    elif cache_cls.__name__ == "CacheList":
-                        # CacheList.from_state resolves nested class names only
-                        # from mlx_lm.models.cache globals. Vendored DeepSeek
-                        # pooling caches intentionally do not live there, so
-                        # reconstruct the wrapper with an explicit local map.
-                        from mlx_lm.models import cache as _mlx_cache
-                        from mlx_lm.models.cache import CacheList as _CacheList
-
-                        from rapid_mlx.memory_cache import _vendored_cache_registry
-
-                        vendored = _vendored_cache_registry()
-                        if not isinstance(meta_state, tuple) or len(meta_state) != 2:
-                            raise ValueError(
-                                "CacheList metadata must be a (names, metadata) tuple"
-                            )
-                        names, nested_meta = meta_state
-                        if not (len(state) == len(names) == len(nested_meta)):
-                            raise ValueError(
-                                "CacheList state/metadata length mismatch: "
-                                f"state={len(state)}, names={len(names)}, "
-                                f"metadata={len(nested_meta)}"
-                            )
-                        nested = []
-                        for nested_state, name, nested_m in zip(
-                            state, names, nested_meta
-                        ):
-                            nested_cls = getattr(
-                                _mlx_cache, name, None
-                            ) or vendored.get(name)
-                            if nested_cls is None:
-                                raise ValueError(f"Unknown nested cache class {name!r}")
-                            nested.append(nested_cls.from_state(nested_state, nested_m))
-                        cache = _CacheList(*nested)
+                        if hasattr(keys, "shape"):
+                            idx = int(state[4]) if len(state) > 4 else keys.shape[2]
+                            pad = 0
+                            if len(state) > 3 and state[3] is not None:
+                                pad = int(state[3].tolist()[0])
+                            cache.keys = keys[..., pad:idx, :]
+                            cache.values = values[..., pad:idx, :]
+                            cache.offset = idx - pad
+                        else:
+                            cache.offset = 0
                     else:
-                        cache = cache_cls.from_state(state, meta_state)
+                        # Upstream classes take the one-argument 0.32
+                        # ``from_state``; Rapid's classes (and a CacheList
+                        # holding them) get their recorded ``meta_state`` —
+                        # one rule, shared with the persisted prefix cache.
+                        from rapid_mlx.cache_state_codec import restore_cache
+
+                        cache = restore_cache(cache_cls, state, meta_state)
                 else:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache

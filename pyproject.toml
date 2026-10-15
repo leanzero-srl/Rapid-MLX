@@ -8,7 +8,7 @@ version = "0.14.3"
 description = "Rapid-MLX — AI inference for Apple Silicon. Drop-in OpenAI API, up to 3x Ollama's measured throughput."
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Rapid-MLX contributors"}
 ]
@@ -20,7 +20,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -51,8 +50,19 @@ dependencies = [
     # recorded in the accompanying performance report; retain the next-minor
     # cap so another runtime change cannot arrive unswept. Raising either bound
     # is a gated coherence event — see scripts/check_mlx_bound_move.py.
-    "mlx>=0.32.1,<0.33",
-    "mlx-lm>=0.31.3,<0.32",  # 0.31.1+ required for presence_penalty/frequency_penalty kwargs on make_logits_processors (#512); 0.31.3 added thread-local generation_stream but cross-thread eval is still broken (see shim sites). Upper cap <0.32 (#1248).
+    #
+    # mlx-lm 0.32.0 (LeanZero lz/mlx-lm-032, 2026-10-15): native
+    # ``muse_glimmer`` (Meta Muse Glimmer 30B) and ``mellum``. It is a breaking
+    # minor for us: cache ``state`` now carries the scalars that used to live in
+    # ``meta_state`` (``meta_state`` is gone, ``from_state`` takes one
+    # argument), ``BatchGenerator`` dropped ``_make_new_cache`` and its
+    # ``SequenceStateMachine`` stop matcher (now ``StopSequences``),
+    # ``TokenizerWrapper`` holds one detokenizer instance and ``generate_step``
+    # gained a positional ``stream`` and a 5000-token ``quantized_kv_start``
+    # default. It needs mlx>=0.32.2, transformers>=5.7.0 and Python>=3.11 —
+    # hence the floors below and ``requires-python``.
+    "mlx>=0.32.2,<0.33",
+    "mlx-lm>=0.32.0,<0.33",  # 0.32.0+: the cache-state/BatchGenerator contract the shims are written against (see above). Upper cap <0.33 (#1248).
     # mlx-vlm is opt-in via [vision] extras (saves ~322 MB for text-only users)
     #
     # transformers 5.13.0 tightened
@@ -80,7 +90,7 @@ dependencies = [
     # in the HY3 hot path. If a future transformers release above 5.7
     # introduces an HY3-specific regression, we tighten the floor with a
     # dedicated bump PR + Phase-0 re-audit rather than pinning here.
-    "transformers>=5.0.0,!=5.13.0,<5.16",
+    "transformers>=5.7.0,!=5.13.0,<5.16",  # mlx-lm 0.32.0 requires >=5.7.0
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",

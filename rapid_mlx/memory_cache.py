@@ -67,27 +67,12 @@ _REPLACE_STAGING_PHYS_HEADROOM_FRACTION = 0.75
 def _vendored_cache_registry() -> dict[str, type]:
     """Return cache classes owned by Rapid rather than ``mlx_lm``.
 
-    Persisted prefix-cache restore and the scheduler's in-memory mid-prefill
-    restore share this registry. This prevents a vendored hybrid side-cache
-    from restoring after restart but failing in the live scheduler path.
+    One home: :func:`rapid_mlx.cache_state_codec.vendored_cache_registry`
+    (persisted restore and the scheduler's mid-prefill restore share it).
     """
-    from rapid_mlx.models.deepseek_v4_cache import (
-        BatchDeepseekV4PoolingCache,
-        BatchPoolingCache,
-        DeepseekV4PoolingCache,
-        PoolingCache,
-    )
-    from rapid_mlx.models.qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache
+    from .cache_state_codec import vendored_cache_registry
 
-    classes = (
-        PoolingCache,
-        BatchPoolingCache,
-        DeepseekV4PoolingCache,
-        BatchDeepseekV4PoolingCache,
-        QSAIndexCache,
-        Qwen4ExpStateCache,
-    )
-    return {cls.__name__: cls for cls in classes}
+    return vendored_cache_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -144,132 +129,30 @@ _TOKENS_FORMAT_VERSION_IN_INDEX = 3  # bumped from 2
 # uses struct.pack into bytes; reader uses struct.unpack_from a slice.
 _TOKEN_BYTES = 4
 
-# mlx-lm's prompt-cache serializer forwards the flattened cache state directly
-# to ``mx.save_safetensors``.  Safetensors cannot represent ``None`` or a
-# zero-element MLX array: the former currently raises ``std::bad_cast`` and the
-# latter raises ``Cannot serialize an empty array``.  DeepSeek V4 legitimately
-# uses both shapes for optional pooling/remainder/overlap state, so encode those
-# leaves as one-element sentinels and describe the original value in embedded
-# metadata.  The transformation is persistence-only; live cache objects are
-# never mutated.
-_OPTIONAL_STATE_METADATA = "__rapid_mlx_optional_state_v1"
-_VENDORED_STATE_METADATA = "__rapid_mlx_vendored_cache_classes_v1"
-
-
-def _vendored_cache_class_names(cache: list[Any]) -> set[str]:
-    """Return vendored cache types present in a possibly nested cache list."""
-    found: set[str] = set()
-    pending = list(cache)
-    while pending:
-        item = pending.pop()
-        if type(item).__module__ in {
-            "rapid_mlx.models.deepseek_v4_cache",
-            "rapid_mlx.models.qwen4_exp_cache",
-        }:
-            found.add(type(item).__name__)
-        pending.extend(getattr(item, "caches", ()))
-    return found
-
-
 def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, str]):
-    """Save an mlx-lm cache, losslessly encoding optional/empty state leaves."""
-    import mlx.core as mx
-    from mlx.utils import tree_flatten
+    """Save a prompt cache with Rapid's mlx-lm 0.32 codec.
 
-    cache_data = [c.state for c in cache]
-    flat_data = list(tree_flatten(cache_data))
-    optional: dict[str, dict[str, Any]] = {}
-    encoded: dict[str, Any] = {}
-    for key, value in flat_data:
-        if value is None:
-            optional[key] = {"kind": "none"}
-            encoded[key] = mx.array([0], dtype=mx.uint8)
-        elif hasattr(value, "size") and int(value.size) == 0:
-            optional[key] = {"kind": "empty", "shape": list(value.shape)}
-            # Preserve dtype in the sentinel itself; the loader uses it when
-            # recreating the original zero-element shape.
-            encoded[key] = mx.zeros((1,), dtype=value.dtype)
-        else:
-            encoded[key] = value
+    mlx-lm 0.32 moved every cache's scalars into ``state`` and dropped
+    ``meta_state``; Rapid's own classes still keep one. The codec in
+    :mod:`rapid_mlx.cache_state_codec` is the one writer for both, and it also
+    encodes ``None`` / empty / scalar leaves (DeepSeek V4's optional pooling
+    state, ``ArraysCache``'s ``left_padding``).
+    """
+    from .cache_state_codec import save_prompt_cache
 
-    vendored = _vendored_cache_class_names(cache)
-    if not optional and not vendored:
-        from mlx_lm.models.cache import save_prompt_cache
-
-        return save_prompt_cache(path, cache, metadata=metadata)
-
-    cache_info = [c.meta_state for c in cache]
-    cache_classes = [type(c).__name__ for c in cache]
-    embedded = dict(metadata)
-    if optional:
-        embedded[_OPTIONAL_STATE_METADATA] = json.dumps(optional, separators=(",", ":"))
-    embedded[_VENDORED_STATE_METADATA] = json.dumps(sorted(vendored))
-    cache_metadata = dict(tree_flatten([cache_info, embedded, cache_classes]))
-    mx.save_safetensors(path, encoded, cache_metadata)
+    return save_prompt_cache(path, cache, metadata)
 
 
 def _load_prompt_cache_compat(path: str) -> list[Any]:
-    """Load prompt caches written by either mlx-lm or the optional-state codec."""
-    import mlx.core as mx
-    from mlx.utils import tree_unflatten
+    """Load a prompt cache written by :func:`_save_prompt_cache_compat`.
 
-    arrays, flat_metadata = mx.load(path, return_metadata=True)
-    metadata_tree = tree_unflatten(list(flat_metadata.items()))
-    info, metadata, classes = metadata_tree
-    marker = metadata.get(_OPTIONAL_STATE_METADATA) if metadata else None
-    optional = json.loads(marker) if marker else {}
-    flat_arrays = dict(arrays.items())
-    for key, spec in optional.items():
-        sentinel = flat_arrays.get(key)
-        if sentinel is None:
-            raise ValueError(f"optional-state sentinel {key!r} is missing")
-        kind = spec.get("kind")
-        if kind == "none":
-            flat_arrays[key] = None
-        elif kind == "empty":
-            shape = tuple(int(dim) for dim in spec.get("shape", ()))
-            if not shape or all(dim > 0 for dim in shape):
-                raise ValueError(f"invalid empty-array shape for {key!r}: {shape!r}")
-            flat_arrays[key] = mx.zeros(shape, dtype=sentinel.dtype)
-        else:
-            raise ValueError(f"unknown optional-state kind for {key!r}: {kind!r}")
-    states = tree_unflatten(list(flat_arrays.items()))
+    A file from before the mlx-lm 0.32 layout raises ``ValueError`` (its
+    states no longer fit the classes); the persistence loader counts that
+    entry as skipped and re-prefills it.
+    """
+    from .cache_state_codec import load_prompt_cache
 
-    # Reconstruct nested CacheList objects through a per-call registry.  Do not
-    # patch mlx-lm module globals: another thread may be loading an ordinary
-    # upstream cache at the same time.  New files carry an explicit vendored
-    # type discriminator.  For legacy files, fall back to a vendored class only
-    # when mlx-lm has no class by that name.
-    import mlx_lm.models.cache as mlx_cache
-
-    registry = _vendored_cache_registry()
-    declared_vendored = set(json.loads(metadata.get(_VENDORED_STATE_METADATA, "[]")))
-
-    def restore(name, state, meta_state):
-        if name == "CacheList":
-            obj = mlx_cache.CacheList.__new__(mlx_cache.CacheList)
-            nested_classes, nested_meta = meta_state
-            obj.caches = [
-                restore(nested_name, nested_state, nested_meta_state)
-                for nested_name, nested_state, nested_meta_state in zip(
-                    nested_classes, state, nested_meta
-                )
-            ]
-            return obj
-        upstream = getattr(mlx_cache, name, None)
-        cls = (
-            registry[name]
-            if name in registry and (name in declared_vendored or upstream is None)
-            else upstream
-        )
-        if cls is None:
-            raise ValueError(f"unknown prompt-cache class {name!r}")
-        return cls.from_state(state, meta_state)
-
-    return [
-        restore(name, state, meta_state)
-        for name, state, meta_state in zip(classes, states, info)
-    ]
+    return load_prompt_cache(path)
 
 
 def _write_tokens_bin_v3(path: str, tokens: list[int], save_uuid: str) -> None:
@@ -702,6 +585,17 @@ def _safetensors_cache_classes(path: str) -> list[str]:
     meta = header.get("__metadata__")
     if not isinstance(meta, dict):
         return []
+    from .cache_state_codec import _CLASSES_KEY
+
+    codec_classes = meta.get(_CLASSES_KEY)
+    if isinstance(codec_classes, str):
+        # Rapid's mlx-lm 0.32 codec keeps the class names in one JSON key.
+        try:
+            decoded = json.loads(codec_classes)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, list) and all(isinstance(c, str) for c in decoded):
+            return decoded
     layer_classes: dict[int, str] = {}
     for k, v in meta.items():
         if not isinstance(k, str) or not k.startswith("2."):

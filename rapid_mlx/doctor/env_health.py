@@ -177,9 +177,9 @@ _DISTRIBUTION_MODULES: dict[str, str] = {
 # version outside them can import successfully and still make the next server
 # start fail. Keep them aligned with pyproject.toml.
 _SUPPORTED_VERSIONS: dict[str, str] = {
-    "mlx": ">=0.32.1,<0.33",
-    "mlx-lm": ">=0.31.3,<0.32",
-    "transformers": ">=5.0.0,!=5.13.0,<5.16",
+    "mlx": ">=0.32.2,<0.33",
+    "mlx-lm": ">=0.32.0,<0.33",
+    "transformers": ">=5.7.0,!=5.13.0,<5.16",
     "mlx-vlm": "==0.7.1",
 }
 
