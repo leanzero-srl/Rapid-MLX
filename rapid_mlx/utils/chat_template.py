@@ -274,17 +274,28 @@ def _sanitize_messages_for_template(
         if not isinstance(msg, dict):
             sanitized.append(msg)
             continue
-        content = msg.get("content")
-        if include_reasoning_sentinels:
-            content = _double_existing_control_escapes_in_content(content)
-        new_content = _sanitize_message_content(content, pattern)
-        if new_content is content:
-            sanitized.append(msg)
-            continue
-        new_msg = dict(msg)
-        new_msg["content"] = new_content
-        sanitized.append(new_msg)
+        new_msg = None
+        for field in _CLIENT_TEXT_FIELDS:
+            value = msg.get(field)
+            if field != "content" and not isinstance(value, str):
+                continue
+            if include_reasoning_sentinels:
+                value = _double_existing_control_escapes_in_content(value)
+            new_value = _sanitize_message_content(value, pattern)
+            if new_value is msg.get(field):
+                continue
+            if new_msg is None:
+                new_msg = dict(msg)
+            new_msg[field] = new_value
+        sanitized.append(msg if new_msg is None else new_msg)
     return sanitized
+
+
+#: Message fields a client controls that templates render as text. The
+#: reasoning fields are assistant history the client sends back; the server
+#: cannot prove its own model wrote them, so they get the same treatment as
+#: ``content``.
+_CLIENT_TEXT_FIELDS = ("content", "reasoning_content", "reasoning")
 
 
 # =============================================================================
@@ -775,14 +786,17 @@ def _baseline_sanitize_messages(messages):
         return messages
     fallback: list = []
     for msg in messages:
-        if isinstance(msg, dict) and "content" in msg:
-            new_msg = dict(msg)
-            new_msg["content"] = _sanitize_message_content(
-                msg["content"], baseline_pattern
-            )
-            fallback.append(new_msg)
-        else:
+        if not isinstance(msg, dict):
             fallback.append(msg)
+            continue
+        new_msg = dict(msg)
+        for field in _CLIENT_TEXT_FIELDS:
+            if field not in msg:
+                continue
+            if field != "content" and not isinstance(msg[field], str):
+                continue
+            new_msg[field] = _sanitize_message_content(msg[field], baseline_pattern)
+        fallback.append(new_msg)
     return fallback
 
 
@@ -2256,7 +2270,16 @@ def apply_chat_template(
     if isinstance(prompt, str) and _template_drops_think_from_tool_loop_history(
         template_applicator, tools=tools
     ):
-        prompt = _retain_tool_loop_think_blocks(prompt, messages)
+        # The retained blocks are re-inserted AFTER the render, so they must
+        # come from the same sanitised text the render saw, never the raw
+        # client strings.
+        try:
+            retained_from = _sanitize_messages_for_template(
+                messages, template_applicator
+            )
+        except Exception:
+            retained_from = _baseline_sanitize_messages(messages)
+        prompt = _retain_tool_loop_think_blocks(prompt, retained_from)
     return prompt
 
 
