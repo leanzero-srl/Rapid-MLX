@@ -249,8 +249,63 @@ def test_a_recurrent_state_update_ends_the_charge(cpu):
     assert s._memguard_shared_pending() == _nbytes(live)
     layer[1] = layer[1] * 0.5
     assert s._memguard_shared_pending() == layer[0].nbytes
-    layer[0] = layer[0] + 1
+    # the old array object may outlive the write (a step still holds it):
+    # the layer no longer does, which is what ends the charge
+    old = layer[0]
+    layer[0] = old + 1
     assert s._memguard_shared_pending() == 0
+    del old
+
+
+def test_both_mid_turn_store_sites_record_the_shared_buffers():
+    """The prompt-end snapshot and the message-boundary snapshot are the
+    stores taken from a live row; each records what it shares."""
+    from tests.test_prompt_cache_snapshot import _make_scheduler_with_cache, _register
+
+    s = _make_scheduler_with_cache()
+    s._memguard_room_for_store = lambda *a, **k: True
+    s.memory_aware_cache.store = MagicMock(return_value=True)
+    s._memguard_note_shared = MagicMock()
+    _register(s, "req-end", uid=1, prompt_tokens=[1, 2, 3])
+    bg = MagicMock()
+    bg.extract_cache.return_value = {1: ([object()], [1, 2, 3])}
+    s.batch_generator = bg
+    s._snapshot_promoted_prompts(
+        [SimpleNamespace(uid=1, progress=(3, 3), end_of_segment=True, end_of_prompt=True)]
+    )
+    s._memguard_note_shared.assert_called_once_with([1, 2, 3])
+
+    s._memguard_note_shared.reset_mock()
+    s._extract_cache_states = MagicMock(return_value=[{"k": "v"}])
+    s._reconstruct_cache_from_states = MagicMock(return_value=["rebuilt"])
+    request = _register(s, "req-mid", uid=2, prompt_tokens=list(range(100)))
+    request.prefix_boundary = 80
+    bg.extract_cache.return_value = {2: (["raw"], list(range(80)))}
+    s._snapshot_boundary_segments(
+        [SimpleNamespace(uid=2, progress=(80, 100), end_of_segment=True, end_of_prompt=False)]
+    )
+    s._memguard_note_shared.assert_called_once_with(list(range(80)))
+
+
+def test_a_decode_only_step_is_checked_while_buffers_are_shared(cpu):
+    """A decode step that does not grow (a recurrent model's state update,
+    a ring) still re-allocates a shared buffer: it gets the room check. A
+    plain decode with nothing shared does not (RC6)."""
+    calls = []
+    s = object.__new__(Scheduler)
+    s.batch_generator = SimpleNamespace()
+    guard = SimpleNamespace(counts={})
+    s._memguard = lambda: guard
+    s._memguard_ceiling = lambda: 10**12
+    s._memguard_check_generation_merge = lambda g, c: False
+    s._memguard_decode_growth = lambda g: 0
+    s._memguard_rows = lambda: []
+    s._memguard_room_for_decode = lambda g, d, c: calls.append(d)
+    for pending, expected in ((0, []), (64 * MB, [0])):
+        calls.clear()
+        s._memguard_shared_pending = lambda pending=pending: pending
+        assert s._memguard_plan_dispatch([]) == (None, [])
+        assert calls == expected
 
 
 def test_a_step_that_wrote_a_shared_buffer_is_not_learned_as_transient(cpu):
