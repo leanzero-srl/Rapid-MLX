@@ -35,8 +35,12 @@ from tests.test_memory_guard_session import (  # noqa: F401
     M4_MAX_128_CEILING,
     _auto_budget_scheduler,
     _Device,
+    _drive,
+    _new_tokens,
     _no_metal,
+    _request,
     _session,
+    _tokens,
     cpu,
     llama,
 )
@@ -61,29 +65,25 @@ def _kv(context: int) -> int:
     return int(PER_TOKEN * context)
 
 
-def test_before_any_measurement_a_growth_step_is_planned_as_a_whole_kv():
+def test_gabee_growth_step_over_the_ceiling_teaches_the_growth_term():
     guard = _guard()
-    planned = guard.decode_growth(CONTEXT, kv_footprint=_kv)
-    # the old constant planned 2 layers: 0.69 GB at 84k
-    assert planned >= PEAK - FOOTPRINT, planned / GB
-    assert planned >= 16 * LAYER * CONTEXT
-
-
-def test_gabee_growth_step_teaches_the_growth_term():
-    guard = _guard()
-    guard.observe_decode(
+    before = guard.decode_growth(CONTEXT, kv_footprint=_kv)
+    # the 2-layer prior: 0.71 GB at 84k against the 4.85 GB measured
+    assert before < (PEAK - FOOTPRINT) / 4, before / GB
+    assert guard.observe_decode(
         PEAK - FOOTPRINT,
         context=CONTEXT,
         batch=1,
-        planned=0,
+        planned=before,
         ceiling=CEILING,
+        peak=PEAK,
         grew=True,
         kv_footprint=_kv,
     )
     planned = guard.decode_growth(CONTEXT, kv_footprint=_kv)
     assert planned >= PEAK - FOOTPRINT, planned / GB
-    # measured, not the whole-KV prior any more
-    assert guard.decode_growth_layers < 16 * PER_TOKEN / LAYER
+    # capped at a whole KV (16 full-attention layers + the recurrent state)
+    assert guard.decode_growth_layers <= PER_TOKEN / LAYER
     # the next growth at that context fits only with room made on Gabee ...
     margin = guard.margin(planned, CEILING)
     assert FOOTPRINT + planned + margin > CEILING
@@ -91,40 +91,51 @@ def test_gabee_growth_step_teaches_the_growth_term():
     assert FOOTPRINT + planned + guard.margin(planned, BIG_CEILING) < BIG_CEILING
 
 
-def test_a_plain_growth_measurement_lowers_the_whole_kv_prior():
-    """Both directions: a decode graph that holds two layers at its growth
-    step is planned two layers after one measurement."""
+def test_a_step_under_the_ceiling_teaches_nothing():
+    """Below the ceiling an unplanned byte costs nothing: the same excess
+    on a Mac with room changes no plan (owner: no action without duress)."""
     guard = _guard()
-    two = int(2 * LAYER * (CONTEXT + kv_growth_step()))
-    block = _kv(CONTEXT + kv_growth_step()) - _kv(CONTEXT)
-    guard.observe_decode(
-        two + block,
-        context=CONTEXT,
-        batch=1,
-        planned=0,
-        ceiling=CEILING,
-        grew=True,
-        kv_footprint=_kv,
-    )
-    assert guard.decode_growth_layers == pytest.approx(2.0, rel=0.01)
+    for grew in (True, False):
+        assert not guard.observe_decode(
+            PEAK - FOOTPRINT,
+            context=CONTEXT,
+            batch=1,
+            planned=0,
+            ceiling=BIG_CEILING,
+            peak=PEAK,
+            grew=grew,
+            kv_footprint=_kv,
+        )
+    assert guard.decode_growth_layers == 2.0
+    assert guard.decode_step(CONTEXT) == 0
 
 
 def test_an_overshooting_decode_step_teaches_the_every_step_term():
     guard = _guard()
     assert guard.decode_step(CONTEXT) == 0
     guard.observe_decode(
-        PEAK - FOOTPRINT, context=CONTEXT, batch=1, planned=0, ceiling=CEILING
+        PEAK - FOOTPRINT,
+        context=CONTEXT,
+        batch=1,
+        planned=0,
+        ceiling=CEILING,
+        peak=PEAK,
     )
     assert guard.decode_step(CONTEXT) >= PEAK - FOOTPRINT - 1
     assert guard.decode_growth(CONTEXT, kv_footprint=_kv) >= guard.decode_step(CONTEXT)
 
 
-def test_a_decode_step_within_the_margin_teaches_nothing():
+def test_a_decode_step_under_the_ceiling_teaches_nothing():
     """The MTP decodes at 48-72k on the same run: peak - active <= 0.4 GB
     (the [Metal memory] samples, e.g. active=44.1GB peak=44.5GB at ~70k)."""
     guard = _guard()
     guard.observe_decode(
-        int(0.4 * GB), context=70_000, batch=1, planned=0, ceiling=CEILING
+        int(0.4 * GB),
+        context=70_000,
+        batch=1,
+        planned=0,
+        ceiling=CEILING,
+        peak=int(44.5 * GB),
     )
     assert guard.decode_step(CONTEXT) == 0
 
@@ -136,7 +147,12 @@ def test_the_window_includes_the_measured_decode_step():
         base=base, kv_footprint=_kv, ceiling=CEILING, upper=262_144
     )
     guard.observe_decode(
-        PEAK - FOOTPRINT, context=CONTEXT, batch=1, planned=0, ceiling=CEILING
+        PEAK - FOOTPRINT,
+        context=CONTEXT,
+        batch=1,
+        planned=0,
+        ceiling=CEILING,
+        peak=PEAK,
     )
     after = guard.max_context(
         base=base, kv_footprint=_kv, ceiling=CEILING, upper=262_144
@@ -215,7 +231,8 @@ def test_an_mtp_verify_near_capacity_is_a_growth_step(cpu, monkeypatch):
     guard = _guard()
     s = _scheduler("mtp", max_k=3, lookup=None)
     _decoding(s, capacity=CONTEXT + 3, idx=CONTEXT, context=CONTEXT)
-    assert s._memguard_decode_growth(guard) >= PEAK - FOOTPRINT
+    # planned as a growth step (2 layers + the block before any crossing)
+    assert s._memguard_decode_growth(guard) >= 2 * LAYER * CONTEXT
     assert s._memguard_last_decode_grows is True
     # plain decode at the same position does not grow there
     s.config.spec_decode = "none"
@@ -289,13 +306,25 @@ def test_an_mtp_like_decode_is_learned_and_then_planned_on_gabee(llama, monkeypa
 
 
 def test_an_mtp_like_decode_takes_no_protective_action_on_128_gb(llama, monkeypatch):
+    """The same session on a 128 GB Mac up to the goose 27B's "116k" (8.85k
+    sim tokens: real = sim x 13.1, test_the_guard_acts_only_under_duress),
+    Gabee's 84k overshoot included: no duress there, so no protective
+    action, no step over the ceiling, nothing learned."""
     device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
     scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
     device.install(monkeypatch, scheduler)
     _mtp_like(scheduler)
-    history, _windows = _session(scheduler, delta=2000, native=65536)
+    prompt = _new_tokens(0, 600)
+    turns = 0
+    while len(prompt) < 8_850:
+        rid = f"turn-{turns}"
+        outs = _drive(scheduler, [_request(rid, prompt, 64)])[rid]
+        assert outs[-1].finished and not outs[-1].error, outs[-1].error
+        prompt = prompt + _tokens(outs) + _new_tokens(turns + 1, 800)
+        turns += 1
     guard = scheduler._memguard()
-    assert len(history) >= 4, history
+    assert turns >= 4, turns
     assert device.ooms == 0
     assert guard.steps_over_ceiling == 0
     assert not _actions(guard), _actions(guard)
+    assert guard.decode_step_raises == 0

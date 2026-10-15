@@ -8293,6 +8293,7 @@ class Scheduler:
                     batch=rows,
                     planned=planned_extra,
                     ceiling=ceiling,
+                    peak=peak,
                     grew=self._memguard_decode_capacity() != capacity,
                     kv_footprint=self._kv_footprint_fn(),
                 )
