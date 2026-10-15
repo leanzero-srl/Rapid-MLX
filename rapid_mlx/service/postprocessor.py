@@ -398,6 +398,13 @@ class StreamingPostProcessor:
                                 )
                             ),
                             tools_requested=self.tools_requested,
+                            rendered=bool(
+                                getattr(
+                                    self.reasoning_parser,
+                                    "prompt_priming_rendered",
+                                    False,
+                                )
+                            ),
                         )
                     )
                 if "json_mode" in configure_parameters:
@@ -2564,6 +2571,13 @@ class StreamingPostProcessor:
                                 )
                             ),
                             tools_requested=self.tools_requested,
+                            rendered=bool(
+                                getattr(
+                                    self.reasoning_parser,
+                                    "prompt_priming_rendered",
+                                    False,
+                                )
+                            ),
                         )
                     )
                 if "json_mode" in configure_parameters:

@@ -689,6 +689,7 @@ def _should_start_in_thinking(
     *,
     unconditional: bool = False,
     tools_requested: bool = False,
+    rendered: bool = False,
 ) -> bool:
     """Thin wrapper over the shared
     ``service.helpers._should_start_in_thinking`` predicate.
@@ -706,6 +707,7 @@ def _should_start_in_thinking(
         enable_thinking,
         unconditional=unconditional,
         tools_requested=tools_requested,
+        rendered=rendered,
     )
 
 
