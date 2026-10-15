@@ -67,7 +67,8 @@ def test_m24_a_forgotten_new_window_still_releases_the_left_one():
     y = _line(s, (("session", "Y"), KO), KO, 5, 8, 6)
     assert x in s._memguard_outlived_lines()
     del s.memory_aware_cache._entries[f"e{y}"]
-    assert x in s._memguard_outlived_lines()
+    for i in range(3):  # Y's tombstone is kept: needed under the "left" rule
+        assert x in s._memguard_outlived_lines(), i
 
 
 G = 4096.0
@@ -334,3 +335,24 @@ def test_a_forgotten_main_keeps_releasing_its_finished_subagent():
     del s.memory_aware_cache._entries[f"e{M}"]
     for i in range(3):
         assert sub in s._memguard_outlived_lines(), i
+
+
+def test_a_second_needed_tombstone_is_kept_while_there_is_room():
+    """S (tool-ended subagent) is released through two forgotten parents:
+    main (done) and P (forgotten while its tool ran). P's tool then returns:
+    P is recorded again and no longer released, so only main's tombstone
+    still releases S. The latest needed tombstone alone (P's) is not
+    enough; the others are kept while they fit the bound."""
+    s = _sched()
+    _line(s, M, KA, 1, 7, 1)  # main took the result, stopped
+    p = _line(s, (("session", "P"), KA), KA, 2, 8, 2, outcome="tool_calls")
+    _line(s, S, KB, 3, 6, 3, outcome="tool_calls")
+    _line(s, Z, KA, 9, 10, 10)  # the user opens Z
+    assert S in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]
+    del s.memory_aware_cache._entries[f"e{p}"]  # evicted while its tool ran
+    assert S in s._memguard_outlived_lines()
+    _line(s, p, KA, 11, 11, 0, continues=False)  # P's tool result comes back
+    out = s._memguard_outlived_lines()
+    assert p not in out
+    assert S in out
