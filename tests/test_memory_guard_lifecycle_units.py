@@ -391,3 +391,19 @@ def test_past_the_bound_the_most_recently_active_tombstone_stays():
     assert len(s._memguard_forgotten) == 1  # one recorded conversation
     _line(s, r2, KA, 8, 8, 8, continues=False)  # back to R2: the user types
     assert x not in s._memguard_outlived_lines()
+
+
+def test_past_the_bound_every_rule_keeps_its_latest():
+    """Past the bound each (conversation, rule) keeps its own latest needed
+    tombstone. Subagent S is released by the chain through its forgotten
+    main; an older window R of S's own kind, active later than main, is
+    forgotten too. R is the latest tombstone older than S (its age rule),
+    main the only chain witness: both stay, and S stays released."""
+    s = _sched()
+    r = _line(s, (("session", "R"), KB), KB, 1, 8, 1)
+    _line(s, M, KA, 2, 7, 2)
+    _line(s, S, KB, 3, 6, 3, outcome="tool_calls")
+    del s.memory_aware_cache._entries[f"e{r}"]
+    del s.memory_aware_cache._entries[f"e{M}"]
+    for i in range(3):
+        assert S in s._memguard_outlived_lines(), i
