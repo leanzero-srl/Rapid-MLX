@@ -935,6 +935,13 @@ class Message(BaseModel):
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
     tool_call_id: str | None = None
+    # An assistant turn's reasoning, sent back by the client on later turns.
+    # Templates with ``preserve_thinking`` (Qwen3.8 defaults it on) render it
+    # inside every history row's ``<think>`` block; dropping it here rendered
+    # an empty block on every past turn. ``reasoning`` is the LiteLLM /
+    # OpenRouter spelling of the same field; only a string is used.
+    reasoning_content: str | None = None
+    reasoning: object | None = None
 
     @model_validator(mode="after")
     def _validate_content_not_null(self) -> "Message":
