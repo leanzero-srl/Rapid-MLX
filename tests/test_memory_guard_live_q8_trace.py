@@ -190,3 +190,21 @@ def test_tail_groups_just_above_the_copy_never_zero_the_coefficient():
                 turn,
                 guard.model.attention_bytes_per_unit,
             )
+
+
+def test_a_context_term_over_its_cap_is_not_a_separation():
+    """Two chunk sizes at or above the floor whose context slopes are nearly
+    equal and far above one layer's copy: least squares reads that as a ~0
+    attention coefficient and a context term over its cap (a whole copy of
+    the KV). That is ``a`` leaking into ``b``, not a separation -- the fit
+    falls through to the per-size median and ``a`` stays with the slopes."""
+    floor = kv_growth_step()
+    guard = MemoryGuard(PRIOR, floor_tokens=floor)
+    slope = 40_000.0  # bytes per context token, both sizes
+    for chunk in (2 * floor, 3 * floor):
+        for x in range(20_000, 100_000, 4_000):
+            guard.observe(StepShape(1, chunk, x), int(slope * x + 2e9))
+    g = PRIOR.kv_copy_bytes_per_context
+    expected = statistics.median([(slope - g) / (2 * floor), (slope - g) / (3 * floor)])
+    a = guard.model.attention_bytes_per_unit
+    assert a == pytest.approx(expected, rel=0.25), (a, expected)
