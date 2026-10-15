@@ -698,6 +698,59 @@ def sc_tool_ended_subagent_then_a_second_one(w, header, _arg):
     w.flush(header)
 
 
+def sc_tool_ended_subagent_witness_resumes(w, header, variant):
+    """Review 13: subagent S ends on a tool call and main takes the result;
+    the user goes back to an older window O ("two": then to another older
+    window P) and opens Z. Under duress main's and the windows' entries go
+    (each window, forgotten, is evidence that S is done). Then the user
+    resumes the window forgotten LAST, with the same session: it is not a
+    new conversation, and S must not be held again -- not after it, not
+    through three more windows."""
+    windows = ["O", "P"] if variant == "two" else ["O"]
+    for j, name in enumerate(windows):
+        w.chat(name, size=500 - 50 * j, header=header, seed=61 + 13 * j)
+        w.turn(name, add=100)
+        w.turn(name, add=100)
+    w.chat("main", size=700, header=header)
+    w.turn("main", add=100, outcome="tool_calls")
+    w.chat("sub", size=3000, header=header, kind=SUBAGENT)
+    w.turn("sub", add=100, outcome="tool_calls")
+    w.turn("sub", user=False, add=300, outcome="tool_calls")
+    w.turn("sub", user=False, add=300, outcome="tool_calls")  # its last
+    w.turn("main", user=False, add=100, outcome="stop")
+    for name in windows:  # back to the older window(s)
+        w.turn(name, add=100)
+    w.chat("Z", size=400, header=header, seed=77)
+    w.turn("Z", add=100)
+    w.turn("Z", add=100)
+    for name in [*windows, "main", "sub"]:
+        w.evictable(name, "left for Z")
+    gone = [*windows, "main"]
+    order: list[str] = []  # the windows, in the order their entries went
+    for _i in range(60 if w.arm != "nopressure" else 3):
+        w.turn("Z", add=60)
+        order += [
+            n for n in windows if n not in order and not w._entries(w.convs[n].owner)
+        ]
+        if not any(w._entries(w.convs[n].owner) for n in gone):
+            break
+    if w.arm != "nopressure":  # the case needs them forgotten
+        assert not any(w._entries(w.convs[n].owner) for n in gone), gone
+    # the window forgotten LAST: the one tombstone a rule that keeps only
+    # the deciding witness keeps (review 13, its second variant)
+    back = order[-1] if order else windows[-1]
+    w.left.discard(back)
+    w.turn(back, add=100)  # the user resumes it
+    w.turn(back, add=100)
+    w.evictable("sub", f"{back} resumed")
+    for k in range(3):  # three more windows
+        w.chat(f"N{k}", size=300, header=header, seed=200 + k)
+        for _t in range(3):
+            w.turn(f"N{k}", add=400)
+        w.evictable("sub", f"window N{k}")
+    w.flush(header)
+
+
 def sc_two_chats_alternating(w, header, end):
     """The user alternates between two chats: each one being used is
     protected and hits; the other is evictable under duress only."""
@@ -824,6 +877,15 @@ for header in (True, False):
     SCENARIOS.append(
         (f"secondsub-{tag}", sc_tool_ended_subagent_then_a_second_one, header, None)
     )
+    for variant in ("one", "two"):
+        SCENARIOS.append(
+            (
+                f"witnessresumes-{variant}-{tag}",
+                sc_tool_ended_subagent_witness_resumes,
+                header,
+                variant,
+            )
+        )
     for order in ("subagent-first", "window-first"):
         SCENARIOS.append(
             (

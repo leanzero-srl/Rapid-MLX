@@ -331,6 +331,86 @@ def _memguard_outcome(hint: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _memguard_continues(record: dict, past: dict | None) -> bool:
+    """A frame record is a CONVERSATION frame: its requests continue each
+    other -- or it is the conversation frame of a line that comes back
+    (its kind is one its history continued in), whose first request after
+    the return has no predecessor to continue."""
+    if record["continues"]:
+        return True
+    return bool(past and past["continues"] and record["kind"] in past["kinds"])
+
+
+def _memguard_part(record: dict, past: dict | None) -> dict:
+    """One frame record as a history summary."""
+    return {
+        "first": record["first"],
+        "last": record["last"],
+        "turn": record["turn"],
+        "continues": _memguard_continues(record, past),
+        "kinds": {record["kind"]} if record["kind"] is not None else set(),
+    }
+
+
+def _memguard_fold(parts: list) -> dict:
+    """One conversation's history from its frame records and summaries
+    (None skipped): when it began, its latest activity, its OWN latest user
+    turn and kinds (from its conversation frames, a helper call's are not
+    its own), whether it continues."""
+    parts = [p for p in parts if p is not None]
+    convo = [p for p in parts if p["continues"]] or parts
+    return {
+        "first": min(p["first"] for p in parts),
+        "last": max(p["last"] for p in parts),
+        "turn": max(p["turn"] for p in convo),
+        "continues": any(p["continues"] for p in parts),
+        "kinds": set().union(*(p["kinds"] for p in convo)),
+    }
+
+
+def _memguard_older(ost: dict, st: dict) -> bool:
+    return ost["first"] < st["first"] and ost["last"] > st["last"] and ost["continues"]
+
+
+def _memguard_w_outlived(ost: dict, st: dict) -> bool:
+    """``ost`` releases ``st``: an older continuing conversation ran after it.
+    A PENDING one is waiting on its own tool: an older conversation's tool
+    rounds say nothing about it, only that one's next user turn does
+    (review 9: a younger swarm worker, an async delegate, a newer chat
+    mid-build re-prefilled 2,308 of 2,356 tokens on the 64 GB arm) ... and
+    only one of ANOTHER kind (its main): a user turn in an older window of
+    the same kind is not the build's parent (review 10: 48 of 3,856)."""
+    return _memguard_older(ost, st) and (
+        not st["pending"]
+        or (ost["turn"] > st["last"] and not ost["kinds"] & st["kinds"])
+    )
+
+
+def _memguard_w_left(ost: dict, st: dict) -> bool:
+    """``ost`` releases ``st``: the user left it. IDLE: a younger
+    conversation (one that continues, or of the same kind) started a user
+    turn after it. PENDING: one of the same kind that BEGAN after its latest
+    activity did."""
+    if not st["pending"]:
+        return (
+            ost["first"] > st["first"]
+            and ost["turn"] > st["last"]
+            and (ost["continues"] or bool(ost["kinds"] & st["kinds"]))
+        )
+    return (
+        ost["first"] > st["last"]
+        and ost["turn"] > st["last"]
+        and bool(ost["kinds"] & st["kinds"])
+    )
+
+
+def _memguard_w_chain(ost: dict, st: dict) -> bool:
+    """``ost`` releases the PENDING ``st`` once ``ost`` is itself released or
+    forgotten: an older continuing conversation of another kind ran after
+    it (its main took the result)."""
+    return st["pending"] and _memguard_older(ost, st) and not ost["kinds"] & st["kinds"]
+
+
 def _memguard_named_line(line: Any) -> bool:
     """A conversation line the client named (goose's agent-session-id): the
     only kind whose diverged heads are certainly its own dead branches."""
@@ -6774,7 +6854,19 @@ class Scheduler:
         # (review 10: main's record vanished with its entries and its
         # finished subagent stayed NEEDED; review 11: the new window that
         # released a left one was evicted, and the left one was held again).
+        #
+        # Eviction never rewrites a conversation's history. A frame record
+        # lost while the conversation keeps others, and the tombstone of a
+        # forgotten conversation that comes back (the same session id), are
+        # folded into its HISTORY -- when it began, its latest own user
+        # turn, whether it continues, its kinds -- so an older conversation
+        # stays older and its user turn still counts (review 13: the user
+        # resumed a forgotten older window, it restarted as the youngest,
+        # and the finished subagent it had released was held for good).
+        # A history exists only for a recorded conversation: it is folded
+        # into the tombstone when the conversation is forgotten.
         forgotten = self.__dict__.setdefault("_memguard_forgotten", {})
+        history = self.__dict__.setdefault("_memguard_history", {})
         dropped: dict[Any, list[dict]] = {}
         for owner in [k for k in lines if k not in present]:
             dropped.setdefault(owner[0], []).append(lines.pop(owner))
@@ -6782,103 +6874,44 @@ class Scheduler:
             if not any(o[0] == owner[0] for o in lines):
                 self.__dict__.get("_memguard_rewriting_lines", set()).discard(owner[0])
         for line, records in dropped.items():
+            past = history.pop(line, None)
+            folded = _memguard_fold([past, *(_memguard_part(r, past) for r in records)])
             if any(o[0] == line for o in lines):
-                continue
-            convo = [r for r in records if r["continues"]] or records
-            forgotten[line] = {
-                "first": min(r["first"] for r in records),
-                "last": max(r["last"] for r in records),
-                "turn": max(r["turn"] for r in convo),
-                "continues": any(r["continues"] for r in records),
-                "kinds": {r["kind"] for r in convo if r["kind"] is not None},
-            }
+                history[line] = folded
+            else:
+                forgotten[line] = folded
         by_line: dict[Any, list[tuple[Any, dict]]] = {}
         for owner, record in lines.items():
             by_line.setdefault(owner[0], []).append((owner, record))
+        for line in by_line:
+            back = forgotten.pop(line, None)  # active again
+            if back is not None:
+                history[line] = _memguard_fold([history.get(line), back])
         state: dict[Any, dict[str, Any]] = {}
         for line, members in by_line.items():
-            convo = [r for _o, r in members if r["continues"]] or [
-                r for _o, r in members
-            ]
-            state[line] = {
-                "first": min(r["first"] for _o, r in members),
-                "last": max(r["last"] for _o, r in members),
-                # its OWN user turns: a helper call of the session (a
-                # FactCheck, a retitle) ends in a user message too (review 10)
-                "turn": max(r["turn"] for r in convo),
-                "pending": any(
-                    _memguard_outcome(r["hint"]) in _MEMGUARD_MID_TURN for r in convo
-                ),
-                "kinds": {r["kind"] for r in convo if r["kind"] is not None},
-                "continues": any(r["continues"] for _o, r in members),
-            }
-        for line in state:
-            forgotten.pop(line, None)  # active again
+            past = history.get(line)
+            records = [r for _o, r in members]
+            # its OWN user turns: a helper call of the session (a FactCheck,
+            # a retitle) ends in a user message too (review 10)
+            convo = [r for r in records if _memguard_continues(r, past)] or records
+            st = _memguard_fold([past, *(_memguard_part(r, past) for r in records)])
+            st["pending"] = any(
+                _memguard_outcome(r["hint"]) in _MEMGUARD_MID_TURN for r in convo
+            )
+            state[line] = st
+        # The release rules, one predicate each; the same predicates decide
+        # which tombstones are kept.
+        everyone = [*state.items(), *forgotten.items()]
         gone: set[Any] = set()
-        # Tombstones that DECIDED a release (no conversation still recorded
-        # would have released it): only these are kept -- at most one per
-        # released conversation, so never more than the conversations held.
-        deciding: set[Any] = set()
-
-        def _release(line: Any, witnesses: list[Any]) -> bool:
-            if not witnesses:
-                return False
-            gone.add(line)
-            if all(w in forgotten for w in witnesses):
-                deciding.add(max(witnesses, key=lambda w: forgotten[w]["last"]))
-            return True
-
         for line, st in state.items():
             if line in live:
                 continue
-            others = [
-                (o, ost) for o, ost in [*state.items(), *forgotten.items()] if o != line
-            ]
-            if _release(
-                line,
-                [
-                    o
-                    for o, ost in others
-                    if ost["first"] < st["first"]
-                    and ost["last"] > st["last"]
-                    and ost["continues"]
-                    # a PENDING one is waiting on its own tool: an older
-                    # conversation's tool rounds say nothing about it, only
-                    # that one's next user turn does (review 9: a younger
-                    # swarm worker, an async delegate, a newer chat
-                    # mid-build re-prefilled 2,308 of 2,356 tokens on the
-                    # 64 GB arm) ... and only one of ANOTHER kind (its main):
-                    # a user turn in an older window of the same kind is not
-                    # the build's parent (review 10: 48 of 3,856)
-                    and (
-                        not st["pending"]
-                        or (ost["turn"] > st["last"] and not ost["kinds"] & st["kinds"])
-                    )
-                ],
+            if any(
+                other != line
+                and (_memguard_w_outlived(ost, st) or _memguard_w_left(ost, st))
+                for other, ost in everyone
             ):
-                continue
-            if not st["pending"]:
-                _release(
-                    line,
-                    [
-                        o
-                        for o, ost in others
-                        if ost["first"] > st["first"]
-                        and ost["turn"] > st["last"]
-                        and (ost["continues"] or ost["kinds"] & st["kinds"])
-                    ],
-                )
-            else:
-                _release(
-                    line,
-                    [
-                        o
-                        for o, ost in others
-                        if ost["first"] > st["last"]
-                        and ost["turn"] > st["last"]
-                        and ost["kinds"] & st["kinds"]
-                    ],
-                )
+                gone.add(line)
         # Chain: a PENDING conversation of another kind that an older,
         # continuing conversation outlived (a subagent that ended on a tool
         # call -- goose's turn limit, a sub-recipe's final_output -- whose
@@ -6892,44 +6925,71 @@ class Scheduler:
         # two apart (a "third kind began after it" exemption) pinned a
         # finished subagent with no end instead -- a bounded worst case beats
         # an unbounded one.
-        parents = [*state.items(), *forgotten.items()]
         changed = True
         while changed:
             changed = False
             for line, st in state.items():
                 if line in live or line in gone or not st["pending"]:
                     continue
-                changed |= _release(
-                    line,
-                    [
-                        other
-                        for other, ost in parents
-                        if other != line
-                        and (other in gone or other in forgotten)
-                        and ost["first"] < st["first"]
-                        and ost["last"] > st["last"]
-                        and ost["continues"]
-                        and not ost["kinds"] & st["kinds"]
-                    ],
-                )
-        # Keep only the deciding tombstones (review 12: one stale held line
-        # kept every later tombstone -- 8,000 of them, 80 ms a call under the
-        # cache lock). A release depends only on the released conversation's
-        # own state, which changes only when it acts again (and then every
-        # older tombstone is moot), so a tombstone that decides nothing now
-        # never will. At most one per held conversation.
+                if any(
+                    other != line
+                    and (other in gone or other in forgotten)
+                    and _memguard_w_chain(ost, st)
+                    for other, ost in everyone
+                ):
+                    gone.add(line)
+                    changed = True
+        # Which tombstones stay does not depend on which rule released a
+        # conversation, nor on whether a recorded one also would have: the
+        # witness that released it may act, grow a kind, or be forgotten
+        # itself (review 13: rule 1 released the subagent through the older
+        # window, main's tombstone was dropped as undeciding, and when that
+        # window came back nothing released the subagent). A tombstone is
+        # kept while it WITNESSES some recorded conversation under ANY rule.
+        # A conversation's own state changes only when it acts, and then it
+        # has acted after every tombstone, so one that witnesses nothing now
+        # never will (review 12: one stale held line no longer keeps every
+        # later tombstone -- they witness nothing for it).
+        #
+        # Bound, relative to what is recorded: the latest witness of every
+        # (conversation, rule) is always kept; all of them while the
+        # tombstones number no more than the recorded conversations, past
+        # that the most recent ones.
+        must: set[Any] = set()
+        witnesses: set[Any] = set()
+        for _line, st in state.items():
+            for rule in (_memguard_w_outlived, _memguard_w_left, _memguard_w_chain):
+                best = None
+                for tomb, tst in forgotten.items():
+                    if rule(tst, st):
+                        witnesses.add(tomb)
+                        if best is None or tst["last"] > forgotten[best]["last"]:
+                            best = tomb
+                if best is not None:
+                    must.add(best)
+        spare = max(0, len(state) - len(must))
+        keep = must | set(
+            sorted(witnesses - must, key=lambda t: forgotten[t]["last"], reverse=True)[
+                :spare
+            ]
+        )
         for line in list(forgotten):
-            if line not in deciding:
+            if line not in keep:
                 forgotten.pop(line, None)
         outlived = {owner for owner in lines if owner[0] in gone}
         for line, members in by_line.items():
             if line in gone:
                 continue
+            past = history.get(line)
             latest_convo = max(
-                (r["last"] for _o, r in members if r["continues"]), default=0
+                (r["last"] for _o, r in members if _memguard_continues(r, past)),
+                default=0,
             )
             for owner, record in members:
-                if not record["continues"] and record["last"] < latest_convo:
+                if (
+                    not _memguard_continues(record, past)
+                    and record["last"] < latest_convo
+                ):
                     outlived.add(owner)
         return outlived
 

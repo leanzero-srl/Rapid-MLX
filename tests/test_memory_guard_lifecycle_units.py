@@ -2,6 +2,7 @@
 M21, M24, M25, M26). Unit-level, deterministic."""
 
 import random
+import time
 import types
 
 from rapid_mlx.memory_guard import MemoryGuard, PeakPrior, StepShape, kv_growth_step
@@ -138,8 +139,8 @@ def test_tombstones_are_bounded_by_the_conversations_held():
     """Review 12: one stale held line (an old one-shot request with no
     session id that ended on a tool call) kept EVERY later tombstone: 8,000
     of them after 8,000 short chats, 80 ms per call under the cache lock.
-    Only a tombstone that decides a release is kept -- at most one per held
-    conversation."""
+    Only a tombstone that witnesses a recorded conversation under some rule
+    is kept, and none of these witnesses anything for the held lines."""
     s = _sched()
     lines = s._memguard_lines
     seq = 1
@@ -153,7 +154,8 @@ def test_tombstones_are_bounded_by_the_conversations_held():
         lines[owner] = _rec(seq, (48, 100 + j), "tool_calls")
         s.memory_aware_cache._entries[f"old{j}"] = types.SimpleNamespace(owner=owner)
         held.append(owner)
-    for i in range(2000):
+    started = time.perf_counter()
+    for i in range(8000):
         seq += 2
         owner = (("session", f"c{i}"), (48, i % 3))
         lines[owner] = _rec(seq, (48, i % 3))
@@ -162,3 +164,127 @@ def test_tombstones_are_bounded_by_the_conversations_held():
         del s.memory_aware_cache._entries[f"c{i}"]  # the count bound evicts it
         s._memguard_outlived_lines()
         assert len(s.__dict__.get("_memguard_forgotten", {})) <= len(held), i
+    # 16,000 calls: the old growth cost 80 ms per call at the end
+    assert time.perf_counter() - started < 8.0
+
+
+# -- review 13: tombstones and history -------------------------------------
+
+OW = (("session", "O"), KA)
+M = (("session", "M"), KA)
+S = (("session", "S"), KB)
+Z = (("session", "Z"), KA)
+
+
+def test_a_resumed_older_window_still_releases_the_finished_subagent():
+    """Review 13 (the reviewer's repro): rule 1 released S through the older
+    window OW, so main's tombstone decided nothing and was dropped; the user
+    resumed OW and nothing released S again."""
+    s = _sched()
+    _line(s, OW, KA, 1, 5, 1)  # older window, used before
+    _line(s, M, KA, 2, 7, 2)  # main: hands off, takes the result, stops
+    _line(s, S, KB, 3, 6, 3, outcome="tool_calls")  # subagent ended on a tool call
+    s._memguard_lines[OW].update(last=9, turn=9)  # the user goes back to OW
+    _line(s, Z, KA, 10, 11, 11)  # then opens Z
+    assert {S, OW, M} <= s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]  # duress: main's entries go
+    assert S in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{OW}"]  # then OW's
+    assert S in s._memguard_outlived_lines()
+    _line(s, OW, KA, 12, 13, 13)  # the user resumes OW (same session id)
+    for i in range(5):  # any amount of further traffic
+        q = (("session", f"Q{i}"), KA)
+        _line(s, q, KA, 20 + 3 * i, 21 + 3 * i, 21 + 3 * i)
+        assert S in s._memguard_outlived_lines(), i
+
+
+def test_the_last_forgotten_of_two_witnesses_resumes():
+    """Review 13, second variant: of two forgotten witnesses only the latest
+    was kept, and the subagent was held again once that one resumed."""
+    s = _sched()
+    _line(s, M, KA, 1, 1, 1)
+    _line(s, OW, KA, 2, 2, 2)
+    _line(s, S, KB, 3, 4, 3, outcome="tool_calls")  # M's subagent, tool-ended
+    s._memguard_lines[M].update(last=6, turn=6)  # the user types in M
+    s._memguard_lines[OW].update(last=8, turn=8)  # and then in OW
+    _line(s, Z, KA, 9, 10, 10)  # then opens Z
+    assert S in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]
+    del s.memory_aware_cache._entries[f"e{OW}"]
+    assert S in s._memguard_outlived_lines()
+    _line(s, OW, KA, 12, 13, 13)  # the user resumes OW
+    for i in range(4):
+        _line(s, (("session", f"Q{i}"), KA), KA, 20 + 3 * i, 21 + 3 * i, 21 + 3 * i)
+    assert S in s._memguard_outlived_lines(), "pinned"
+
+
+def test_a_resumed_main_alone_is_still_older_than_its_subagent():
+    """The only evidence is the conversation that comes back: main typed
+    after its tool-ended subagent, was left and forgotten, and resumes with
+    a helper call first (no user turn of its own). It is the same
+    conversation -- older than S, its user turn after S still counts."""
+    s = _sched()
+    _line(s, M, KA, 1, 7, 7)  # main: the user typed after S's last request
+    _line(s, S, KB, 3, 6, 3, outcome="tool_calls")
+    _line(s, Z, KA, 8, 9, 9)  # the user opens Z
+    assert S in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]
+    assert S in s._memguard_outlived_lines()
+    # main comes back: a helper call of its session first (another frame,
+    # one-shot), then its conversation frame
+    _line(s, (("session", "M"), KH), KH, 10, 10, 10, continues=False)
+    assert S in s._memguard_outlived_lines()
+    _line(s, M, KA, 11, 11, 11, continues=False)  # first request after return
+    assert S in s._memguard_outlived_lines()
+
+
+def test_a_lost_frame_does_not_make_a_conversation_younger():
+    """A conversation that changed frames (an extension enabled mid-session)
+    loses its OLDER frame's entries: it still began before S."""
+    s = _sched()
+    w1 = _line(s, (("session", "W"), KA), KA, 1, 4, 1)
+    _line(s, S, KB, 5, 6, 5, outcome="tool_calls")
+    _line(s, (("session", "W"), KO), KO, 10, 12, 12)  # W's new frame, typed after S
+    assert S in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{w1}"]  # the old frame's entries go
+    assert S in s._memguard_outlived_lines()
+    for i in range(3):
+        _line(s, (("session", f"Q{i}"), KA), KA, 20 + 3 * i, 21 + 3 * i, 21 + 3 * i)
+        assert S in s._memguard_outlived_lines(), i
+
+
+def test_a_tombstone_is_kept_for_any_rule_not_only_the_deciding_one():
+    """S (tool-ended subagent) is released by the chain through two parents
+    that ran after it: P (recorded, released: the user left it for Z) and
+    main (forgotten). P's tool then returns -- P is no longer released --
+    and only main's tombstone still releases S."""
+    s = _sched()
+    _line(s, M, KA, 1, 7, 1)  # main took the result (a tool round), stopped
+    p = _line(s, (("session", "P"), KA), KA, 2, 8, 2, outcome="tool_calls")
+    _line(s, S, KB, 3, 6, 3, outcome="tool_calls")
+    _line(s, Z, KA, 9, 10, 10)  # the user opens Z: main and P left
+    assert {S, M, p} <= s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]
+    assert S in s._memguard_outlived_lines()
+    s._memguard_lines[p].update(last=11, hint=types.SimpleNamespace(outcome=["stop"]))
+    out = s._memguard_outlived_lines()
+    assert p not in out  # P acted again: not left
+    assert S in out
+
+
+def test_tombstones_stay_bounded_beside_a_released_line_that_stays():
+    """A released conversation whose entry stays (a shared prefix it stored
+    keeps being hit) is witnessed by EVERY later conversation; the
+    tombstones kept for it are bounded by what is recorded."""
+    s = _sched()
+    a = _line(s, (("session", "A"), KA), KA, 1, 2, 1)
+    seq = 3
+    for i in range(2000):
+        owner = (("session", f"c{i}"), KA)
+        _line(s, owner, KA, seq, seq + 1, seq + 1)
+        seq += 2
+        assert a in s._memguard_outlived_lines()
+        del s.memory_aware_cache._entries[f"e{owner}"]
+        assert a in s._memguard_outlived_lines()
+        recorded = len({o[0] for o in s._memguard_lines})
+        assert len(s._memguard_forgotten) <= 3 * recorded, i
