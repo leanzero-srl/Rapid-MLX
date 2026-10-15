@@ -2389,7 +2389,11 @@ def load_model(
 
         _bare_repo_has_pulled_variant = pulled_variant(model_name) is not None
     _model_config = None if _bare_repo_has_pulled_variant else _profile
-    _adapter_path = adapter_path if adapter_path is not None else getattr(_profile, "adapter_path", None)
+    _adapter_path = (
+        adapter_path
+        if adapter_path is not None
+        else getattr(_profile, "adapter_path", None)
+    )
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
 
