@@ -1,24 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode steps planned from MEASUREMENT (Gabee T12 control run, 2026-10-15).
+"""An MTP decode step planned from the MODEL, not from a measurement.
 
-Qwen3.8-27B Q8 + mtp.safetensors on Gabee's M3 Max (64 GB, ceiling 50.10 GB,
-engine e84498a4a = the b06acd8ea guard). The first STEP OVER CEILING lines
-fired in DECODE at B=1:
+Gabee T12 control run (2026-10-15, Qwen3.8-27B Q8 + mtp.safetensors, engine
+e84498a4a): decode steps at 84-86k planned 45.2-46.4 GB and peaked
+50.15-50.24 GB against a 50.10 GB ceiling, on CONSECUTIVE steps ~0.55 s
+apart (4 in a ~546-token turn) -- not KV growth (once per 256 tokens).
 
-    [memory_guard] STEP OVER CEILING: decode shape=decode B=1 prompt_rows=0
-    decoding_rows=1 planned=45.37GB measured_peak=50.22GB ceiling=50.10GB
-    (+4.85GB unplanned; guard defect signal)
+The cost (independent review, measured on Metal with the 27B's shapes): an
+MTP verify of S rows keeps S - 1 restore points -- the recurrent state and
+the conv slice -- of every linear-attention (GatedDeltaNet) layer until the
+round ends (spec_decode/mtp/cache_patch.py, ``gated_delta_verify_with_
+states``). FIXED, independent of the context: 32 rows (a prompt-lookup
+copy draft) = 31 x 48 layers x (48 x 128 x 128 x 4 B + 3 x 10,240 x 2 B)
+= 4.77 GB (the +4.85 GB crossings); 4 rows (k = 3) = 0.46 GB (the
+<= 0.4 GB the run's other decode steps showed). The copy-draft width is
+adaptive, which is why the crossings were intermittent.
 
-at the request scheduled with prompt_tokens=83666; the store line beside it
-reads ``kv=5228.3MB ... per_token=73.0KB`` for 83,653 tokens (16
-full-attention layers, 4 KV heads x head_dim 256 x bf16: 4,096 B per token
-per layer). Seventeen such lines, every peak 50.15-50.24 GB whatever was
-planned (45.20 .. 49.96 GB): MLX throttles at its memory limit (the
-guard's ceiling), so +4.85 GB is a lower bound -- about 0.9 of the KV.
-
-The vendored MTP verify writes ``mtp_max_k + 1`` rows a step (32 with a
-prompt-lookup copy draft), so ``idx + 1 > capacity`` never saw the KV
-growth coming, and the growth the guard did plan was 2 layers of 16.
+And why a plan of exactly that cost still crossed in the 1/100 sim: a
+prefix entry stored mid-turn from a live cache with no slack SHARED its K/V
+buffers (``mx.contiguous`` does not copy a whole contiguous buffer), so
+the bytes the store's room check made room for were allocated at the live
+cache's next write -- the first decode step of every turn (+60.5 MB at
+7,100 tokens against 17.2 MB planned). RC6's slack hid it; a fixed cost
+planned beside it crossed. The store now copies there.
 """
 
 from __future__ import annotations
@@ -29,157 +33,69 @@ import mlx.core as mx
 import pytest
 
 from rapid_mlx.memory_guard import MemoryGuard, PeakPrior, kv_growth_step
-from rapid_mlx.scheduler import Scheduler
+from rapid_mlx.scheduler import (
+    Scheduler,
+    _held_rollback_bytes,
+    _model_recurrent_state_bytes,
+    _recurrent_state_bytes_per_row,
+)
 from tests.test_memory_guard_session import (  # noqa: F401
     GABEE_PHYSICAL,
     M4_MAX_128_CEILING,
     _auto_budget_scheduler,
     _Device,
-    _drive,
-    _new_tokens,
     _no_metal,
-    _request,
     _session,
-    _tokens,
     cpu,
     llama,
 )
 
 GB = 10**9
-CEILING = int(50.10 * GB)  # Gabee: 90% of 55.7 GB
-FOOTPRINT = int(45.37 * GB)  # planned (no growth, no per-step term)
-PEAK = int(50.22 * GB)
+CEILING = int(50.10 * GB)
+FOOTPRINT = int(45.37 * GB)
 CONTEXT = 83_666
 LAYER = 4096.0  # one full-attention layer's K+V per token
-PER_TOKEN = 73.0 * 1024  # the store line's per_token (KV + recurrent state)
-# M4 Max 128 GB: 0.9 x its recommended working set (test_memory_guard_session)
+PER_TOKEN = 73.0 * 1024
 BIG_CEILING = int(0.9 * 115.4 * GB)
+# Qwen3.8-27B (Gabee's config.json): 64 layers, one full-attention in four
+# -> 48 GatedDeltaNet layers; 48 value / 16 key heads of 128; conv kernel 4.
+LINEAR_LAYERS = 48
+V_HEADS, K_HEADS, HEAD_DIM, KERNEL = 48, 16, 128, 4
+CONV_DIM = 2 * K_HEADS * HEAD_DIM + V_HEADS * HEAD_DIM
 
 
 def _guard() -> MemoryGuard:
-    prior = PeakPrior(192.0, 251_904.0, LAYER, PER_TOKEN)
-    return MemoryGuard(prior, floor_tokens=kv_growth_step())
+    return MemoryGuard(
+        PeakPrior(192.0, 251_904.0, LAYER, PER_TOKEN), floor_tokens=kv_growth_step()
+    )
 
 
 def _kv(context: int) -> int:
     return int(PER_TOKEN * context)
 
 
-def test_gabee_growth_step_over_the_ceiling_teaches_the_growth_term():
-    guard = _guard()
-    before = guard.decode_growth(CONTEXT, kv_footprint=_kv)
-    # the 2-layer prior: 0.71 GB at 84k against the 4.85 GB measured
-    assert before < (PEAK - FOOTPRINT) / 4, before / GB
-    assert guard.observe_decode(
-        PEAK - FOOTPRINT,
-        context=CONTEXT,
-        batch=1,
-        planned=before,
-        ceiling=CEILING,
-        peak=PEAK,
-        grew=True,
-        kv_footprint=_kv,
-    )
-    planned = guard.decode_growth(CONTEXT, kv_footprint=_kv)
-    assert planned >= PEAK - FOOTPRINT, planned / GB
-    # capped at a whole KV (16 full-attention layers + the recurrent state)
-    assert guard.decode_growth_layers <= PER_TOKEN / LAYER
-    # the next growth at that context fits only with room made on Gabee ...
-    margin = guard.margin(planned, CEILING)
-    assert FOOTPRINT + planned + margin > CEILING
-    # ... and needs none on a 128 GB Mac (no protective action there)
-    assert FOOTPRINT + planned + guard.margin(planned, BIG_CEILING) < BIG_CEILING
+class _Model(SimpleNamespace):
+    def named_modules(self):
+        return self.modules
 
 
-def test_a_step_under_the_ceiling_teaches_nothing():
-    """Below the ceiling an unplanned byte costs nothing: the same excess
-    on a Mac with room changes no plan (owner: no action without duress)."""
-    guard = _guard()
-    for grew in (True, False):
-        assert not guard.observe_decode(
-            PEAK - FOOTPRINT,
-            context=CONTEXT,
-            batch=1,
-            planned=0,
-            ceiling=BIG_CEILING,
-            peak=PEAK,
-            grew=grew,
-            kv_footprint=_kv,
-        )
-    assert guard.decode_growth_layers == 2.0
-    assert guard.decode_step(CONTEXT) == 0
-
-
-def test_an_overshooting_decode_step_teaches_the_every_step_term():
-    guard = _guard()
-    assert guard.decode_step(CONTEXT) == 0
-    guard.observe_decode(
-        PEAK - FOOTPRINT,
-        context=CONTEXT,
-        batch=1,
-        planned=0,
-        ceiling=CEILING,
-        peak=PEAK,
-    )
-    assert guard.decode_step(CONTEXT) >= PEAK - FOOTPRINT - 1
-    assert guard.decode_growth(CONTEXT, kv_footprint=_kv) >= guard.decode_step(CONTEXT)
-
-
-def test_a_decode_step_under_the_ceiling_teaches_nothing():
-    """The MTP decodes at 48-72k on the same run: peak - active <= 0.4 GB
-    (the [Metal memory] samples, e.g. active=44.1GB peak=44.5GB at ~70k)."""
-    guard = _guard()
-    guard.observe_decode(
-        int(0.4 * GB),
-        context=70_000,
-        batch=1,
-        planned=0,
-        ceiling=CEILING,
-        peak=int(44.5 * GB),
-    )
-    assert guard.decode_step(CONTEXT) == 0
-
-
-def test_the_window_includes_the_measured_decode_step():
-    guard = _guard()
-    base = int(31.8 * GB)  # weights (the boot line)
-    before = guard.max_context(
-        base=base, kv_footprint=_kv, ceiling=CEILING, upper=262_144
-    )
-    guard.observe_decode(
-        PEAK - FOOTPRINT,
-        context=CONTEXT,
-        batch=1,
-        planned=0,
-        ceiling=CEILING,
-        peak=PEAK,
-    )
-    after = guard.max_context(
-        base=base, kv_footprint=_kv, ceiling=CEILING, upper=262_144
-    )
-    assert after < before
-    need = guard.single_sequence_need(
-        after, base=base, kv_footprint=_kv, ceiling=CEILING
-    )
-    assert need <= CEILING
-    # 128 GB: the native window is untouched
-    assert (
-        guard.max_context(
-            base=base, kv_footprint=_kv, ceiling=BIG_CEILING, upper=262_144
-        )
-        == 262_144
+def _gdn():
+    return SimpleNamespace(
+        num_v_heads=V_HEADS,
+        head_v_dim=HEAD_DIM,
+        head_k_dim=HEAD_DIM,
+        conv_dim=CONV_DIM,
+        conv_kernel_size=KERNEL,
+        norm=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16)),
     )
 
 
-# -- the scheduler's growth predicate ---------------------------------------
-
-
-def _scheduler(spec_decode: str, *, max_k: int, lookup: int | None):
+def _model_27b(wide: bool = True, lookup: int | None = 31):
     from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
 
-    s = object.__new__(Scheduler)
-    s.config = SimpleNamespace(spec_decode=spec_decode, mtp_max_k=max_k)
-    model = SimpleNamespace()
+    model = _Model(modules=[(f"layers.{i}.linear_attn", _gdn()) for i in range(48)])
+    if wide:
+        model.mtp_wide_verify_rollback_supported = True
     if lookup is not None:
         model.mtp_prompt_lookup_supported = True
         model.mtp_prompt_lookup_policy = PromptLookupPolicy(
@@ -189,8 +105,66 @@ def _scheduler(spec_decode: str, *, max_k: int, lookup: int | None):
             max_ngram=64,
             max_tokens=lookup,
         )
-    s.model = model
+    return model
+
+
+def _scheduler(spec="mtp", *, max_k=3, model=None):
+    s = object.__new__(Scheduler)
+    s.config = SimpleNamespace(spec_decode=spec, mtp_max_k=max_k)
+    s.model = model if model is not None else _model_27b()
+    s.batch_generator = SimpleNamespace(_generation_batch=None)
     return s
+
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", raising=False)
+
+
+def test_the_27b_restore_point_is_read_from_the_model():
+    per = _model_recurrent_state_bytes(_model_27b())
+    state = V_HEADS * HEAD_DIM * HEAD_DIM * 4  # mlx-lm keeps it in float32
+    conv = (KERNEL - 1) * CONV_DIM * 2  # bf16 activations
+    assert per == LINEAR_LAYERS * (state + conv)
+
+
+@pytest.mark.parametrize(
+    ("max_k", "lookup", "gb"),
+    [(3, 31, 4.77), (3, None, 0.46)],
+    ids=["copy-draft-32-rows", "mtp-k3-4-rows"],
+)
+def test_the_verify_cost_is_the_measured_one(max_k, lookup, gb):
+    """4.77 GB for a 32-row copy-draft verify (Gabee's +4.85 GB crossings,
+    the review's 97.5 MB per layer on Metal), 0.46 GB at k = 3 (the run's
+    <= 0.4 GB MTP decode steps)."""
+    s = _scheduler(max_k=max_k, model=_model_27b(lookup=lookup))
+    cost = s._memguard_verify_bytes_per_row(s._memguard_decode_write_rows())
+    assert cost == pytest.approx(gb * GB, rel=0.01), cost / GB
+
+
+def test_no_cost_off_mtp_or_without_the_wide_verify():
+    assert _scheduler("none")._memguard_verify_bytes_per_row(1) == 0
+    s = _scheduler(model=_model_27b(wide=False))
+    assert s._memguard_verify_bytes_per_row(s._memguard_decode_write_rows()) == 0
+
+
+def test_the_live_cache_gives_the_same_restore_point(cpu):
+    """From the decoding cache's own arrays (exact): one row's conv + SSM
+    state per recurrent layer."""
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    rows = 2
+    layer = ArraysCache(size=2)
+    layer[0] = mx.zeros((rows, KERNEL - 1, 64), mx.bfloat16)
+    layer[1] = mx.zeros((rows, 4, 16, 16), mx.float32)
+    kv = KVCache()
+    assert _recurrent_state_bytes_per_row([layer, kv]) == (
+        (KERNEL - 1) * 64 * 2 + 4 * 16 * 16 * 4
+    )
+
+
+# -- the plan --------------------------------------------------------------
 
 
 class _Batch(SimpleNamespace):
@@ -198,65 +172,161 @@ class _Batch(SimpleNamespace):
         return len(self.uids)
 
 
-def _decoding(s: Scheduler, *, capacity: int, idx: int, context: int):
-    from mlx_lm.models.cache import BatchKVCache
+def _decoding(s, *, capacity: int, idx: int, context: int, held=None):
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
-    layer = BatchKVCache(left_padding=[0])
+    attn = BatchKVCache(left_padding=[0])
     k = mx.zeros((1, 1, capacity, 8))
-    layer.keys, layer.values = k, k
-    layer._idx = idx
-    layer.offset = mx.array([idx])
+    attn.keys, attn.values = k, k
+    attn._idx = idx
+    attn.offset = mx.array([idx])
+    gdn = ArraysCache(size=2)
+    gdn.rollback_state = held
     request = SimpleNamespace(prompt_token_ids=[0] * context, num_output_tokens=0)
     s.batch_generator = SimpleNamespace(
-        _generation_batch=_Batch(uids=[7], prompt_cache=[layer])
+        _generation_batch=_Batch(uids=[7], prompt_cache=[attn, gdn])
     )
     s._memguard_request_for_uid = lambda uid: request
     s._kv_footprint_fn = lambda: _kv
+    # the model's restore point, not the toy cache's
+    s._memguard_state_bytes_per_row = _model_recurrent_state_bytes(_model_27b())
 
 
-@pytest.mark.parametrize(
-    ("spec", "max_k", "lookup", "rows"),
-    [("none", 3, None, 1), ("mtp", 3, None, 4), ("mtp", 3, 31, 32)],
-)
-def test_a_step_writes_the_verify_width(spec, max_k, lookup, rows, monkeypatch):
-    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
-    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", raising=False)
-    s = _scheduler(spec, max_k=max_k, lookup=lookup)
-    assert s._memguard_decode_write_rows() == rows
-
-
-def test_an_mtp_verify_near_capacity_is_a_growth_step(cpu, monkeypatch):
-    """Gabee's shape: 3 positions short of the buffer, a 4-row verify."""
-    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
+def test_every_mtp_decode_step_plans_the_verify(cpu):
     guard = _guard()
-    s = _scheduler("mtp", max_k=3, lookup=None)
+    s = _scheduler(max_k=3)
+    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT)
+    planned = s._memguard_decode_growth(guard)
+    assert planned == pytest.approx(4.77 * GB, rel=0.01)
+    assert s._memguard_decode_growth(guard) == guard.decode_verify(batch=1)
+    # Gabee: footprint + verify + margin does not fit -> room is made
+    assert FOOTPRINT + planned + guard.margin(planned, CEILING) > CEILING
+    # 128 GB: it fits, no protective action
+    assert FOOTPRINT + planned + guard.margin(planned, BIG_CEILING) < BIG_CEILING
+
+
+def test_the_previous_rounds_restore_points_are_not_counted_twice(cpu):
+    """The verify drops the last round's restore points as it writes its
+    own: what is still held is subtracted."""
+    guard = _guard()
+    s = _scheduler(max_k=3)
+    held = [(mx.zeros((1, 3, 64)), mx.zeros((1, 48, 128, 128)))]
+    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT, held=held)
+    assert _held_rollback_bytes(s.batch_generator._generation_batch.prompt_cache) > 0
+    assert s._memguard_decode_growth(guard) == guard.decode_verify(
+        batch=1
+    ) - _held_rollback_bytes(s.batch_generator._generation_batch.prompt_cache)
+
+
+def test_an_mtp_verify_near_capacity_is_a_growth_step(cpu):
+    """3 positions short of the buffer, a 4-row verify (k = 3): the KV
+    grows; ``idx + 1 > capacity`` never saw it."""
+    guard = _guard()
+    s = _scheduler(max_k=3, model=_model_27b(lookup=None))
     _decoding(s, capacity=CONTEXT + 3, idx=CONTEXT, context=CONTEXT)
-    # planned as a growth step (2 layers + the block before any crossing)
-    assert s._memguard_decode_growth(guard) >= 2 * LAYER * CONTEXT
-    assert s._memguard_last_decode_grows is True
-    # plain decode at the same position does not grow there
-    s.config.spec_decode = "none"
+    planned = s._memguard_decode_growth(guard)
+    assert planned == guard.decode_growth(CONTEXT, kv_footprint=_kv)
+    assert planned >= 2 * LAYER * CONTEXT + guard.decode_verify(batch=1)
+
+
+def test_a_plain_decode_is_planned_exactly_as_rc6(cpu):
+    guard = _guard()
+    s = _scheduler("none")
+    _decoding(s, capacity=CONTEXT + 3, idx=CONTEXT, context=CONTEXT)
     assert s._memguard_decode_growth(guard) == 0
-    assert s._memguard_last_decode_grows is False
+    assert guard.decode_verify_bytes_per_row == 0
+    _decoding(s, capacity=CONTEXT, idx=CONTEXT, context=CONTEXT)
+    rc6 = int(2.0 * LAYER * (CONTEXT + kv_growth_step())) + (
+        _kv(CONTEXT + kv_growth_step()) - _kv(CONTEXT)
+    )
+    assert s._memguard_decode_growth(guard) == pytest.approx(rc6, abs=1)
 
 
-# -- the whole path, through the real scheduler (the 1/100 session sim) -----
+def test_the_window_includes_the_verify_on_gabee_not_on_128():
+    """The window's worst step is the larger of the floor-chunk prefill and
+    the decode step; the verify joins the decode step. At Gabee's prior
+    the floor-chunk prefill still binds (no window lost); a cost beyond it
+    shrinks the window to what fits; 128 GB keeps its native window."""
+    guard = _guard()
+    base = int(31.8 * GB)
+
+    def window(ceiling):
+        return guard.max_context(
+            base=base, kv_footprint=_kv, ceiling=ceiling, upper=262_144
+        )
+
+    before = window(CEILING)
+    guard.decode_verify_bytes_per_row = int(4.77 * GB)
+    assert window(CEILING) <= before
+    guard.decode_verify_bytes_per_row = int(12 * GB)
+    after = window(CEILING)
+    assert after < before
+    need = guard.single_sequence_need(
+        after, base=base, kv_footprint=_kv, ceiling=CEILING
+    )
+    assert need <= CEILING
+    assert need >= base + _kv(after) + guard.decode_verify(batch=1)
+    guard.decode_verify_bytes_per_row = int(4.77 * GB)
+    assert window(BIG_CEILING) == 262_144
 
 
-# Gabee's measured excess per KV byte at 84k: 4.85 GB of a 5.23 GB KV.
-EXCESS_OF_KV = 4.85 / 5.23
+# -- the store: an entry owns its bytes when it is stored -------------------
 
 
-def _mtp_like(scheduler):
-    """Every decode-only step also holds EXCESS_OF_KV of its context's KV
-    beyond the footprint (what Gabee's MTP decode measured), as a real
-    allocation of the CPU allocator."""
-    kv_fn = scheduler._kv_footprint_fn
+def test_a_store_from_a_live_cache_with_no_slack_copies_now(cpu):
+    from unittest.mock import MagicMock
+
+    from mlx_lm.models.cache import KVCache
+
+    from rapid_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+    tokens, layers = 2048, 8
+    live = []
+    for _ in range(layers):
+        layer = KVCache()
+        layer.keys = mx.random.normal((1, 4, tokens, 64))
+        layer.values = mx.random.normal((1, 4, tokens, 64))
+        layer.offset = tokens  # no slack: the buffer IS the content
+        live.append(layer)
+    mx.eval([c.keys for c in live] + [c.values for c in live])
+    kv = sum(c.keys.nbytes + c.values.nbytes for c in live)
+    cache = MemoryAwarePrefixCache(
+        model=MagicMock(), config=MemoryCacheConfig(max_memory_mb=4096)
+    )
+    # what extraction hands over for a row with no slack: new layer objects
+    # over the SAME buffers
+    extracted = []
+    for c in live:
+        e = KVCache()
+        e.keys, e.values, e.offset = c.keys, c.values, c.offset
+        extracted.append(e)
+    before = mx.get_active_memory()
+    assert cache.store(list(range(tokens)), extracted, evict_prefixes=False)
+    assert mx.get_active_memory() - before >= 0.99 * kv  # copied at store
+    # the live cache's next in-place write allocates nothing more
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    for c in live:
+        c.keys[..., tokens - 1 : tokens, :] = mx.zeros((1, 4, 1, 64))
+        c.values[..., tokens - 1 : tokens, :] = mx.zeros((1, 4, 1, 64))
+    mx.eval([c.keys for c in live] + [c.values for c in live])
+    assert mx.get_peak_memory() - before < 0.1 * kv
+
+
+# -- the whole path: the review's fixed-cost sim -----------------------------
+
+
+def _fixed_verify(scheduler, nbytes: int) -> None:
+    """Every decode step holds a FIXED ``nbytes`` (an MTP verify's restore
+    points: context-independent), as a real allocation, and the guard
+    plans exactly that (as it does from the model on an MTP engine)."""
+    scheduler._memguard_verify_bytes_per_row = lambda writes: nbytes
+    scheduler._memguard().decode_verify_bytes_per_row = nbytes
     real_step = scheduler.step
 
     def step():
         bg = scheduler.batch_generator
-        if bg is not None and not getattr(bg, "_lz_mtp_like", False):
+        if bg is not None and not getattr(bg, "_lz_fixed", False):
             real_next = bg.next
 
             def next_():
@@ -266,139 +336,57 @@ def _mtp_like(scheduler):
                 )
                 decoding = gen is not None and len(gen) > 0 and not prompting
                 out = real_next()
-                lengths = scheduler._memguard_generation_lengths()
-                fn = kv_fn()
-                if decoding and lengths and fn is not None:
-                    extra = mx.zeros((int(EXCESS_OF_KV * fn(max(lengths))),), mx.uint8)
+                if decoding:
+                    extra = mx.zeros((nbytes,), mx.uint8)
                     mx.eval(extra)
                     del extra
                 return out
 
             bg.next = next_
-            bg._lz_mtp_like = True
+            bg._lz_fixed = True
         return real_step()
 
     scheduler.step = step
 
 
 def _actions(guard) -> dict[str, int]:
-    quiet = {"checks", "calibrations", "superseded", "abandoned"}
-    return {k: v for k, v in guard.counts.items() if v and k not in quiet}
+    rc6_bookkeeping = {
+        "checks",
+        "calibrations",
+        "superseded",
+        "abandoned",
+        # the plain session's own RC6 counts (no MTP cost) on both arms
+        "store_skips",
+        "admission_handoffs",
+        "chunk_halvings",
+        "chunks_reduced",
+    }
+    return {k: v for k, v in guard.counts.items() if v and k not in rc6_bookkeeping}
 
 
-def test_an_mtp_like_decode_is_learned_and_then_planned_on_gabee(llama, monkeypatch):
-    device = _Device(physical=GABEE_PHYSICAL)
-    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
-    device.install(monkeypatch, scheduler)
-    _mtp_like(scheduler)
-    history, _windows = _session(scheduler, delta=500, native=65536)
-    guard = scheduler._memguard()
-    assert len(history) >= 4, history
+@pytest.mark.parametrize("arm", ["gabee", "m4max128"])
+def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, arm):
+    """The review's scenario: a FIXED 0.9 of the KV at 65% of the sim's
+    "84k" (6,500 sim tokens = Gabee's window; 84k = 0.65 of it). RC6 with
+    the cost unplanned: 20 crossings on Gabee, 12 on 128 GB; planned
+    exactly but with the shared-store copy deferred: 5 and 3. Now 0, the
+    window shrinks by what the cost occupies and no more, and the 128 GB
+    arm takes no protective action beyond the plain session's."""
+    physical = GABEE_PHYSICAL if arm == "gabee" else int(M4_MAX_128_CEILING / 0.97) + 1
+    device = _Device(physical=physical)
+    s = _auto_budget_scheduler(llama, monkeypatch, device)
+    device.install(monkeypatch, s)
+    kv_fn = s._kv_footprint_fn()
+    nbytes = int(0.9 * kv_fn(int(0.65 * 6500)))
+    _fixed_verify(s, nbytes)
+    history, windows = _session(s, delta=500, native=65536)
+    guard = s._memguard()
     assert device.ooms == 0
-    # learned from the steps that overshot, then planned: the overshoots are
-    # the learning steps, not every later decode step
-    assert guard.decode_step_bytes_per_context > 0
-    assert guard.decode_step_raises >= 1
-    assert guard.steps_over_ceiling <= guard.decode_step_raises, (
-        guard.steps_over_ceiling,
-        guard.decode_step_raises,
-    )
-
-
-def test_an_mtp_like_decode_takes_no_protective_action_on_128_gb(llama, monkeypatch):
-    """The same session on a 128 GB Mac up to the goose 27B's "116k" (8.85k
-    sim tokens: real = sim x 13.1, test_the_guard_acts_only_under_duress),
-    Gabee's 84k overshoot included: no duress there, so no protective
-    action, no step over the ceiling, nothing learned."""
-    device = _Device(physical=int(M4_MAX_128_CEILING / 0.97) + 1)
-    scheduler = _auto_budget_scheduler(llama, monkeypatch, device)
-    device.install(monkeypatch, scheduler)
-    _mtp_like(scheduler)
-    prompt = _new_tokens(0, 600)
-    turns = 0
-    while len(prompt) < 8_850:
-        rid = f"turn-{turns}"
-        outs = _drive(scheduler, [_request(rid, prompt, 64)])[rid]
-        assert outs[-1].finished and not outs[-1].error, outs[-1].error
-        prompt = prompt + _tokens(outs) + _new_tokens(turns + 1, 800)
-        turns += 1
-    guard = scheduler._memguard()
-    assert turns >= 4, turns
-    assert device.ooms == 0
-    assert guard.steps_over_ceiling == 0
+    assert guard.steps_over_ceiling == 0, guard.steps_over_ceiling
+    assert device.max_seen <= device.ceiling
     assert not _actions(guard), _actions(guard)
-    assert guard.decode_step_raises == 0
-
-
-def test_a_learned_step_term_is_planned_on_every_decode_step(cpu, monkeypatch):
-    """Not only at growth: the term every decode step pays is charged on a
-    step that does not grow the KV."""
-    guard = _guard()
-    guard.decode_step_bytes_per_context = (PEAK - FOOTPRINT) / CONTEXT
-    s = _scheduler("none", max_k=0, lookup=None)
-    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT)
-    assert s._memguard_decode_growth(guard) == guard.decode_step(CONTEXT)
-    assert s._memguard_last_decode_grows is False
-
-
-def _plan_decode_only(s: Scheduler, guard: MemoryGuard) -> list[int]:
-    """Run the dispatch plan of a decode-only step; the eviction levels the
-    room was made from."""
-    levels: list[int] = []
-    s._memguard = lambda: guard
-    s._memguard_ceiling = lambda: CEILING
-    s._memguard_check_generation_merge = lambda guard, ceiling: False
-    s._memguard_rows = lambda: []
-
-    def make_room(extra, ceiling, max_level):
-        levels.append(max_level)
-        return True
-
-    s._memguard_make_room = make_room
-    s._memguard_plan_dispatch([])
-    return levels
-
-
-def test_room_for_the_step_term_never_takes_the_decoding_heads(cpu):
-    """The per-step term (not known to be rigid: MLX throttles at its
-    limit) is made room for from what nobody uses; a KV growth from the
-    ONE policy's last level."""
-    from rapid_mlx.memory_guard import EVICT_HEAD, EVICT_NEEDED
-
-    guard = _guard()
-    guard.decode_step_bytes_per_context = (PEAK - FOOTPRINT) / CONTEXT
-    s = _scheduler("none", max_k=0, lookup=None)
-    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT)
-    assert _plan_decode_only(s, guard) == [EVICT_HEAD]
-    _decoding(s, capacity=CONTEXT, idx=CONTEXT, context=CONTEXT)
-    assert _plan_decode_only(s, guard) == [EVICT_NEEDED]
-
-
-def _measured_step(s: Scheduler, guard: MemoryGuard, monkeypatch, *, stores, uids):
-    """One decode step's peak record: Gabee's numbers, a store or not in its
-    window, the generation rows at its end."""
-    s._memory_guard = guard
-    s._memguard_ceiling = lambda: CEILING
-    s._memguard_step_pending = True
-    s._memguard_step_info = None
-    s._memguard_window_stores = stores
-    s._memguard_decode_probe = (FOOTPRINT, CONTEXT, 1, 0, (7,), CONTEXT + 200)
-    s._memguard_generation_uids = lambda: uids
-    s._memguard_decode_capacity = lambda: CONTEXT + 200
-    s._kv_footprint_fn = lambda: _kv
-    monkeypatch.setattr(mx, "get_peak_memory", lambda: PEAK)
-    s._memguard_step_peak_record()
-
-
-@pytest.mark.parametrize(
-    ("stores", "uids", "learns"),
-    [(0, (7,), True), (1, (7,), False), (0, (7, 9), False), (0, (), False)],
-    ids=["decode-only", "a-store-in-the-window", "a-row-joined", "the-row-finished"],
-)
-def test_only_the_decode_step_itself_teaches(monkeypatch, stores, uids, learns):
-    """A store's copy, a joiner's merge or a finished row's extracted cache
-    in the same peak window is not the decode step's."""
-    guard = _guard()
-    s = _scheduler("none", max_k=0, lookup=None)
-    _measured_step(s, guard, monkeypatch, stores=stores, uids=uids)
-    assert (guard.decode_step_raises == 1) is learns
+    if arm == "gabee":
+        # RC6's plain window is 18,008; the cost occupies nbytes of KV
+        lost = nbytes / (kv_fn(1000) / 1000)
+        assert min(windows) >= 18_008 - 1.1 * lost, (windows, lost)
+        assert len(history) >= 20, len(history)
