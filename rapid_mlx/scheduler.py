@@ -449,6 +449,75 @@ def _exact_data_layers(caches: Any) -> list[Any]:
     return out
 
 
+def _recurrent_state_bytes_per_row(caches: Any) -> int:
+    """One copy of every recurrent (ArraysCache) layer's state -- the conv
+    state and the SSM state -- per batch row, from the live arrays."""
+    from mlx_lm.models.cache import ArraysCache
+
+    total = 0
+    for c in caches or ():
+        sub = getattr(c, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            total += _recurrent_state_bytes_per_row(sub)
+            continue
+        if not isinstance(c, ArraysCache):
+            continue
+        arrays = [a for a in getattr(c, "cache", None) or () if a is not None]
+        rows = max((int(a.shape[0]) for a in arrays if a.ndim), default=1) or 1
+        total += sum(int(a.nbytes) for a in arrays) // rows
+    return total
+
+
+def _held_rollback_bytes(caches: Any) -> int:
+    """Bytes the recurrent layers' restore points of the previous verify
+    round still hold."""
+
+    def size(value: Any) -> int:
+        if isinstance(value, (list, tuple)):
+            return sum(size(v) for v in value)
+        return int(getattr(value, "nbytes", 0) or 0)
+
+    total = 0
+    for c in caches or ():
+        sub = getattr(c, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            total += _held_rollback_bytes(sub)
+        elif getattr(c, "rollback_state", None) is not None:
+            total += size(c.rollback_state)
+    return total
+
+
+def _model_recurrent_state_bytes(model: Any) -> int:
+    """One restore point of every linear-attention layer of the loaded
+    model, per row: heads x v_dim x k_dim in the recurrent state's dtype
+    (mlx-lm's gated_delta keeps it in float32) plus the conv slice in the
+    layer's own activation dtype."""
+    import mlx.core as mx
+
+    total = 0
+    try:
+        modules = model.named_modules() if model is not None else ()
+    except Exception:  # noqa: BLE001
+        return 0
+    for _name, m in modules:
+        if not all(
+            hasattr(m, a)
+            for a in ("num_v_heads", "head_v_dim", "head_k_dim", "conv_dim")
+        ):
+            continue
+        act = getattr(getattr(m, "norm", None), "weight", None)
+        itemsize = act.dtype.size if act is not None else mx.float32.size
+        kernel = int(getattr(m, "conv_kernel_size", 1) or 1)
+        total += (
+            int(m.num_v_heads)
+            * int(m.head_v_dim)
+            * int(m.head_k_dim)
+            * int(mx.float32.size)
+            + (kernel - 1) * int(m.conv_dim) * itemsize
+        )
+    return total
+
+
 def _mark_handed_over(caches: Any) -> None:
     """Flag a loan whose prefix entries were evicted as the sole owner of its
     buffers: the singleton admission skips its copy-on-admit. Only layer
@@ -6534,6 +6603,12 @@ class Scheduler:
         chosen = getattr(config, "adaptive_prefill_min_chunk_size", default_floor)
         floor = kv_growth_step() if chosen == default_floor else max(1, int(chosen))
         guard = MemoryGuard(self._memguard_prior(), floor_tokens=floor)
+        try:
+            guard.decode_verify_bytes_per_row = self._memguard_verify_bytes_per_row(
+                self._memguard_decode_write_rows()
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[memory_guard] MTP verify cost unavailable", exc_info=True)
         mac = getattr(self, "memory_aware_cache", None)
         if mac is not None:
             guard.configured_prefix_budget = self._memguard_operator_budget(mac)
@@ -6748,11 +6823,6 @@ class Scheduler:
         if getattr(self, "_memory_guard", None) is None or request is None:
             return {}
         self._memguard_line_activity(request)
-        # A store copies KV inside this step's peak window: the window then
-        # says nothing about the decode step alone (observe_decode).
-        self._memguard_window_stores = (
-            int(getattr(self, "_memguard_window_stores", 0) or 0) + 1
-        )
         return {"owner": self._memguard_line(request)}
 
     def _memguard_line_activity(self, request: Any) -> None:
@@ -7433,31 +7503,14 @@ class Scheduler:
             if self._memguard_check_generation_merge(guard, ceiling):
                 continue
             # The decoding rows run first in this next(); at a step where
-            # their KV grows it holds the measured growth layers of the
-            # context beyond the footprint, and every decode step its
-            # measured per-step term. Charged in the same plan.
+            # their KV grows it holds ~2 layers of the context beyond the
+            # footprint (DECODE_GROWTH_LAYERS). Charged in the same plan.
             decode = self._memguard_decode_growth(guard)
             self._memguard_last_decode_growth = decode
             rows = self._memguard_rows()
             if not rows:
                 if decode > 0:
-                    # A KV growth is rigid: room up to the ONE policy's last
-                    # level. The measured per-step term alone is not known to
-                    # be (MLX throttles in-flight buffers at its memory limit,
-                    # Gabee 2026-10-15): room from what nobody is using, never
-                    # the decoding session's own head -- a 100 s re-prefill
-                    # of its next turn for a transient MLX can wait out. The
-                    # window and every admission include it either way.
-                    self._memguard_room_for_decode(
-                        guard,
-                        decode,
-                        ceiling,
-                        max_level=(
-                            EVICT_NEEDED
-                            if getattr(self, "_memguard_last_decode_grows", False)
-                            else EVICT_HEAD
-                        ),
-                    )
+                    self._memguard_room_for_decode(guard, decode, ceiling)
                 return None, refusals
             if self._memguard_admit_handoffs(guard, ceiling, rows):
                 continue
@@ -7659,6 +7712,7 @@ class Scheduler:
         from mlx_lm.models.cache import RotatingKVCache
 
         writes = self._memguard_decode_write_rows()
+        guard.decode_verify_bytes_per_row = self._memguard_verify_bytes_per_row(writes)
         growing = False
         for layer in _exact_data_layers(getattr(gen, "prompt_cache", None)):
             if isinstance(layer, RotatingKVCache) or type(layer).__name__.startswith(
@@ -7676,12 +7730,14 @@ class Scheduler:
                 continue
             growing = idx + writes > int(shape[2])
             break
-        self._memguard_last_decode_grows = growing
         lengths = self._memguard_generation_lengths()
         if not lengths:
             return 0
         if not growing:
-            return guard.decode_step(max(lengths), batch=len(lengths))
+            # An MTP verify's restore points, less those of the previous
+            # round still held (the verify drops them as it writes its own).
+            held = _held_rollback_bytes(getattr(gen, "prompt_cache", None))
+            return max(0, guard.decode_verify(batch=len(lengths)) - held)
         return guard.decode_growth(
             max(lengths), batch=len(lengths), kv_footprint=self._kv_footprint_fn()
         )
@@ -7714,13 +7770,42 @@ class Scheduler:
             break
         return depth + 1
 
+    def _memguard_verify_bytes_per_row(self, writes: int) -> int:
+        """Bytes per decoding row an MTP verify of ``writes`` rows keeps until
+        its round ends: ``writes - 1`` restore points (the recurrent state
+        and the conv slice) of every linear-attention layer, which the wide
+        verify holds when the model supports it
+        (``mtp_wide_verify_rollback_supported``; cache_patch.py). 0
+        otherwise."""
+        if writes <= 1 or getattr(self.config, "spec_decode", "none") != "mtp":
+            return 0
+        model = getattr(self, "model", None)
+        if not any(
+            getattr(m, "mtp_wide_verify_rollback_supported", False)
+            for m in (model, getattr(model, "language_model", None))
+            if m is not None
+        ):
+            return 0
+        return (writes - 1) * self._memguard_recurrent_state_bytes_per_row()
+
+    def _memguard_recurrent_state_bytes_per_row(self) -> int:
+        """One restore point of every linear-attention layer, per decoding
+        row: the recurrent state (heads x v_dim x k_dim, in the state dtype)
+        plus the conv slice (kernel - 1 positions of the conv channels, in
+        the activation dtype). From the live decoding cache when there is
+        one (exact), else from the loaded model's layers; memoized as the
+        largest seen."""
+        best = int(getattr(self, "_memguard_state_bytes_per_row", 0) or 0)
+        gen = getattr(self.batch_generator, "_generation_batch", None)
+        live = _recurrent_state_bytes_per_row(getattr(gen, "prompt_cache", None))
+        if live <= 0 and best <= 0:
+            live = _model_recurrent_state_bytes(getattr(self, "model", None))
+        best = max(best, live)
+        self._memguard_state_bytes_per_row = best
+        return best
+
     def _memguard_room_for_decode(
-        self,
-        guard: MemoryGuard,
-        decode: int,
-        ceiling: int,
-        *,
-        max_level: int = EVICT_NEEDED,
+        self, guard: MemoryGuard, decode: int, ceiling: int
     ) -> None:
         """A decode-only step whose KV grows: footprint + growth + margin
         under the ceiling, in the one order -- clear the allocator cache,
@@ -7728,12 +7813,9 @@ class Scheduler:
         row is never aborted, so if even that does not fit it decodes
         anyway, counted and logged (the window and every admission include
         the growth, so this is a defect signal, not a path)."""
-        if self._memguard_make_room(decode, ceiling, max_level):
+        if self._memguard_make_room(decode, ceiling, EVICT_NEEDED):
             return
         guard.counts["decode_over_ceiling"] += 1
-        count = guard.counts["decode_over_ceiling"]
-        if count & (count - 1):
-            return  # logged at 1, 2, 4, 8, ...: every decode step would spam
         logger.warning(
             "[memory_guard] decode KV growth %.2fGB: footprint %.2fGB + growth "
             "+ margin exceeds the ceiling %.2fGB with nothing left to evict; "
@@ -7742,33 +7824,6 @@ class Scheduler:
             self._metal_footprint_bytes() / 1e9,
             ceiling / 1e9,
         )
-
-    def _memguard_decode_capacity(self) -> int | None:
-        """The KV buffer capacity of the decoding batch's first growing
-        (full-attention, non-rotating) layer: a change across a step means
-        the step grew the KV."""
-        gen = getattr(self.batch_generator, "_generation_batch", None)
-        if gen is None:
-            return None
-        from mlx_lm.models.cache import RotatingKVCache
-
-        for layer in _exact_data_layers(getattr(gen, "prompt_cache", None)):
-            if isinstance(layer, RotatingKVCache) or type(layer).__name__.startswith(
-                "BatchRotating"
-            ):
-                continue
-            shape = getattr(getattr(layer, "keys", None), "shape", None)
-            if shape and len(shape) >= 3:
-                return int(shape[2])
-        return None
-
-    def _memguard_generation_uids(self) -> tuple[Any, ...]:
-        """The uids in mlx-lm's generation (decode) batch, in order."""
-        gen = getattr(self.batch_generator, "_generation_batch", None)
-        try:
-            return tuple(getattr(gen, "uids", None) or ())
-        except TypeError:
-            return ()
 
     def _memguard_generation_lengths(self) -> list[int]:
         """Context length of every row in mlx-lm's generation (decode) batch."""
@@ -7850,7 +7905,7 @@ class Scheduler:
             return False
         joined = [len(r.prompt_token_ids or ()) for r in joiners]
         # The merged batch must also be able to decode: its first KV growth
-        # holds the measured growth layers of every (padded) row.
+        # holds ~2 layers of every (padded) row.
         extra = self._memguard_merge_bytes(
             gen_lengths, joined, kv_fn
         ) + guard.decode_growth(
@@ -8209,7 +8264,6 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             pass
         self._memguard_step_acc = 0
-        self._memguard_window_stores = 0
 
     def _memguard_step_describe(self, plan: GuardPlan | None = None) -> None:
         """A dispatched step's kind, shape and PLANNED bytes, so a step over
@@ -8229,32 +8283,17 @@ class Scheduler:
                 kind = "prefill"
             else:
                 kind = "decode"
-            if growth and getattr(self, "_memguard_last_decode_grows", False):
+            if growth:
                 kind += " + KV growth"
-            self._memguard_decode_probe = None
             if plan is not None:
                 planned = plan.footprint + plan.projected_transient
                 shape = f"{plan.shape.batch}x{plan.shape.chunk}x{plan.shape.context}"
             else:
                 planned = self._metal_footprint_bytes() + growth
                 shape = f"decode B={gen_rows}"
-                lengths = self._memguard_generation_lengths()
-                if gen_rows and not prompt_rows and lengths:
-                    # What this decode step is measured against
-                    # (observe_decode): active before it, its context and
-                    # rows, and the bytes its plan charged.
-                    self._memguard_decode_probe = (
-                        self._current_metal_active_bytes(),
-                        max(lengths),
-                        len(lengths),
-                        growth,
-                        self._memguard_generation_uids(),
-                        self._memguard_decode_capacity(),
-                    )
             self._memguard_step_info = (kind, shape, planned, prompt_rows, gen_rows)
         except Exception:  # noqa: BLE001
             self._memguard_step_info = None
-            self._memguard_decode_probe = None
         self._memguard_step_pending = True
 
     def _memguard_step_peak_record(self) -> None:
@@ -8276,27 +8315,6 @@ class Scheduler:
             self._memguard_step_acc = 0
             over_before = guard.steps_over_ceiling
             guard.record_step_peak(peak, ceiling)
-            probe = getattr(self, "_memguard_decode_probe", None)
-            self._memguard_decode_probe = None
-            if (
-                probe is not None
-                and not getattr(self, "_memguard_window_stores", 0)
-                # The same rows before and after: a row that joined (the
-                # promotion / merge copy, planned by the join check) or
-                # finished (its extracted cache) is not the decode step.
-                and probe[4] == self._memguard_generation_uids()
-            ):
-                active_before, context, rows, planned_extra, _uids, capacity = probe
-                guard.observe_decode(
-                    peak - active_before,
-                    context=context,
-                    batch=rows,
-                    planned=planned_extra,
-                    ceiling=ceiling,
-                    peak=peak,
-                    grew=self._memguard_decode_capacity() != capacity,
-                    kv_footprint=self._kv_footprint_fn(),
-                )
             if guard.steps_over_ceiling > over_before:
                 info = getattr(self, "_memguard_step_info", None) or (
                     "unknown",

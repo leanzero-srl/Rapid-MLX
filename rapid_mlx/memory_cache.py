@@ -1778,12 +1778,47 @@ def own_cache_bytes(cache: list[Any]) -> list[Any]:
     """
     import mlx.core as mx
 
-    owned: list[Any] = []
+    kv: list[Any] = []
+    rest: list[Any] = []
+    kv_layers: list[Any] = []
     for layer in cache:
-        _own_layer(layer, owned)
-    if owned:
-        mx.eval(owned)
+        if _is_kv_layer(layer):
+            _own_layer(layer, kv)
+            kv_layers.append(layer)
+        else:
+            _own_layer(layer, rest)
+    start = int(mx.get_active_memory())
+    if kv:
+        mx.eval(kv)
+    copied = int(mx.get_active_memory()) - start
+    if kv and copied < sum(int(a.nbytes) for a in kv):
+        # ``mx.contiguous`` returns an array that already is one whole
+        # contiguous buffer WITHOUT copying it (mlx 0.32.2: 0 bytes for a
+        # full-length slice, a copy for a partial one). A live cache with
+        # no slack beyond its offset would therefore SHARE its K/V buffers
+        # with this entry, and the bytes the entry is charged for -- the
+        # bytes the store's room check made room for -- would be allocated
+        # at the live cache's next in-place write: the first decode step
+        # after the store, which nothing plans (the 1/100 sim: +60.5 MB at
+        # 7,100 tokens against 17.2 MB planned, every turn; RC6's slack hid
+        # it until a planned fixed MTP verify cost used the slack and the
+        # step crossed the ceiling). Copy them here, where they were
+        # planned.
+        for layer in kv_layers:
+            layer.keys = mx.array(layer.keys)
+            layer.values = mx.array(layer.values)
+        mx.eval([a for layer in kv_layers for a in (layer.keys, layer.values)])
+    if rest:
+        mx.eval(rest)
     return cache
+
+
+def _is_kv_layer(layer: Any) -> bool:
+    import mlx.core as mx
+
+    return isinstance(getattr(layer, "keys", None), mx.array) and isinstance(
+        getattr(layer, "values", None), mx.array
+    )
 
 
 def hand_over_cache_bytes(cache: list[Any]) -> list[Any]:
