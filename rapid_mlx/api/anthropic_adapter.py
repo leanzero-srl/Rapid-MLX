@@ -775,12 +775,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     # Content is a list of blocks
     messages = []
     text_parts = []
+    thinking_parts = []
     tool_calls_for_assistant = []
     tool_results = []
 
     for block in msg.content:
         if block.type == "text":
             text_parts.append(block.text or "")
+
+        elif block.type == "thinking" and isinstance(block.thinking, str):
+            # Echoed assistant thinking: the template renders it inside the
+            # history row's <think> block (Qwen3.8 preserve_thinking).
+            thinking_parts.append(block.thinking)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -822,18 +828,24 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     # Build the messages
     if msg.role == "assistant":
         combined_text = "\n".join(text_parts) if text_parts else None
+        reasoning = "\n".join(thinking_parts) if thinking_parts else None
         if tool_calls_for_assistant:
             messages.append(
                 Message(
                     role="assistant",
                     content=combined_text or "",
                     tool_calls=tool_calls_for_assistant,
+                    reasoning_content=reasoning,
                 )
             )
-        elif combined_text is not None:
-            messages.append(Message(role="assistant", content=combined_text))
         else:
-            messages.append(Message(role="assistant", content=""))
+            messages.append(
+                Message(
+                    role="assistant",
+                    content=combined_text or "",
+                    reasoning_content=reasoning,
+                )
+            )
     elif msg.role == "user":
         # User messages: collect text parts, then add tool results separately
         if text_parts:

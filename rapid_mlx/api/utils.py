@@ -1903,6 +1903,7 @@ def extract_multimodal_content(
     processed_messages = []
     images = []
     videos = []
+    history_reasoning: dict[int, str] = {}
 
     for msg in messages:
         # Handle both dict and Pydantic model messages
@@ -1912,6 +1913,13 @@ def extract_multimodal_content(
         else:
             role = msg.role
             content = msg.content
+
+        if role == "assistant":
+            reasoning = _history_reasoning(msg)
+            if reasoning is not None:
+                # Every branch below appends this message's row at the
+                # current end, so this is the row's index.
+                history_reasoning[len(processed_messages)] = reasoning
 
         # Handle tool response messages (role="tool")
         if role == "tool":
@@ -2075,4 +2083,20 @@ def extract_multimodal_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content)})
 
+    for index, reasoning in history_reasoning.items():
+        processed_messages[index]["reasoning_content"] = reasoning
+
     return processed_messages, images, videos
+
+
+def _history_reasoning(msg) -> str | None:
+    """The reasoning a client sent back on an assistant history row.
+
+    ``reasoning_content`` (DeepSeek / vLLM / goose) wins over ``reasoning``
+    (LiteLLM / OpenRouter). Only a string counts; anything else is absent.
+    """
+    for field in ("reasoning_content", "reasoning"):
+        value = msg.get(field) if isinstance(msg, dict) else getattr(msg, field, None)
+        if isinstance(value, str):
+            return value
+    return None
