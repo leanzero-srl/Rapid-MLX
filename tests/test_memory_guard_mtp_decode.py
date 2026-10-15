@@ -328,3 +328,77 @@ def test_an_mtp_like_decode_takes_no_protective_action_on_128_gb(llama, monkeypa
     assert guard.steps_over_ceiling == 0
     assert not _actions(guard), _actions(guard)
     assert guard.decode_step_raises == 0
+
+
+def test_a_learned_step_term_is_planned_on_every_decode_step(cpu, monkeypatch):
+    """Not only at growth: the term every decode step pays is charged on a
+    step that does not grow the KV."""
+    guard = _guard()
+    guard.decode_step_bytes_per_context = (PEAK - FOOTPRINT) / CONTEXT
+    s = _scheduler("none", max_k=0, lookup=None)
+    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT)
+    assert s._memguard_decode_growth(guard) == guard.decode_step(CONTEXT)
+    assert s._memguard_last_decode_grows is False
+
+
+def _plan_decode_only(s: Scheduler, guard: MemoryGuard) -> list[int]:
+    """Run the dispatch plan of a decode-only step; the eviction levels the
+    room was made from."""
+    levels: list[int] = []
+    s._memguard = lambda: guard
+    s._memguard_ceiling = lambda: CEILING
+    s._memguard_check_generation_merge = lambda guard, ceiling: False
+    s._memguard_rows = lambda: []
+
+    def make_room(extra, ceiling, max_level):
+        levels.append(max_level)
+        return True
+
+    s._memguard_make_room = make_room
+    s._memguard_plan_dispatch([])
+    return levels
+
+
+def test_room_for_the_step_term_never_takes_the_decoding_heads(cpu):
+    """The per-step term (not known to be rigid: MLX throttles at its
+    limit) is made room for from what nobody uses; a KV growth from the
+    ONE policy's last level."""
+    from rapid_mlx.memory_guard import EVICT_HEAD, EVICT_NEEDED
+
+    guard = _guard()
+    guard.decode_step_bytes_per_context = (PEAK - FOOTPRINT) / CONTEXT
+    s = _scheduler("none", max_k=0, lookup=None)
+    _decoding(s, capacity=CONTEXT + 200, idx=CONTEXT, context=CONTEXT)
+    assert _plan_decode_only(s, guard) == [EVICT_HEAD]
+    _decoding(s, capacity=CONTEXT, idx=CONTEXT, context=CONTEXT)
+    assert _plan_decode_only(s, guard) == [EVICT_NEEDED]
+
+
+def _measured_step(s: Scheduler, guard: MemoryGuard, monkeypatch, *, stores, uids):
+    """One decode step's peak record: Gabee's numbers, a store or not in its
+    window, the generation rows at its end."""
+    s._memory_guard = guard
+    s._memguard_ceiling = lambda: CEILING
+    s._memguard_step_pending = True
+    s._memguard_step_info = None
+    s._memguard_window_stores = stores
+    s._memguard_decode_probe = (FOOTPRINT, CONTEXT, 1, 0, (7,), CONTEXT + 200)
+    s._memguard_generation_uids = lambda: uids
+    s._memguard_decode_capacity = lambda: CONTEXT + 200
+    s._kv_footprint_fn = lambda: _kv
+    monkeypatch.setattr(mx, "get_peak_memory", lambda: PEAK)
+    s._memguard_step_peak_record()
+
+
+@pytest.mark.parametrize(
+    ("stores", "uids", "learns"),
+    [(0, (7,), True), (1, (7,), False), (0, (7, 9), False), (0, (), False)],
+    ids=["decode-only", "a-store-in-the-window", "a-row-joined", "the-row-finished"],
+)
+def test_only_the_decode_step_itself_teaches(monkeypatch, stores, uids, learns):
+    """A store's copy, a joiner's merge or a finished row's extracted cache
+    in the same peak window is not the decode step's."""
+    guard = _guard()
+    s = _scheduler("none", max_k=0, lookup=None)
+    _measured_step(s, guard, monkeypatch, stores=stores, uids=uids)
+    assert (guard.decode_step_raises == 1) is learns
