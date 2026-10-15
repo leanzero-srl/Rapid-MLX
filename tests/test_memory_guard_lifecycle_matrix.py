@@ -609,6 +609,44 @@ def sc_user_types_in_an_older_window(w, header, end):
     w.flush(header)
 
 
+def sc_main_on_its_subagent_beside_a_left_window(w, header, order):
+    """Review 11: an older window X of ANOTHER kind runs tool rounds after
+    main hands off to its subagent, then stops, and the user opens a new
+    window of X's kind -- X is released. Main ran after nothing of X's: it
+    is waiting on its OWN subagent (a conversation of a third kind that began
+    after main's hand-off), so the chain release (a pending conversation goes
+    with the older one that outlived it) must not take it. ``order``: the
+    subagent starts right after main's hand-off (goose), or only after the
+    user opened the new window."""
+    w.chat("X", size=1500, header=header, kind=OTHER)
+    w.turn("X", outcome="tool_calls")
+    w.chat("main", size=2500, header=header)
+    w.turn("main", outcome="tool_calls")  # hands off to its subagent
+    before = len(w.convs["main"].tokens)
+    w.chat("sub", size=800, header=header, kind=SUBAGENT)
+    if order == "subagent-first":
+        w.turn("sub", add=1500, outcome="tool_calls")
+    for _t in range(2):
+        w.turn("X", user=False, add=600, outcome="tool_calls")
+    w.turn("X", user=False, add=200, outcome="stop")
+    w.chat("Y", size=600, header=header, kind=OTHER, seed=71)
+    w.turn("Y", add=200, outcome="stop")
+    w.evictable("X", "left for Y")
+    for j in range(4):
+        last = j == 3
+        w.turn(
+            "sub",
+            user=j == 0 and order != "subagent-first",
+            add=1500,
+            outcome="stop" if last else "tool_calls",
+        )
+        if not last:
+            w.protected("main", "waiting on its own subagent")
+    cached, length = w.turn("main", user=False, outcome="stop")
+    assert _hit(cached, length, before), (cached, before)
+    w.flush(header)
+
+
 def sc_two_chats_alternating(w, header, end):
     """The user alternates between two chats: each one being used is
     protected and hits; the other is evictable under duress only."""
@@ -723,6 +761,15 @@ for header in (True, False):
     SCENARIOS.append(
         (f"olderwindow-{tag}", sc_user_types_in_an_older_window, header, "stop")
     )
+    for order in ("subagent-first", "window-first"):
+        SCENARIOS.append(
+            (
+                f"mainsubleft-{order}-{tag}",
+                sc_main_on_its_subagent_beside_a_left_window,
+                header,
+                order,
+            )
+        )
     for kind in ("same", "other"):
         SCENARIOS.append(
             (f"youngerwaits-{kind}-{tag}", sc_younger_waits_on_its_tool, header, kind)

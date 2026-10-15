@@ -6739,7 +6739,12 @@ class Scheduler:
           that ran after it (its main) was itself released or forgotten (all
           its entries evicted: a tombstone of it is kept while it matters):
           a subagent that ended on a tool call (goose's turn limit, a
-          sub-recipe's final_output) whose main the user left.
+          sub-recipe's final_output) whose main the user left -- unless a
+          conversation of a third kind began after its last request (its
+          own subagent, still at work). Trade-off, wire-identical to the
+          left-mid-tool-call case: a SIBLING of another kind waiting on its
+          own long tool (no subagent) goes with an older window the user
+          left.
 
         A conversation's user turns are its OWN frames' (a helper call ends
         in a user message too). Inside one session, a one-shot frame (a
@@ -6765,9 +6770,11 @@ class Scheduler:
         kept = self.__dict__.get("_memguard_turn_boundaries", {})
         # A conversation whose every entry was evicted (and that has no
         # request) is forgotten -- but a lightweight tombstone of it stays
-        # while a pending conversation it outlived could still need it as
-        # the parent that released it (review 10: under duress main's record
-        # vanished with its entries and its finished subagent stayed NEEDED).
+        # while it can still be the evidence that releases another one (it
+        # acted after that one): under duress the witness's entries go first
+        # (review 10: main's record vanished with its entries and its
+        # finished subagent stayed NEEDED; review 11: the new window that
+        # released a left one was evicted, and the left one was held again).
         forgotten = self.__dict__.setdefault("_memguard_forgotten", {})
         dropped: dict[Any, list[dict]] = {}
         for owner in [k for k in lines if k not in present]:
@@ -6782,6 +6789,7 @@ class Scheduler:
             forgotten[line] = {
                 "first": min(r["first"] for r in records),
                 "last": max(r["last"] for r in records),
+                "turn": max(r["turn"] for r in convo),
                 "continues": any(r["continues"] for r in records),
                 "kinds": {r["kind"] for r in convo if r["kind"] is not None},
             }
@@ -6805,11 +6813,15 @@ class Scheduler:
                 "kinds": {r["kind"] for r in convo if r["kind"] is not None},
                 "continues": any(r["continues"] for _o, r in members),
             }
+        for line in state:
+            forgotten.pop(line, None)  # active again
         gone: set[Any] = set()
         for line, st in state.items():
             if line in live:
                 continue
-            others = [(o, ost) for o, ost in state.items() if o != line]
+            others = [
+                (o, ost) for o, ost in [*state.items(), *forgotten.items()] if o != line
+            ]
             if any(
                 ost["first"] < st["first"]
                 and ost["last"] > st["last"]
@@ -6844,8 +6856,6 @@ class Scheduler:
                 for _o, ost in others
             ):
                 gone.add(line)
-        for line in state:
-            forgotten.pop(line, None)  # active again
         # Chain: a PENDING conversation of another kind that an older,
         # continuing conversation outlived (a subagent that ended on a tool
         # call -- goose's turn limit, a sub-recipe's final_output -- whose
@@ -6865,18 +6875,27 @@ class Scheduler:
                     and ost["last"] > st["last"]
                     and ost["continues"]
                     and not ost["kinds"] & st["kinds"]
+                    # ... unless a conversation of a THIRD kind began after
+                    # this one's last request: its own subagent, still at
+                    # work (review 11: main re-prefilled 0 of 2,952 when an
+                    # older window of another kind was left meanwhile)
+                    and not any(
+                        child != line
+                        and child != other
+                        and cst["first"] > st["last"]
+                        and cst["kinds"]
+                        and not cst["kinds"] & st["kinds"]
+                        and not cst["kinds"] & ost["kinds"]
+                        for child, cst in state.items()
+                    )
                     for other, ost in parents
                 ):
                     gone.add(line)
                     changed = True
-        # A tombstone is kept while a pending conversation it outlived still
-        # exists (released or not: the release is recomputed every time).
+        # A tombstone is kept while it acted after some conversation still
+        # held (released or not: every release is recomputed each time).
         for line in list(forgotten):
-            t = forgotten[line]
-            if not any(
-                st["pending"] and t["first"] < st["first"] and t["last"] > st["last"]
-                for st in state.values()
-            ):
+            if not any(st["last"] < forgotten[line]["last"] for st in state.values()):
                 forgotten.pop(line, None)
         outlived = {owner for owner in lines if owner[0] in gone}
         for line, members in by_line.items():
