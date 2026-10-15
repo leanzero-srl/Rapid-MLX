@@ -390,3 +390,23 @@ def test_a_fixed_verify_cost_is_planned_without_a_crossing(llama, monkeypatch, a
         lost = nbytes / (kv_fn(1000) / 1000)
         assert min(windows) >= 18_008 - 1.1 * lost, (windows, lost)
         assert len(history) >= 20, len(history)
+
+
+def test_the_scheduler_reads_the_restore_point_from_the_live_cache(cpu):
+    """With a decoding cache, its own arrays decide (exact for the loaded
+    weights and dtypes); the model's layers are the fallback before one."""
+    from mlx_lm.models.cache import ArraysCache
+
+    s = _scheduler(max_k=3, model=_model_27b(lookup=None))
+    layer = ArraysCache(size=2)
+    layer[0] = mx.zeros((1, KERNEL - 1, 64), mx.bfloat16)
+    layer[1] = mx.zeros((1, 4, 16, 16), mx.float32)
+    s.batch_generator = SimpleNamespace(
+        _generation_batch=_Batch(uids=[7], prompt_cache=[layer])
+    )
+    live = (KERNEL - 1) * 64 * 2 + 4 * 16 * 16 * 4
+    assert s._memguard_recurrent_state_bytes_per_row() == live
+    fresh = _scheduler(max_k=3, model=_model_27b(lookup=None))
+    assert fresh._memguard_recurrent_state_bytes_per_row() == (
+        _model_recurrent_state_bytes(_model_27b())
+    )
