@@ -971,10 +971,13 @@ class MemoryGuard:
         ceiling: int,
         probe: GuardProbe,
         extra_bytes: int = 0,
+        decoding: int = 0,
     ) -> GuardPlan:
         """``extra_bytes``: allocated in the same ``next()`` outside the
         prefill projection (the decoding rows' KV growth): charged like the
-        admission copy, and never fitted."""
+        admission copy, and never fitted. ``decoding``: rows decoding beside
+        the prompt rows -- another request in the step, so a prompt row can
+        be deferred before any conversation's newest entry is touched."""
         self.counts["checks"] += 1
         self.last_ceiling = ceiling
         caps = [r.chunk_cap for r in rows if r.chunk_cap > 0]
@@ -1037,7 +1040,11 @@ class MemoryGuard:
             ok, shape, transient, margin = fits(chunk, fp)
 
         active_rows = [r for r in rows if r.segment > 0]
-        concurrent = len(active_rows) > 1
+        # A prompt row beside another prompt row OR beside a decoding row
+        # (review of f1fe5b3be: a side request prefilling while the main
+        # decodes counted as alone, and the main's newest entry went before
+        # the side was deferred).
+        concurrent = len(active_rows) + (1 if decoding > 0 else 0) > 1
 
         def evict(max_level: int) -> None:
             nonlocal fp, ok, shape, transient, margin, evicted

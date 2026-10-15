@@ -7753,13 +7753,29 @@ class Scheduler:
                 getattr(self.batch_generator, "prefill_step_size", 0)
                 or getattr(self.config, "prefill_step_size", 2048)
             )
+            decoding = len(self._memguard_generation_lengths())
+            knob = self._memguard_verify_rows_range() if decoding else None
+            narrowed = knob is not None and not self._memguard_fits_as_is(
+                guard, rows, configured, ceiling, decode
+            )
+            if narrowed:
+                # The full-width verify would cost an action beyond the
+                # allocator cache (a smaller chunk, an eviction, a deferral):
+                # plan the step at the NARROWEST verify, then widen it into
+                # whatever room the plan leaves (review of f1fe5b3be: mixed
+                # steps charged 4.77 GB and took the main's newest entry).
+                decode = self._memguard_decode_growth(guard, writes=knob[0])
+                self._memguard_last_decode_growth = decode
             plan = guard.plan(
                 rows,
                 configured_chunk=configured,
                 ceiling=ceiling,
                 probe=probe,
                 extra_bytes=decode,
+                decoding=decoding,
             )
+            if plan.refuse is None and narrowed:
+                self._memguard_widen_beside(guard, plan, ceiling, knob, decode)
             if plan.refuse is None:
                 self._memguard_set_chunk(plan.chunk)
                 return plan, refusals
@@ -7806,6 +7822,7 @@ class Scheduler:
                 ceiling=ceiling,
                 probe=self._memguard_probe(),
                 extra_bytes=self._memguard_decode_growth(guard),
+                decoding=len(self._memguard_generation_lengths()),
             )
             if plan.refuse is None:
                 self._memguard_set_chunk(plan.chunk)
@@ -8096,6 +8113,69 @@ class Scheduler:
             self._metal_footprint_bytes() / 1e9,
             ceiling / 1e9,
         )
+
+    def _memguard_fits_as_is(
+        self,
+        guard: MemoryGuard,
+        rows: list[RowPlan],
+        configured: int,
+        ceiling: int,
+        extra: int,
+    ) -> bool:
+        """Whether the step fits at the configured chunk with ``extra`` bytes
+        beside it, giving back at most the allocator cache (no eviction, no
+        smaller chunk, no deferral)."""
+        caps = [r.chunk_cap for r in rows if r.chunk_cap > 0]
+        chunk = max(1, min([int(configured), *caps]))
+        admit = sum(max(0, int(r.admit_bytes)) for r in rows if r.segment > 0)
+        transient = guard.plan_transient(
+            step_shape(rows, chunk), admit_bytes=admit + max(0, int(extra))
+        )
+        footprint = self._current_metal_active_bytes() + self._memguard_shared_pending()
+        return footprint + transient + guard.margin(transient, ceiling) <= ceiling
+
+    def _memguard_widen_beside(
+        self,
+        guard: MemoryGuard,
+        plan: GuardPlan,
+        ceiling: int,
+        knob: tuple[int, int],
+        floor_extra: int,
+    ) -> None:
+        """After a mixed step was planned at the narrowest verify: the widest
+        verify that still fits beside the planned prefill (its chunk is
+        kept). Sets the cap (None at full width)."""
+        floor, widest = knob
+        base = int(plan.projected_transient) - int(floor_extra)
+
+        def fits(rows_: int) -> bool:
+            transient = base + self._memguard_decode_growth(guard, writes=rows_)
+            return plan.footprint + transient + guard.margin(transient, ceiling) <= ceiling
+
+        lo, hi = floor, widest
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        extra = self._memguard_decode_growth(guard, writes=lo)
+        self._memguard_last_decode_growth = extra
+        plan.projected_transient = base + extra
+        plan.margin = guard.margin(plan.projected_transient, ceiling)
+        if lo < widest:
+            guard.counts["verify_narrowed"] += 1
+            self._memguard_set_verify_cap(lo)
+            if getattr(self, "_memguard_last_verify_cap", None) != lo:
+                logger.warning(
+                    "[memory_guard] MTP verify narrowed to %d of %d rows beside a "
+                    "prefill (instead of a smaller chunk or an eviction)",
+                    lo,
+                    widest,
+                )
+        else:
+            self._memguard_set_verify_cap(None)
+        self._memguard_last_verify_cap = lo if lo < widest else None
 
     def _memguard_narrow_verify(
         self, guard: MemoryGuard, ceiling: int, knob: tuple[int, int]

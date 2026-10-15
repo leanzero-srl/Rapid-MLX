@@ -439,3 +439,101 @@ def test_a_join_defers_before_a_needed_entry_that_frees_less(cpu):
 
 def test_the_batch_helper_is_the_decoding_one():
     assert _Batch(uids=[1]).__len__() == 1
+
+
+# -- a side request prefilling while the main decodes (review of f1fe5b3be) --
+
+
+def _mixed(ceiling: int, live: int):
+    """The control state plus a 20k side request mid-prefill (admitted
+    before the pressure arrived, as goose's subagents are) while the main
+    decodes with MTP."""
+    from tests.test_memory_guard_mtp_decode import _Batch
+
+    s = _scheduler(ceiling, live=live)
+    main = _entry(s, list(range(BOUNDARY)), ENTRY)
+    side = Request(
+        request_id="side",
+        prompt="ignored",
+        prompt_token_ids=[10**6 + i for i in range(20_000)],
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    side.arrival_time = 2.0
+    s.running["main"].arrival_time = 1.0
+    s.running["side"] = side
+    s.requests["side"] = side
+    main_request = s._memguard_request_for_uid(7)
+    s._memguard_request_for_uid = lambda uid: side if uid == 8 else main_request
+    s._memguard_idle_base_bytes = LIVE - KV_95K - int(1.9 * GB)  # the weights
+    bg = s.batch_generator
+    bg._prompt_batch = _Batch(uids=[8], tokens=[[0] * 4096])
+    bg._currently_processing = [([list(range(16_000))], 4096)]
+    bg.prefill_batch_size = 1
+    bg.prefill_step_size = 2048
+    bg._unprocessed_sequences = []
+    deferred: list[str] = []
+
+    def defer(row, plan, others):
+        deferred.append(row.request_id)
+        s.running.pop(row.request_id, None)
+        bg._prompt_batch = _Batch(uids=[], tokens=[])
+        bg._currently_processing = []
+
+    s._memguard_defer = defer
+    return s, main, deferred
+
+
+@pytest.mark.parametrize("extra_gb", [0, 1, 2, 3])
+def test_a_side_prefill_beside_the_decoding_main_never_costs_its_entry(cpu, extra_gb):
+    """The verify narrows and the side keeps a real chunk; where even that
+    does not fit, the side is deferred. The main's 95,813 entry stays."""
+    s, main, deferred = _mixed(CEILING, LIVE + extra_gb * GB)
+    s._memguard_plan_dispatch([])
+    counts = s._memguard().counts
+    bg = s.batch_generator
+    assert main in s.memory_aware_cache._entries
+    assert counts["newest_evictions"] == 0
+    if deferred:
+        assert deferred == ["side"]
+    else:
+        assert counts["verify_narrowed"] == 1
+        assert 4 <= bg._lz_verify_rows_cap < 32
+        assert bg.prefill_step_size > 256
+    if extra_gb == 0:
+        assert not deferred and bg.prefill_step_size >= 1900
+
+
+def test_the_side_prefill_on_128_gb_takes_no_action(cpu):
+    s, main, deferred = _mixed(BIG_CEILING, LIVE)
+    s._memguard_plan_dispatch([])
+    counts = s._memguard().counts
+    assert not deferred and main in s.memory_aware_cache._entries
+    assert getattr(s.batch_generator, "_lz_verify_rows_cap", None) is None
+    assert s.batch_generator.prefill_step_size == 2048
+    assert counts["verify_narrowed"] == 0 and counts["chunks_reduced"] == 0
+
+
+def test_when_even_the_main_alone_cannot_keep_it_the_side_goes_first(cpu):
+    """+4 GB: 42.88 GB + the 6.72 GB entry leave no room for even the 4-row
+    verify of the main ALONE. The side is deferred first; only then, the
+    main's newest entry is the last resort (its bytes are real)."""
+    s, main, deferred = _mixed(CEILING, LIVE + 4 * GB)
+    order: list[str] = []
+    real_defer = s._memguard_defer
+
+    def defer(row, plan, others):
+        order.append("defer")
+        real_defer(row, plan, others)
+
+    s._memguard_defer = defer
+    real_evict = s.memory_aware_cache._evict_lru
+
+    def evict():
+        order.append("evict")
+        return real_evict()
+
+    s.memory_aware_cache._evict_lru = evict
+    s._memguard_plan_dispatch([])
+    assert deferred == ["side"]
+    assert order == ["defer", "evict"]
+    assert s._memguard().counts["newest_evictions"] == 1
