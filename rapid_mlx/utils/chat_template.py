@@ -2402,9 +2402,10 @@ def apply_chat_template(
     that afterwards gives Qwen3.5-style templates a stable rendering for
     tool-loop assistant rows (see ``_retain_tool_loop_think_blocks``).
     """
-    if any(_is_bare_tool_call_row(m) for m in messages) and (
-        _template_puts_narration_before_calls(template_applicator)
-    ):
+    if any(
+        _is_narration_row(a) and _is_bare_tool_call_row(b)
+        for a, b in zip(messages, messages[1:])
+    ) and _template_puts_narration_before_calls(template_applicator):
         messages = _join_split_assistant_turns(messages)
     prompt = _render_chat_template(
         template_applicator,
