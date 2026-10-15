@@ -288,3 +288,49 @@ def test_tombstones_stay_bounded_beside_a_released_line_that_stays():
         assert a in s._memguard_outlived_lines()
         recorded = len({o[0] for o in s._memguard_lines})
         assert len(s._memguard_forgotten) <= 3 * recorded, i
+
+
+def test_a_returning_conversation_turn_counts_from_its_first_request():
+    """Main R hands off to subagent L (another kind), which ends on a tool
+    call; R is forgotten. The user comes back to R and types: R's FIRST
+    request after the return continues R (no predecessor to continue yet),
+    so its user turn releases L at once, not one request later."""
+    s = _sched()
+    r = _line(s, (("session", "R"), KA), KA, 1, 2, 1)
+    sub = _line(s, (("session", "L"), KB), KB, 3, 5, 3, outcome="tool_calls")
+    assert sub not in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{r}"]  # R forgotten
+    assert sub not in s._memguard_outlived_lines()
+    _line(s, r, KA, 7, 7, 7, continues=False)  # back to R: first request
+    assert sub in s._memguard_outlived_lines()
+
+
+def test_an_older_window_of_the_builds_kind_comes_back():
+    """Review 10's shape across a forgetting: a build X waits on its tool;
+    the older window R of its own kind was forgotten; the user goes back to
+    R and types. R is older than X -- not a new window the user left X for
+    -- so X stays held."""
+    s = _sched()
+    r = _line(s, (("session", "R"), KA), KA, 1, 3, 3)
+    x = _line(s, (("session", "X"), KA), KA, 4, 6, 4, outcome="tool_calls")
+    assert x not in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{r}"]  # R forgotten
+    assert x not in s._memguard_outlived_lines()
+    _line(s, r, KA, 7, 7, 7, continues=False)  # back to R: the user types
+    assert x not in s._memguard_outlived_lines()
+    # control: a NEW window of its kind is the user leaving X
+    _line(s, (("session", "N"), KA), KA, 8, 9, 9)
+    assert x in s._memguard_outlived_lines()
+
+
+def test_a_forgotten_main_keeps_releasing_its_finished_subagent():
+    """A subagent that finished (its last request a reply) is released by
+    its main, which ran after it; main is then forgotten. Main's tombstone
+    is needed under rule 1 only -- and it is kept, call after call."""
+    s = _sched()
+    _line(s, M, KA, 1, 5, 1)  # main took the result after the subagent's end
+    sub = _line(s, S, KB, 2, 3, 2)
+    assert sub in s._memguard_outlived_lines()
+    del s.memory_aware_cache._entries[f"e{M}"]
+    for i in range(3):
+        assert sub in s._memguard_outlived_lines(), i

@@ -411,6 +411,25 @@ def _memguard_w_chain(ost: dict, st: dict) -> bool:
     return st["pending"] and _memguard_older(ost, st) and not ost["kinds"] & st["kinds"]
 
 
+def _memguard_w_age(ost: dict, st: dict) -> bool:
+    """``ost``'s AGE holds the PENDING ``st``: an older conversation that comes
+    back. Older, its user turn releases ``st`` only if it is of another kind
+    (rule 1); if it came back as a new conversation, one of the same kind
+    would release ``st`` instead (it began after ``st``: the user left it) --
+    review 10's build waiting on its tool while the user types in an older
+    window of its own kind."""
+    return st["pending"] and ost["first"] < st["first"]
+
+
+# Every way a tombstone can be needed by a recorded conversation.
+_MEMGUARD_TOMBSTONE_RULES = (
+    _memguard_w_outlived,
+    _memguard_w_left,
+    _memguard_w_chain,
+    _memguard_w_age,
+)
+
+
 def _memguard_named_line(line: Any) -> bool:
     """A conversation line the client named (goose's agent-session-id): the
     only kind whose diverged heads are certainly its own dead branches."""
@@ -6945,31 +6964,32 @@ class Scheduler:
         # itself (review 13: rule 1 released the subagent through the older
         # window, main's tombstone was dropped as undeciding, and when that
         # window came back nothing released the subagent). A tombstone is
-        # kept while it WITNESSES some recorded conversation under ANY rule.
-        # A conversation's own state changes only when it acts, and then it
-        # has acted after every tombstone, so one that witnesses nothing now
-        # never will (review 12: one stale held line no longer keeps every
-        # later tombstone -- they witness nothing for it).
+        # kept while some recorded conversation NEEDS it: it witnesses that
+        # one's release under ANY rule, or its AGE holds that one (see
+        # _memguard_w_age). A conversation's own state changes only when it
+        # acts, and then it has acted after every tombstone, so a tombstone
+        # needed by nothing now is needed by nothing later (review 12: one
+        # stale held line no longer keeps every later tombstone).
         #
-        # Bound, relative to what is recorded: the latest witness of every
-        # (conversation, rule) is always kept; all of them while the
-        # tombstones number no more than the recorded conversations, past
-        # that the most recent ones.
+        # Bound, relative to what is recorded: the latest needed tombstone
+        # of every (conversation, rule) is always kept; all of them while
+        # they number no more than the recorded conversations, past that the
+        # most recent ones.
         must: set[Any] = set()
-        witnesses: set[Any] = set()
+        needed: set[Any] = set()
         for _line, st in state.items():
-            for rule in (_memguard_w_outlived, _memguard_w_left, _memguard_w_chain):
+            for rule in _MEMGUARD_TOMBSTONE_RULES:
                 best = None
                 for tomb, tst in forgotten.items():
                     if rule(tst, st):
-                        witnesses.add(tomb)
+                        needed.add(tomb)
                         if best is None or tst["last"] > forgotten[best]["last"]:
                             best = tomb
                 if best is not None:
                     must.add(best)
         spare = max(0, len(state) - len(must))
         keep = must | set(
-            sorted(witnesses - must, key=lambda t: forgotten[t]["last"], reverse=True)[
+            sorted(needed - must, key=lambda t: forgotten[t]["last"], reverse=True)[
                 :spare
             ]
         )
