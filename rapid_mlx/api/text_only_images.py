@@ -241,10 +241,13 @@ def replace_images_in_openai_messages(messages: list) -> int:
 
 
 def replace_images_in_responses_input(responses_request) -> int:
-    """Swap ``input_image`` entries inside ``function_call_output`` lists.
+    """Swap ``input_image`` entries inside ``function_call_output`` outputs.
 
-    The adapter JSON-encodes a list output into the tool message verbatim, so
-    an image there would reach a text-only prompt as a base64 blob. Message
+    The adapter JSON-encodes a list OR dict output into the tool message
+    verbatim, so an image there would reach a text-only prompt as a base64
+    blob. A list keeps its other entries and gets a notice entry in place of
+    each image; a dict that IS an image becomes the plain notice string (a
+    string output renders as-is, with no JSON wrapper). Message
     items need no handling here: their ``input_image`` parts become
     ``image_url`` parts on the converted chat request, which
     :func:`replace_images_in_openai_messages` covers.
@@ -257,6 +260,11 @@ def replace_images_in_responses_input(responses_request) -> int:
         if getattr(item, "type", None) != "function_call_output":
             continue
         output = getattr(item, "output", None)
+        if isinstance(output, dict):
+            if output.get("type") in IMAGE_CONTENT_TYPES:
+                item.output = text_only_image_notice(_openai_image_facts(output))
+                replaced += 1
+            continue
         if not isinstance(output, list):
             continue
         new_output = None

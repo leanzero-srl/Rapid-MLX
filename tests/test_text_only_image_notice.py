@@ -333,6 +333,30 @@ def test_chat_same_request_renders_identically_for_the_prefix_cache():
     assert engine.prompts[0] == engine.prompts[1]
 
 
+def test_next_turn_repeating_the_image_keeps_the_rendered_prefix():
+    """Turn 2 replays turn 1's history (image included) and appends the
+    model's answer plus a new user message. The rendered turn-1 prompt, minus
+    its trailing generation prompt, must be a prefix of turn 2's, so the
+    prefix cache hits on everything before the new turn."""
+    engine = _TextOnlyEngine()
+    client = _client(engine)
+    turn1 = _goose_read_image_request()
+    assert client.post("/v1/chat/completions", json=turn1).status_code == 200
+    turn2 = json.loads(json.dumps(turn1))
+    turn2["messages"] += [
+        {"role": "assistant", "content": "I cannot see the image."},
+        {"role": "user", "content": "Then read the DOM instead."},
+    ]
+    assert client.post("/v1/chat/completions", json=turn2).status_code == 200
+    first, second = engine.prompts
+    generation_prompt = "<|im_start|>assistant\n"
+    assert first.endswith(generation_prompt + "<think>\n\n</think>\n\n")
+    history = first[: first.rindex(generation_prompt)]
+    assert _NOTICE_PNG in history
+    assert second.startswith(history)
+    assert text_only_image_stats() == {"images_replaced": 4, "requests": 2}
+
+
 def test_status_reports_the_counter():
     engine = _TextOnlyEngine()
     client = _client(engine)
@@ -419,6 +443,63 @@ def test_responses_function_call_output_image_becomes_notice_not_base64():
     assert "Read /tmp/shot.png." in prompt
     assert "[image not shown: this model is serving text-only" in prompt
     assert text_only_image_stats() == {"images_replaced": 1, "requests": 1}
+
+
+def test_responses_function_call_output_dict_image_becomes_notice_not_base64():
+    """``output`` may be a single dict (``str | dict | list``); the adapter
+    JSON-encodes it verbatim, so an image dict would land as base64."""
+    engine = _TextOnlyEngine()
+    resp = _client(engine).post(
+        "/v1/responses",
+        json=_responses_body(
+            [
+                {"type": "message", "role": "user", "content": "Check the UI."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_image",
+                    "arguments": '{"path": "/tmp/shot.png"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": {"type": "input_image", "image_url": _PNG_DATA_URL},
+                },
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    prompt = engine.prompts[-1]
+    assert _PNG_B64[:40] not in prompt
+    tool_block = prompt.split("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
+    assert tool_block.strip() == _NOTICE_PNG
+    assert text_only_image_stats() == {"images_replaced": 1, "requests": 1}
+
+
+def test_responses_function_call_output_non_image_dict_untouched():
+    engine = _TextOnlyEngine()
+    resp = _client(engine).post(
+        "/v1/responses",
+        json=_responses_body(
+            [
+                {"type": "message", "role": "user", "content": "Run it."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "run",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": {"exit_code": 0, "stdout": "ok"},
+                },
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    assert '"exit_code": 0' in engine.prompts[-1]
+    assert text_only_image_stats() == {"images_replaced": 0, "requests": 0}
 
 
 def test_responses_reject_policy_keeps_the_400():
@@ -696,3 +777,24 @@ def test_dflash_server_says_the_image_was_not_shown(policy):
         # part reaches the renderer, which drops it with a WARN log.
         assert parts[1]["type"] == "image_url"
         assert text_only_image_stats()["images_replaced"] == 0
+
+
+def test_dflash_render_joins_text_and_notice_with_a_newline(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import mlx_vlm.prompt_utils
+
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.api.text_only_images import replace_images_in_openai_messages
+    from rapid_mlx.speculative.dflash.server import _render_prompt
+
+    seen: list = []
+    monkeypatch.setattr(
+        mlx_vlm.prompt_utils,
+        "apply_chat_template",
+        lambda processor, config, messages, **kw: seen.append(messages) or "p",
+    )
+    request = ChatCompletionRequest(**_chat_image_request())
+    assert replace_images_in_openai_messages(request.messages) == 1
+    _render_prompt(MagicMock(), MagicMock(), request)
+    assert seen[0][0]["content"] == "what does the screenshot show?\n" + _NOTICE_PNG
