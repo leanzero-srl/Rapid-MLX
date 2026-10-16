@@ -33,7 +33,6 @@ swap-out counter. At 1/100 of the bytes like the session tests.
 
 from __future__ import annotations
 
-import mlx.core as mx
 import pytest
 
 import rapid_mlx.memory_budget as memory_budget
@@ -76,7 +75,9 @@ class _Machine:
         device._machine = self
 
     def engine(self) -> int:
-        return self.device.active() + mx.get_cache_memory()
+        # what the engine holds as the scheduler measures it (active +
+        # allocator cache), so the others are exactly ``others``
+        return self.device.active() + self.device.scheduler._current_metal_cache_bytes()
 
     def settle(self, engine: int | None = None) -> None:
         engine = self.engine() if engine is None else engine
@@ -245,3 +246,29 @@ def test_a_budget_shrink_evicts_in_the_guards_order(llama, monkeypatch):
     assert newest_main in mac._entries
     assert len(mac._entries) < before
     assert scheduler._memguard().counts["busy_machine_evictions"] >= 1
+
+
+def test_a_budget_shrink_takes_the_guards_order_not_lru(llama, monkeypatch):
+    """The machine leaves the engine just enough for what it holds (no
+    give-back is due) but the prefix budget derived from it is below the
+    cached bytes: the shrink evicts in the guard's order. The conversation's
+    newest entry -- here the least recently used -- stays; the cache's own
+    LRU would have taken it first."""
+    scheduler, device, machine, _misses = _ladder(llama, monkeypatch, 50 * MB, turns=6)
+    mac = scheduler.memory_aware_cache
+    newest_main = max(
+        (k for k, e in mac._entries.items() if e.owner and "main" in str(e.owner)),
+        key=len,
+    )
+    with mac._lock:
+        for key in [k for k in mac._entries if k != newest_main]:
+            mac._entries.move_to_end(key)  # main's newest is now the LRU head
+    assert next(iter(mac._entries)) == newest_main
+    footprint = scheduler._metal_footprint_bytes()
+    reserve = int(memory_budget.SYSTEM_RESERVE_RATIO * MACHINE_128)
+    machine.others = MACHINE_128 - reserve - int(footprint * 1.01)
+    scheduler._memguard_others_read = None
+    budget_before = scheduler._memguard().effective_prefix_budget
+    scheduler.evict_prefix_cache_under_pressure()
+    assert scheduler._memguard().effective_prefix_budget < budget_before
+    assert newest_main in mac._entries
