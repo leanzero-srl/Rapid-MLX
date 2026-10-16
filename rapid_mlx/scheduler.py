@@ -12469,10 +12469,16 @@ class Scheduler:
             del self.request_id_to_uid[request_id]
         elif boundary_kept and request.prompt_cache:
             # Parked (SRPF) past its boundary: the cache it holds is its own
-            # (an extracted copy nobody else references).
+            # (an extracted copy nobody else references). A REQUEUED request
+            # holds a loan of its kept ``prompt[:held]`` entry instead (a
+            # deepcopy shares the buffers), so its cut is a copy.
             parked, request.prompt_cache = request.prompt_cache, None
             try:
-                self._memguard_hand_over_boundary(request, parked, solo=True)
+                self._memguard_hand_over_boundary(
+                    request,
+                    parked,
+                    solo=bool(getattr(request, "_srpf_parked", False)),
+                )
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[memory_guard] boundary handoff of a parked cache failed",
