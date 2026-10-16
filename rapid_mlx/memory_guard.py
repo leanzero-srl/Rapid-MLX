@@ -783,6 +783,9 @@ class MemoryGuard:
             # Evictions of a conversation's newest entry (EVICT_LAST): the
             # last resort, after every cheaper action.
             "newest_evictions": 0,
+            # Skipped stores that left their conversation with NO entry for
+            # its next turn (nothing cheaper could give the room). Loud.
+            "orphaned_store_skips": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
