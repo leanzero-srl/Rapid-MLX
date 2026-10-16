@@ -100,11 +100,7 @@ def _scheduler(resident_extra: int = 0):
     base = int(38.40 * MB) + resident_extra  # weights + the main's live row
 
     def active() -> int:
-        return base + sum(
-            int(e.memory_bytes)
-            for k, e in mac._entries.items()
-            if k[:3] != tuple(range(3))  # the main's new entry: checked separately
-        )
+        return base + sum(int(e.memory_bytes) for e in mac._entries.values())
 
     s._current_metal_active_bytes = active
     s._current_metal_cache_bytes = lambda: 0
@@ -272,3 +268,58 @@ def test_a_prefilling_row_reserves_its_own_narrowest_verify(cpu):
     assert s._memguard_own_decode_floor(main) == 3 * 153_944_064
     s.config.spec_decode = "none"
     assert s._memguard_own_decode_floor(main) == 0
+
+
+# -- review of 9fb9fd9fc ------------------------------------------------------
+
+
+def test_a_hybrid_turn_end_store_never_evicts_its_own_resume_point(cpu):
+    """At a hybrid turn end (a side request still running, so the store
+    needs the full entry), this turn's message-boundary entry is a prefix of
+    the prompt and SHORTER than prompt + output -- "cheaper" by length -- but
+    it is the only entry the next prompt can fully hit (the reply is
+    re-rendered). It never gives way to the prompt+output entry."""
+    # 6.47 MB short: the two cheaper side entries (2.46 MB) cannot make the
+    # room alone; the old rule took the 6.50 MB boundary entry too.
+    s, snapshot, side_boundary, older_side, helper = _trace()
+    main = s.running["393"]
+    # this turn's boundary entry, stored mid-prefill
+    boundary = _other(s, list(range(BOUNDARY)), int(6.50 * MB), "main")
+    entry = s.memory_aware_cache._entries[boundary]
+    entry.owner = MAIN_LINE
+    entry.message_boundary = True  # stored by the boundary snapshot path
+    main.output_token_ids = list(range(PROMPT, PROMPT + 48))
+    turn_end = [_kv(int(5.90 * MB), PROMPT + 48), _recurrent(int(0.15 * MB))]
+    tokens = len(main.prompt_token_ids) + 48
+    s._memguard_room_for_store(main, turn_end, turn_end=True, tokens=tokens)
+    assert boundary in s.memory_aware_cache._entries
+
+
+def test_the_store_reserves_a_speculative_decode_on_a_droppable_mtp_head(cpu):
+    """With a trimmable MTP-head cache the guard's floor is ONE row (plain
+    decode), and one row costs no restore points: the reservation is the
+    cheapest SPECULATIVE width (2 rows) plus the first decode's KV growth."""
+    from tests.test_memory_guard_mtp_decode import _guard, _kv, _model_27b
+
+    s = _scheduler()
+    s._memory_guard = _guard()
+    s.config.spec_decode = "mtp"
+    s.config.mtp_max_k = 3
+    s.model = _model_27b()
+    s.model.make_mtp_cache = lambda: [KVCache()]
+    s._kv_footprint_fn = lambda: _kv
+    assert s._memguard_verify_rows_range() == (1, 32)
+    main = Request(
+        request_id="393",
+        prompt="ignored",
+        prompt_token_ids=list(range(PROMPT)),
+        sampling_params=SamplingParams(max_tokens=48),
+    )
+    s.running["393"] = main
+    s.request_id_to_uid["393"] = 36
+    s.batch_generator = SimpleNamespace(_generation_batch=None)
+    guard = s._memguard()
+    growth = guard.decode_growth(PROMPT, kv_footprint=_kv) - guard.decode_verify(batch=1)
+    reserved = s._memguard_own_decode_floor(main)
+    assert reserved == growth + 153_944_064  # 2 rows: one restore point
+    assert reserved > 0

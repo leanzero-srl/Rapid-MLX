@@ -2762,3 +2762,32 @@ def test_real_metal_kernel_matches_stock_for_every_supported_threadgroup():
         else:
             supported.append(threadgroup_y)
     assert supported, "Metal rejected every fused GDN threadgroup candidate"
+
+
+def test_qwen4_restore_rollback_owns_the_kept_state_not_a_view_of_the_stack():
+    """The fused verify returns every restore point as ONE stacked array
+    (``state_snapshots[:, p]`` are views). Restoring a view kept the whole
+    stack resident and unaccounted until the next step; the kept point is
+    now an owned copy."""
+    import ctypes
+
+    import mlx.core as mx
+
+    from rapid_mlx.models.qwen4_exp_cache import Qwen4ExpStateCache
+
+    def address(a):
+        return ctypes.addressof(ctypes.c_char.from_buffer(memoryview(a)))
+
+    cache = Qwen4ExpStateCache(size=2)
+    cache[0] = mx.zeros((1, 3, 8))
+    cache[1] = mx.zeros((1, 4, 8, 8))
+    stack = mx.random.normal((1, 3, 4, 8, 8))
+    mx.eval(stack)
+    cache.record_slot_snapshots(0, [mx.zeros((1, 3, 8)) for _ in range(3)])
+    cache.record_slot_snapshots(1, [stack[:, p] for p in range(3)], finalize=True)
+    cache.restore_rollback(n_to_drop=2, verify_size=4)  # keep 2: stack[:, 1]
+    restored = cache[1]
+    start = address(stack)
+    assert not start <= address(restored) < start + stack.nbytes
+    assert mx.allclose(restored, stack[:, 1]).item()
+    assert cache.rollback_state is None

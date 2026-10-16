@@ -9580,22 +9580,33 @@ class Scheduler:
 
     def _memguard_own_decode_floor(self, request: Request) -> int:
         """Bytes ``request``'s next decode step needs beyond the footprint at
-        the narrowest verify the guard can set (KV growth, restore points),
-        when it is decoding now; 0 otherwise."""
+        the CHEAPEST SPECULATIVE verify (2 rows on MTP, else a plain 1-row
+        decode): a store reserves it, so its own session is never pushed to
+        plain decode or to evicting what was just stored. Decoding now: read
+        from the live batch (growth only when the step grows). Still
+        prefilling (a message-boundary snapshot): the KV growth step its
+        first decode takes (``BatchKVCache.merge`` sizes the buffer exactly)
+        plus the restore points. 0 for a request not in the engine."""
         guard = getattr(self, "_memory_guard", None)
         uid = self.request_id_to_uid.get(request.request_id) if guard else None
         gen = getattr(self.batch_generator, "_generation_batch", None)
         if uid is None:
             return 0
         knob = self._memguard_verify_rows_range()
+        # The cheapest SPECULATIVE width the generator can reach: 2 rows,
+        # or the chain's depth + 1 when a drafted chain cannot be cut.
+        rows = max(knob[0], min(2, knob[1])) if knob is not None else 1
         if uid not in list(getattr(gen, "uids", None) or ()):
-            # Still prefilling (a message-boundary snapshot): its decode comes
-            # next -- at least the narrowest verify's restore points.
-            return self._memguard_verify_bytes_per_row(knob[0]) if knob else 0
-        try:
-            need = self._memguard_decode_growth(
-                guard, writes=knob[0] if knob is not None else None
+            kv_fn = self._kv_footprint_fn()
+            context = len(request.prompt_token_ids or ())
+            if kv_fn is None or context <= 0:
+                return self._memguard_verify_bytes_per_row(rows)
+            growth = guard.decode_growth(context, kv_footprint=kv_fn) - guard.decode_verify(
+                batch=1
             )
+            return max(0, int(growth)) + self._memguard_verify_bytes_per_row(rows)
+        try:
+            need = self._memguard_decode_growth(guard, writes=rows)
         finally:
             self._memguard_decode_growth(guard)  # the plan's own charge back
         return max(0, int(need))
@@ -9712,8 +9723,24 @@ class Scheduler:
             # the main 567 s per turn, every turn after). Entries that cost
             # less to re-prefill give way -- another conversation's, or this
             # one's own older ones (this entry supersedes them).
+            # A non-trimmable (hybrid) conversation resumes ONLY from an
+            # entry stored at an exact boundary of its own prompt (the next
+            # prompt re-renders the reply, so a prompt+output entry is never
+            # fully hit): those resume points never give way to it.
+            # (_memguard_supersede and the ranking keep them for the same
+            # reason.)
+            own_resume_points = (
+                request.prompt_token_ids
+                if request is not None and _cache_has_non_trimmable(cache)
+                else None
+            )
+
             def cheaper(key: tuple) -> bool:
-                return key in mac._entries and len(key) < tokens  # noqa: SLF001
+                if key not in mac._entries or len(key) >= tokens:  # noqa: SLF001
+                    return False
+                return own_resume_points is None or not self._memguard_is_prefix(
+                    key, own_resume_points
+                )
 
             with mac._lock:  # noqa: SLF001
                 ranked = self._memguard_ranked_entries(storing, finished, line)
