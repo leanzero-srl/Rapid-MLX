@@ -605,3 +605,24 @@ def test_rc8_an_error_abort_releases_the_kept_state_and_counts_the_orphan(cpu):
     s._recover_from_generation_error()
     assert main._memguard_boundary_state is None
     assert s._memguard().counts["orphaned_store_skips"] == 1
+
+
+def test_the_orphan_check_ignores_entries_past_the_message_boundary(cpu):
+    """Directly: a skipped store, then only the 120,601-token prompt entry
+    left -- longer than the 120,588-token boundary, so not a resume point
+    for a re-rendered next prompt: orphaned. A boundary entry: not."""
+    s, main = _rc8()
+    main._memguard_store_skipped = True
+    prompt_entry = [_recurrent()] + [_kv_rows(RC8_PROMPT)]
+    assert s.memory_aware_cache.store(
+        list(range(RC8_PROMPT)), prompt_entry, evict_prefixes=False
+    )
+    s._memguard_note_orphaned_turn(main)
+    assert s._memguard().counts["orphaned_store_skips"] == 1
+    main._memguard_store_skipped = True
+    boundary_entry = [_recurrent()] + [_kv_rows(RC8_BOUNDARY)]
+    assert s.memory_aware_cache.store(
+        list(range(RC8_BOUNDARY)), boundary_entry, evict_prefixes=False
+    )
+    s._memguard_note_orphaned_turn(main)
+    assert s._memguard().counts["orphaned_store_skips"] == 1
