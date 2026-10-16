@@ -302,9 +302,10 @@ def system_memory_pressure() -> int:
 
 # LeanZero memory guard: the share of the machine's RAM kept FREE for
 # everything that is not the engine (other apps, other engines, the OS's own
-# file cache). The engine's planning ceiling is what the machine leaves it:
-# physical RAM - what the other processes use now - this reserve. A ratio of
-# physical RAM, the same headroom auto mode charges on top of the weights.
+# file cache). The engine's OPTIONAL memory (its prefix cache, copies of
+# entries) stays under physical RAM - what the other processes use - this
+# reserve. A ratio of physical RAM, the headroom auto mode charges on top of
+# the weights.
 SYSTEM_RESERVE_RATIO = _AUTO_HEADROOM_FRACTION
 
 
@@ -328,17 +329,81 @@ def _sysctl_int(name: bytes, ctype_name: str = "c_int") -> int | None:
         return None
 
 
-def system_memory_free_fraction() -> float | None:
-    """The share of the machine's RAM free or reclaimable now, as the
-    kernel measures it (``kern.memorystatus_level``: what ``memory_pressure``
-    prints as "System-wide memory free percentage"). ``None`` when
-    unavailable (not Darwin). Finer than the pressure LEVEL, which stayed at
-    1 (normal) on a 128 GB laptop at 5% free with 46.8 GB of swap in use
-    (RC10 ladder, 2026-10-16)."""
-    level = _sysctl_int(b"kern.memorystatus_level")
-    if level is None or not 0 <= level <= 100:
+class MachineMemory:
+    """One reading of the machine's memory (``host_statistics64``)."""
+
+    __slots__ = ("used", "swapouts")
+
+    def __init__(self, used: int, swapouts: int):
+        self.used = int(used)  # resident bytes in use, Activity Monitor's
+        self.swapouts = int(swapouts)  # pages swapped out since boot
+
+
+_VM_STATISTICS64 = None
+
+
+def system_memory_used() -> MachineMemory | None:
+    """The machine's resident memory in use, as Activity Monitor's "Memory
+    Used": wired + internal (anonymous) - purgeable + compressor pages
+    (``host_statistics64(HOST_VM_INFO64)``), plus the swap-out counter.
+    ``None`` when unavailable (not Darwin).
+
+    NOT ``kern.memorystatus_level``: that "free percentage" counts anonymous
+    and swapped-out pages as available -- on the 128 GB laptop it read 75%
+    free (~34 GB used) while ``top`` said 99 GB used with 27 GB in swap, and
+    an engine buffer the GPU wires or unwires moved it by 5 points (review of
+    c976b2a3a). Wired + anonymous stays put across a wire/unwire (+-0.15 GB).
+    Pages already swapped out are not resident and do not count here either:
+    the guard's reference therefore never falls while the machine swaps
+    (``Scheduler._memguard_others_ref``)."""
+    try:
+        import ctypes
+        import ctypes.util
+        import sys
+
+        if sys.platform != "darwin":
+            return None
+        global _LIBC, _VM_STATISTICS64
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+        if _VM_STATISTICS64 is None:
+            u32, u64 = ctypes.c_uint32, ctypes.c_uint64
+
+            class _VM(ctypes.Structure):  # <mach/vm_statistics.h>
+                _fields_ = [
+                    ("free_count", u32), ("active_count", u32),
+                    ("inactive_count", u32), ("wire_count", u32),
+                    ("zero_fill_count", u64), ("reactivations", u64),
+                    ("pageins", u64), ("pageouts", u64), ("faults", u64),
+                    ("cow_faults", u64), ("lookups", u64), ("hits", u64),
+                    ("purges", u64), ("purgeable_count", u32),
+                    ("speculative_count", u32), ("decompressions", u64),
+                    ("compressions", u64), ("swapins", u64), ("swapouts", u64),
+                    ("compressor_page_count", u32), ("throttled_count", u32),
+                    ("external_page_count", u32), ("internal_page_count", u32),
+                    ("total_uncompressed_pages_in_compressor", u64),
+                ]
+
+            _LIBC.mach_host_self.restype = ctypes.c_uint32
+            _VM_STATISTICS64 = _VM
+        vm = _VM_STATISTICS64()
+        count = ctypes.c_uint32(ctypes.sizeof(vm) // 4)
+        if _LIBC.host_statistics64(
+            _LIBC.mach_host_self(), 4, ctypes.byref(vm), ctypes.byref(count)
+        ):
+            return None
+        page = _sysctl_int(b"hw.pagesize", "c_uint64") or 0
+        if page <= 0:
+            return None
+        pages = (
+            vm.wire_count
+            + vm.internal_page_count
+            - vm.purgeable_count
+            + vm.compressor_page_count
+        )
+        return MachineMemory(max(0, pages) * page, vm.swapouts)
+    except Exception:  # noqa: BLE001
         return None
-    return level / 100.0
 
 
 def system_physical_memory() -> int:
