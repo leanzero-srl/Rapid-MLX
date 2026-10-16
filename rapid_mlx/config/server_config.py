@@ -210,6 +210,12 @@ class ServerConfig:
     # ``anthropic_adapter._relocate_mid_system_enabled`` for the trade.
     relocate_mid_conversation_system: bool = False
 
+    # What a text-only engine does with an image content part (LeanZero
+    # fork). ``notice`` swaps it for a text part saying the image could not
+    # be viewed, so an agent's turn goes through; ``reject`` is the old
+    # HTTP 400 ``image_input_unsupported``. See ``api/text_only_images.py``.
+    text_only_image_policy: str = "notice"
+
     # --- Audio lane (task #292) ---
     # Operator opt-in for ``/v1/audio/*`` routes on a TEXT-only server.
     # Pre-fix the audio router was unconditionally attached even when

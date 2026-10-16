@@ -32,7 +32,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from rapid_mlx.config import reset_config
+from rapid_mlx.config import get_config, reset_config
 from rapid_mlx.engine.base import GenerationOutput
 from rapid_mlx.routes.anthropic import router as anthropic_router
 from rapid_mlx.routes.chat import router as chat_router
@@ -122,8 +122,12 @@ def _reset():
 
 
 def test_anthropic_text_only_model_rejects_image_block():
-    """The bug repro: text-only model + image block => HTTP 400, not 200."""
+    """The bug repro: text-only model + image block => HTTP 400, not 200.
+
+    Policy ``reject`` (the default is ``notice``, which swaps the image for
+    a text notice; see tests/test_text_only_image_notice.py)."""
     client = _make_client(_TextOnlyEngine())
+    get_config().text_only_image_policy = "reject"  # pin the pre-notice 400
     resp = client.post(
         "/v1/messages",
         json={
@@ -284,8 +288,9 @@ def test_anthropic_text_only_model_accepts_string_content():
 def test_openai_text_only_model_rejects_image_url_block():
     """The pre-existing OpenAI-side guard must keep rejecting image_url
     on text-only models. Pinned here so a refactor that drops it lights
-    up alongside the new Anthropic test."""
+    up alongside the new Anthropic test. Policy ``reject``."""
     client = _make_client(_TextOnlyEngine(), include_anthropic=False)
+    get_config().text_only_image_policy = "reject"  # pin the pre-notice 400
     resp = client.post(
         "/v1/chat/completions",
         json={

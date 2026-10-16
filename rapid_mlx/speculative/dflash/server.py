@@ -861,6 +861,20 @@ def _build_app(
     ):
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        # LeanZero fork: this server never sees images (``_render_prompt``
+        # drops non-text parts). On policy ``notice`` say so in the prompt
+        # instead of dropping the image without the model knowing.
+        from rapid_mlx.api.text_only_images import (
+            record_text_only_image_replacements,
+            replace_images_in_openai_messages,
+            text_only_image_policy,
+        )
+
+        if text_only_image_policy() == "notice":
+            record_text_only_image_replacements(
+                replace_images_in_openai_messages(request.messages),
+                route=f"/v1/chat/completions ({backend_name})",
+            )
         if validate_request_fn is not None:
             validate_request_fn(request)
         if request.n is not None and request.n > 1:

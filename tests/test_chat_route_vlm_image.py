@@ -36,7 +36,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from rapid_mlx.config import reset_config
+from rapid_mlx.config import get_config, reset_config
 from rapid_mlx.engine.base import GenerationOutput
 from rapid_mlx.request import ClientRequestError, InferenceAbortedError
 from rapid_mlx.routes.chat import router as chat_router
@@ -154,6 +154,7 @@ def _multipart_user_message(text: str) -> dict:
 def test_chat_route_rejects_image_on_text_lane_with_typed_reason():
     engine = _StubTextFallbackEngine()
     client = _make_client(engine)
+    get_config().text_only_image_policy = "reject"  # pin the pre-notice 400
 
     response = client.post(
         "/v1/chat/completions",

@@ -78,6 +78,11 @@ class TestTextOnlyMediaRejection:
 
     def test_image_url_rejected(self):
         client = _client()
+        # Policy ``reject``; the default ``notice`` swaps the image for a
+        # text notice (tests/test_text_only_image_notice.py).
+        from rapid_mlx.config import get_config
+
+        get_config().text_only_image_policy = "reject"
         try:
             resp = client.post(
                 "/v1/chat/completions",

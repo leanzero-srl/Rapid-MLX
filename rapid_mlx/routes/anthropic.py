@@ -26,6 +26,11 @@ from ..api.models import (
     ChatCompletionResponse,
 )
 from ..api.protocol_mapping import cancellation_error, is_cancellation_finish_reason
+from ..api.text_only_images import (
+    record_text_only_image_replacements,
+    replace_images_in_anthropic_messages,
+    should_replace_images,
+)
 from ..api.tool_calling import (
     convert_tools_for_template,
     extract_json_schema_for_guided,
@@ -699,6 +704,18 @@ async def create_anthropic_message(
         # this guard the caller sees HTTP 200 with a hallucinated answer
         # about the missing media (mirrors the OpenAI-route R9P1 fix in
         # ``routes/chat.py``: text-only models never silently drop media).
+        # LeanZero fork: with policy ``notice`` (the default) a text-only
+        # engine swaps every ``image`` block, top-level or nested in a
+        # ``tool_result``, for a text notice BEFORE the guard below, so the
+        # guard only still fires for ``document`` blocks (and for images
+        # under policy ``reject``). Same ``is_mllm`` default-True reading as
+        # the guard, so stubs without the attribute are left alone.
+        if getattr(engine, "is_mllm", True) is False and should_replace_images(engine):
+            record_text_only_image_replacements(
+                replace_images_in_anthropic_messages(anthropic_request.messages),
+                route="/v1/messages",
+            )
+
         cfg_pre = get_config()
         # ``getattr`` default-True: tests with minimal engine stubs that
         # never carry image blocks shouldn't trigger this guard, and the
@@ -1401,6 +1418,12 @@ async def count_anthropic_tokens(request: Request):
     # malformed request — same cost-estimation footgun F-160 closed
     # for empty messages.
     anthropic_request = AnthropicRequest(**_body_for_parse)
+    # LeanZero fork: count what /v1/messages will actually render. A
+    # text-only engine on policy ``notice`` turns image blocks into a text
+    # notice there, so the count includes the notice. Not recorded in the
+    # counter: nothing is generated here.
+    if getattr(engine, "is_mllm", True) is False and should_replace_images(engine):
+        replace_images_in_anthropic_messages(anthropic_request.messages)
     # Codex r2 BLOCKING #1 continued: ``AnthropicOutputConfigError``
     # is a structured ``ValueError`` subclass we map to 400 with the
     # adapter's own message — mirrors the ``/v1/messages`` route's
