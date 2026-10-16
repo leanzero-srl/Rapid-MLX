@@ -9704,7 +9704,10 @@ class Scheduler:
         if turn_end:
             guard.counts["turn_store_skips"] += 1
         orphaned = False
-        if request is not None and mac is not None:
+        if request is not None and mac is not None and _cache_has_non_trimmable(cache):
+            # Hybrid only: a non-trimmable conversation resumes from its
+            # mid-turn snapshots alone (no end-of-turn entry matches its next,
+            # re-rendered prompt); a plain KV one still stores at turn end.
             prompt = request.prompt_token_ids
             orphaned = not any(
                 self._memguard_is_prefix(k, prompt) for k in list(mac._entries)  # noqa: SLF001
