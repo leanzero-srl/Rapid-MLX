@@ -2612,6 +2612,7 @@ class MemoryAwarePrefixCache:
                             logger.warning(
                                 f"[radix] remove failed for {len(key)} tokens: {exc}"
                             )
+                    self._notify_evict(key, "prefix_evict")
                     old = self._entries.pop(key)
                     self._ledger_remove(old)
                     self._stats.evictions += 1
@@ -2739,6 +2740,23 @@ class MemoryAwarePrefixCache:
         tokens_key = next(iter(self._entries))
         self._evict_entry_locked(tokens_key, reason="lru_evict")
 
+    def _notify_evict(self, tokens_key: tuple[int, ...], reason: str) -> None:
+        """Tell the owner (the scheduler's memory guard, ``evict_hook``) an
+        entry is about to leave, with the entry still readable. Every path
+        that drops an entry calls it, except an admission handoff (the
+        entry is not lost: a request takes it over). Caller holds the lock;
+        a failing hook never blocks the eviction."""
+        hook = getattr(self, "evict_hook", None)
+        if hook is None or reason == "handoff":
+            return
+        entry = self._entries.get(tokens_key)
+        if entry is None:
+            return
+        try:
+            hook(tokens_key, entry)
+        except Exception:  # noqa: BLE001
+            logger.debug("[cache_evict] evict hook failed", exc_info=True)
+
     def _evict_entry_locked(self, tokens_key: tuple[int, ...], reason: str) -> None:
         """Evict one entry by key with full index/ledger bookkeeping.
 
@@ -2746,6 +2764,7 @@ class MemoryAwarePrefixCache:
         present. Drops the sorted-index entry first so a fetch without the
         lock can't trip the orphaned-sorted-key KeyError.
         """
+        self._notify_evict(tokens_key, reason)
         self._remove_from_sorted(tokens_key)
         if self._radix_index is not None:
             try:
@@ -2856,6 +2875,7 @@ class MemoryAwarePrefixCache:
         with self._lock:
             if tokens_key not in self._entries:
                 return False
+            self._notify_evict(tokens_key, "remove")
             self._remove_from_sorted(tokens_key)
             if self._radix_index is not None:
                 try:
