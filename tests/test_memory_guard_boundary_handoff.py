@@ -118,14 +118,14 @@ def _cached_scheduler(model, *, refuse_copies: bool):
     if hand_over is None:  # d550069a4: no turn-end handoff to observe
         return s, seen
 
-    def spy(request, kv):
+    def spy(request, kv, **kwargs):
         seen["handoffs"].append(
             {
                 "emitted": len(request.prompt_token_ids) + request.num_output_tokens,
                 "kv_offsets": [l.offset for l in kv if isinstance(l, KVCache)],
             }
         )
-        return hand_over(request, kv)
+        return hand_over(request, kv, **kwargs)
 
     s._memguard_hand_over_boundary = spy
     return s, seen
@@ -441,7 +441,10 @@ def test_rc8_a_turn_that_really_ends_with_no_entry_is_counted_then(cpu, caplog):
 def test_rc8_a_mid_prefill_skip_followed_by_a_kept_entry_is_no_orphan(cpu, caplog):
     """05:28:34 -> 05:28:39: the boundary store was skipped mid-prefill and
     the prompt entry was stored 4 s later; the warning had already said the
-    conversation keeps NO entry. Now nothing is said or counted."""
+    conversation keeps NO entry. Now nothing is said or counted -- and the
+    boundary is still handed over: a LONGER, non-trimmable prompt entry does
+    not resume a next prompt that re-renders the reply (review of a3f5247ee:
+    it cancelled the handoff, and that next turn re-prefilled 126,664)."""
     import logging
 
     s, main = _rc8()
@@ -456,8 +459,29 @@ def test_rc8_a_mid_prefill_skip_followed_by_a_kept_entry_is_no_orphan(cpu, caplo
     counts = s._memguard().counts
     assert counts["orphaned_store_skips"] == 0
     assert "keeps NO entry" not in caplog.text
-    # the prompt entry resumes the next turn already: no boundary handoff
+    assert tuple(range(RC8_BOUNDARY)) in s.memory_aware_cache._entries
+    nxt = list(range(RC8_BOUNDARY)) + [7] * (126_664 - RC8_BOUNDARY)
+    cache, remaining = s.memory_aware_cache.fetch(nxt)
+    assert cache is not None and len(remaining) == 126_664 - RC8_BOUNDARY
+
+
+def test_rc8_a_longer_prompt_entry_does_not_hide_an_orphan(cpu, caplog):
+    """The turn ends with only its prompt-end entry (the handoff did not
+    fit): that entry cannot resume a re-rendered next prompt, so the
+    conversation IS orphaned and says so."""
+    import logging
+
+    s, main = _rc8(resident=47.5)
+    _rc8_boundary(s)
+    prompt_entry = [_recurrent()] + [_kv_rows(RC8_PROMPT) for _ in range(2)]
+    assert s.memory_aware_cache.store(
+        list(range(RC8_PROMPT)), prompt_entry, evict_prefixes=False
+    )
+    with caplog.at_level(logging.WARNING):
+        _rc8_turn_end(s, main)
     assert tuple(range(RC8_BOUNDARY)) not in s.memory_aware_cache._entries
+    assert s._memguard().counts["orphaned_store_skips"] == 1
+    assert "keeps NO entry" in caplog.text
 
 
 def test_rc8_128_gb_copies_as_today(cpu):
@@ -525,3 +549,59 @@ def test_the_cut_plan_prices_a_handover_and_a_copy(cpu):
     assert Scheduler._memguard_boundary_cut((400, [kv[0], None]), kv) is None
     rotating = [kv[0], ArraysCache(size=2), kv[2]]
     assert Scheduler._memguard_boundary_cut(kept, rotating) is None
+
+
+def test_an_abort_mid_prefill_beside_other_prefilling_rows_is_planned_as_a_copy(cpu):
+    """The row's buffers are shared with the other rows of its prompt batch
+    (filter gathers them): cutting it is a COPY, not a handover."""
+    from rapid_mlx.scheduler import Scheduler
+
+    s = Scheduler.__new__(Scheduler)
+    for stage, rows, alone in ((1, 2, False), (1, 1, True), (2, 1, True), (2, 3, False)):
+        s.batch_generator = SimpleNamespace(
+            _find_uids=lambda uids, stage=stage: {uids[0]: (stage, 0)},
+            _prompt_batch=[object()] * (rows if stage == 1 else 0),
+            _generation_batch=[object()] * (rows if stage == 2 else 0),
+        )
+        assert s._memguard_row_is_alone(9) is alone, (stage, rows)
+
+
+def test_a_cancelled_parked_turn_keeps_its_boundary_too(hybrid4):
+    """A row parked by SRPF after its boundary holds its own cache on the
+    request; cancelling it then keeps the boundary from that cache."""
+    turn_1, turn_2 = _conversation()
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=True)
+    long_ = _turn("t1", turn_1, BOUNDARY_1, 4)
+    s.add_request(long_)
+    for _ in range(200):
+        s.step()
+        if getattr(long_, "_memguard_boundary_state", None) is not None:
+            break
+    assert getattr(long_, "_memguard_boundary_state", None) is not None
+    # park it: a 3-token request takes the engine at the next chunk boundary
+    s.add_request(_turn("short", [40, 41, 42], 0, 1))
+    for _ in range(50):
+        s.step()
+        if long_.request_id not in s.request_id_to_uid and long_.prompt_cache:
+            break
+    assert long_.request_id not in s.request_id_to_uid and long_.prompt_cache
+    assert s._do_abort_request_impl("t1")
+    assert BOUNDARY_1 in [len(k) for k in s.memory_aware_cache._entries]
+    while s.has_requests():
+        s.step()
+    _, tokens_2, cached_2 = _run(s, {0: [_turn("t2", turn_2, BOUNDARY_2, 8)]})
+    assert cached_2["t2"] == BOUNDARY_1
+    _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
+    assert tokens_2["t2"] == copied_2
+
+
+def test_rc8_an_error_abort_releases_the_kept_state_and_counts_the_orphan(cpu):
+    """A generation error aborts the running rows (the batch is gone, its KV
+    with it): the kept recurrent state is released at once and the
+    conversation, left with no entry, is counted."""
+    s, main = _rc8()
+    _rc8_boundary(s)
+    assert main._memguard_boundary_state is not None
+    s._recover_from_generation_error()
+    assert main._memguard_boundary_state is None
+    assert s._memguard().counts["orphaned_store_skips"] == 1

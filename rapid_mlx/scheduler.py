@@ -8610,7 +8610,9 @@ class Scheduler:
             sum(int(a.nbytes) for _l, _s, a in _layer_arrays(state)) / 1e9,
         )
 
-    def _memguard_hand_over_boundary(self, request: Request, kv: Any) -> bool:
+    def _memguard_hand_over_boundary(
+        self, request: Request, kv: Any, *, solo: bool | None = None
+    ) -> bool:
         """At a turn end: build the message-boundary entry the copy could not
         hold (:meth:`_memguard_keep_boundary_state`) from the finished row's
         own KV, and hand it over -- never two copies of the session.
@@ -8642,11 +8644,11 @@ class Scheduler:
         prompt = list(request.prompt_token_ids or ())
         if boundary > len(prompt):
             return False
-        if any(
-            len(key) >= boundary and self._memguard_is_prefix(key, prompt)
-            for key in list(mac._entries)  # noqa: SLF001
-        ):
-            return False  # a later store of this turn already resumes it
+        if tuple(prompt[:boundary]) in mac._entries:  # noqa: SLF001
+            return False  # stored meanwhile (a later copy fitted after all)
+        # A LONGER entry of this prompt (its prompt-end entry, stored when the
+        # copy did fit later) is no substitute: the next prompt re-renders
+        # the reply, and a non-trimmable entry resumes only an exact prefix.
         plan = self._memguard_boundary_cut(kept, kv)
         if plan is None:
             return False
@@ -8656,11 +8658,14 @@ class Scheduler:
             for layer, state in zip(kv, states, strict=True)
         ]
         uid = self.request_id_to_uid.get(request.request_id)
-        gen = getattr(self.batch_generator, "_generation_batch", None)
-        try:
-            solo = gen is None or len(gen) == 0
-        except TypeError:
-            solo = False
+        if solo is None:
+            # A finished row has left the generation batch: its buffers die
+            # with their copies unless other rows still decode beside it.
+            gen = getattr(self.batch_generator, "_generation_batch", None)
+            try:
+                solo = gen is None or len(gen) == 0
+            except TypeError:
+                solo = False
         for layer in cache:
             if type(layer) is KVCache:
                 layer.trim(int(layer.offset) - boundary)
@@ -9995,6 +10000,31 @@ class Scheduler:
         )
         return False
 
+    def _memguard_end_turn(self, request: Request) -> None:
+        """A request's turn is over (finished, cancelled, or aborted by an
+        error): drop the boundary state it kept and the KV it held for the
+        handoff, and count the conversation if it is left with no entry."""
+        request._memguard_turn_end_kv = None
+        request._memguard_boundary_state = None
+        self._memguard_note_orphaned_turn(request)
+
+    def _memguard_row_is_alone(self, uid: int) -> bool:
+        """``uid``'s row is the only row of the batch stage it is in (its
+        buffers die with their copies once it leaves)."""
+        bg = self.batch_generator
+        try:
+            stage, _idx = bg._find_uids([uid])[uid]  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            return False
+        batch = {
+            1: getattr(bg, "_prompt_batch", None),
+            2: getattr(bg, "_generation_batch", None),
+        }.get(stage)
+        try:
+            return batch is not None and len(batch) == 1
+        except TypeError:
+            return False
+
     def _memguard_note_orphaned_turn(self, request: Request) -> None:
         """At a turn end: a hybrid conversation that had a store skipped this
         turn and holds no entry its next prompt can resume from is counted
@@ -10012,9 +10042,20 @@ class Scheduler:
         prompt = request.prompt_token_ids or ()
         # Hybrid only (the flag is set for non-trimmable caches): it resumes
         # from an entry at an exact boundary of its own prompt alone (no
-        # end-of-turn entry matches its next, re-rendered prompt).
+        # end-of-turn entry matches its next, re-rendered prompt) -- one no
+        # longer than its message boundary, when it has one.
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        limit = boundary if boundary > 0 else len(prompt)
         kept = any(
-            self._memguard_is_prefix(k, prompt) for k in list(mac._entries)  # noqa: SLF001
+            len(k) <= limit and self._memguard_is_prefix(k, prompt)
+            for k in list(mac._entries)  # noqa: SLF001
         )
         if kept:
             return
@@ -10130,6 +10171,7 @@ class Scheduler:
                 continue
             self.performance.record_failed_performance(request)
             request.set_finished(RequestStatus.FINISHED_ABORTED)
+            self._memguard_end_turn(request)
             aborted.add(request_id)
             self.finished_req_ids.add(request_id)
             outputs.append(
@@ -12386,15 +12428,16 @@ class Scheduler:
         # Remove from running (BatchGenerator) — do this even if request
         # was already cleaned up from self.requests, because the UID may
         # still be live inside the BatchGenerator (_partial / active_batch).
+        boundary_kept = (
+            request is not None
+            and getattr(request, "_memguard_boundary_state", None) is not None
+        )
         if request_id in self.request_id_to_uid:
             was_running = True
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
-                boundary_kept = (
-                    request is not None
-                    and getattr(request, "_memguard_boundary_state", None) is not None
-                )
                 if boundary_kept:
+                    solo = self._memguard_row_is_alone(uid)
                     kept = self.batch_generator.remove(
                         [uid], return_prompt_caches=True
                     )
@@ -12409,7 +12452,9 @@ class Scheduler:
                     del kept
                     try:
                         if isinstance(payload, tuple) and payload[0]:
-                            self._memguard_hand_over_boundary(request, payload[0])
+                            self._memguard_hand_over_boundary(
+                                request, payload[0], solo=solo
+                            )
                     except Exception:  # noqa: BLE001
                         logger.debug(
                             "[memory_guard] boundary handoff on abort failed",
@@ -12422,6 +12467,18 @@ class Scheduler:
             # uid is already out of the batch via ``remove`` above).
             self._forget_uid_grammar(uid)
             del self.request_id_to_uid[request_id]
+        elif boundary_kept and request.prompt_cache:
+            # Parked (SRPF) past its boundary: the cache it holds is its own
+            # (an extracted copy nobody else references).
+            parked, request.prompt_cache = request.prompt_cache, None
+            try:
+                self._memguard_hand_over_boundary(request, parked, solo=True)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[memory_guard] boundary handoff of a parked cache failed",
+                    exc_info=True,
+                )
+            del parked
 
         if request_id in self.running:
             del self.running[request_id]
@@ -12438,9 +12495,7 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
-            request._memguard_turn_end_kv = None
-            request._memguard_boundary_state = None
-            self._memguard_note_orphaned_turn(request)
+            self._memguard_end_turn(request)
         if self.block_aware_cache is not None:
             # A cancelled request stores nothing, so nothing owns the block
             # refs its fetch hit acquired — release them here. Idempotent
@@ -14388,9 +14443,7 @@ class Scheduler:
             if request is not None:
                 request.prompt_cache = None
                 request._extracted_cache = None
-                request._memguard_turn_end_kv = None
-                request._memguard_boundary_state = None
-                self._memguard_note_orphaned_turn(request)
+                self._memguard_end_turn(request)
 
             # Remove from running
             if request_id in self.running:
@@ -14461,6 +14514,7 @@ class Scheduler:
             if request is not None:
                 self.performance.record_failed_performance(request)
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
+                self._memguard_end_turn(request)
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
