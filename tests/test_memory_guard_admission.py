@@ -94,10 +94,13 @@ def test_a_prompt_this_mac_cannot_prefill_gets_the_exact_400_body(llama):
     assert response.status_code == 400
     assert json.loads(response.body) == {
         "error": {
+            # 1.08 vs 1.06 GB: a close call, so two decimals and the
+            # shortfall (RC12: "needs 50.1 GB but this Mac can hold 50.1 GB")
             "message": (
-                f"This prompt ({prompt} tokens) needs {needed / 1e9:.1f} GB but "
-                f"this Mac can hold {CEILING / 1e9:.1f} GB; the maximum context "
-                f"here is {max_ctx} tokens."
+                f"This prompt ({prompt} tokens) needs {needed / 1e9:.2f} GB but "
+                f"this Mac can hold {CEILING / 1e9:.2f} GB "
+                f"({(needed - CEILING) / 1e6:.0f} MB short); the maximum "
+                f"context here is {max_ctx} tokens."
             ),
             "type": "invalid_request_error",
             "code": "context_length_exceeded",
