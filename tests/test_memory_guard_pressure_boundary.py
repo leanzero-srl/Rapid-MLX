@@ -393,3 +393,31 @@ def test_a_line_keeps_its_newest_boundary_and_one_fallback(hybrid4, kernel):
     assert all(len(c) <= 2 for c in counts), counts
     assert cached[1:] == [c[-1] for c in counts[:-1]], (cached, counts)
     assert s._memguard().counts["superseded"] >= 4
+
+
+def test_a_hybrid_on_a_machine_with_no_room_resumes_through_the_handover(
+    hybrid4, kernel, monkeypatch
+):
+    """The machine leaves the engine nothing for copies (101 GB of others on
+    the laptop): the boundary COPY is refused as optional memory, the row
+    keeps the recurrent state, and its turn end hands the boundary over
+    under the device ceiling. Turn 2 resumes from it, with the tokens of a
+    copied boundary."""
+    turn_1, turn_2 = _conversation()
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=False)
+    physical = 10**12
+    monkeypatch.setattr(memory_budget, "system_physical_memory", lambda: physical)
+    monkeypatch.setattr(
+        memory_budget,
+        "system_memory_used",
+        lambda: memory_budget.MachineMemory(physical, 0),  # all of it in use
+    )
+    s._memguard_others_read = None
+    assert s._memguard_cache_ceiling() == 0
+    _run(s, {0: [_turn("t1", turn_1, BOUNDARY_1, 6)]})
+    counts = s._memguard().counts
+    assert counts["boundary_states_kept"] >= 1 and counts["boundary_handoffs"] >= 1
+    _, tokens_2, cached_2 = _run(s, {0: [_turn("t2", turn_2, BOUNDARY_2, 8)]})
+    assert cached_2["t2"] == BOUNDARY_1
+    _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
+    assert tokens_2["t2"] == copied_2

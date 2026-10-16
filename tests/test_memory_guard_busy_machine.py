@@ -177,25 +177,59 @@ def test_a_big_idle_mac_keeps_the_device_ceiling(llama, monkeypatch):
     assert machine.swapouts == 0 and misses == []
 
 
-@pytest.mark.parametrize("others", [120, 160])
-def test_gabee_keeps_its_pass_beside_the_others_it_runs(llama, monkeypatch, others):
+_GABEE_BLIND: dict = {}
+
+
+@pytest.fixture
+def gabee_blind(llama, monkeypatch):
+    """The machine-blind Gabee run, computed once (inside a test, so the
+    CPU / no-Metal fixtures are in force) and memoised."""
+    if "run" not in _GABEE_BLIND:
+        blind, _d, _m, misses = _ladder(
+            llama, monkeypatch, None, ceiling=GABEE_64_CEILING, physical=MACHINE_64,
+            turns=26, beside=False,
+        )
+        _GABEE_BLIND["run"] = (dict(blind._memguard().counts), misses)
+    return _GABEE_BLIND["run"]
+
+
+@pytest.mark.parametrize("others", [120, 160, 177, 190])
+def test_gabee_keeps_its_pass_beside_the_others_it_runs(
+    llama, monkeypatch, others, gabee_blind
+):
     """Gabee, 64 GB, ceiling 50.10 GB, main turn then its subagent ALONE
-    (the reviewer's probe): with 12 GB of others (measured) and 16 GB (where
-    c976b2a3a missed turns 24-25 with 3-6 newest evictions), the guard's
-    degradations are exactly those of the machine-blind engine and the
-    session misses nothing."""
-    blind, _d, _m, blind_misses = _ladder(
-        llama, monkeypatch, None, ceiling=GABEE_64_CEILING, physical=MACHINE_64,
-        turns=26, beside=False,
-    )
+    (the reviewers' probe, 26 turns ~178k): 12 GB, 16 GB, 17.7 GB (measured
+    live mid-generation with Teams, Chrome and Outlook open: the norm) and
+    19 GB of others. 70f4e424b took 4-6 newest entries at 17.7-19 GB and
+    missed turns 23-25 at 19 GB. Now: no miss, no newest eviction, and no
+    degradation beyond the machine-blind engine's."""
+    blind_counts, blind_misses = gabee_blind
     scheduler, _d2, _m2, misses = _ladder(
         llama, monkeypatch, others * MB, ceiling=GABEE_64_CEILING,
         physical=MACHINE_64, turns=26, beside=False,
     )
     assert misses == blind_misses == []
-    a, b = scheduler._memguard().counts, blind._memguard().counts
+    a, b = scheduler._memguard().counts, blind_counts
+    assert a["newest_evictions"] == 0
     for key in ("newest_evictions", "chunks_reduced", "deferrals", "turn_store_skips"):
         assert a[key] <= b[key], (key, a[key], b[key])
+
+
+def test_a_laptop_with_101_gb_of_others_keeps_resuming_and_says_so(llama, monkeypatch):
+    """The laptop as measured (101 GB used by others, 27 GB in swap): the
+    machine leaves the engine less than its weights. 70f4e424b refused every
+    turn-end store ("Cache entry too large", prefix budget 0): every turn a
+    re-prefill. A live conversation's newest resume entry is not optional
+    memory: the main resumes every turn; everything optional is given back;
+    the shortfall is a capacity choice, logged and counted."""
+    scheduler, _device, machine, misses = _ladder(
+        llama, monkeypatch, 1010 * MB, turns=8, beside=False
+    )
+    assert misses == [], misses
+    counts = scheduler._memguard().counts
+    assert counts["newest_evictions"] == 0 and counts["turn_store_skips"] == 0
+    assert counts["busy_machine_short"] >= 1
+    assert counts["busy_machine_evictions"] >= 1
 
 
 def test_the_reference_never_falls_while_the_machine_swaps(llama, monkeypatch):
@@ -249,9 +283,9 @@ def test_a_budget_shrink_evicts_in_the_guards_order(llama, monkeypatch):
 
 
 def test_a_budget_shrink_takes_the_guards_order_not_lru(llama, monkeypatch):
-    """The machine leaves the engine just enough for what it holds (no
-    give-back is due) but the prefix budget derived from it is below the
-    cached bytes: the shrink evicts in the guard's order. The conversation's
+    """The machine leaves the engine just enough for what it holds but the
+    SOFT machine budget derived from it is below the cached bytes: the give
+    back runs in the guard's order up to EVICT_HEAD. The conversation's
     newest entry -- here the least recently used -- stays; the cache's own
     LRU would have taken it first."""
     scheduler, device, machine, _misses = _ladder(llama, monkeypatch, 50 * MB, turns=6)
@@ -268,7 +302,11 @@ def test_a_budget_shrink_takes_the_guards_order_not_lru(llama, monkeypatch):
     reserve = int(memory_budget.SYSTEM_RESERVE_RATIO * MACHINE_128)
     machine.others = MACHINE_128 - reserve - int(footprint * 1.01)
     scheduler._memguard_others_read = None
-    budget_before = scheduler._memguard().effective_prefix_budget
+    guard = scheduler._memguard()
+    budget_before = guard.machine_prefix_budget
+    hard_before = guard.effective_prefix_budget
     scheduler.evict_prefix_cache_under_pressure()
-    assert scheduler._memguard().effective_prefix_budget < budget_before
+    assert guard.machine_prefix_budget < budget_before
+    # the HARD budget (every store obeys it) stays on the device
+    assert guard.effective_prefix_budget == hard_before
     assert newest_main in mac._entries

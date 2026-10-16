@@ -796,6 +796,10 @@ class MemoryGuard:
             # Entries given back because the REST of the machine grew into
             # the RAM kept free for it (free share under the reserve).
             "busy_machine_evictions": 0,
+            # Episodes where the engine, holding only the live conversations'
+            # newest resume entries and live KV, still needed more than the
+            # machine left it (a capacity choice, logged loudly).
+            "busy_machine_short": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
@@ -813,6 +817,9 @@ class MemoryGuard:
         self.last_ceiling = 0
         self.last_margin = 0
         self.effective_prefix_budget: int | None = None
+        # The soft budget the machine leaves the prefix cache (optional
+        # entries above it are given back, up to EVICT_HEAD).
+        self.machine_prefix_budget: int | None = None
         self.configured_prefix_budget: int | None = None
         self.cache_limit: int | None = None
         # Last dispatch's live KV/state beyond the idle base + its transient:
@@ -1370,6 +1377,11 @@ class MemoryGuard:
                 None
                 if self.effective_prefix_budget is None
                 else round(self.effective_prefix_budget / 2**20, 1)
+            ),
+            "machine_prefix_budget_mb": (
+                None
+                if self.machine_prefix_budget is None
+                else round(self.machine_prefix_budget / 2**20, 1)
             ),
             "configured_prefix_budget_mb": (
                 None
