@@ -215,15 +215,22 @@ def test_gabee_keeps_its_pass_beside_the_others_it_runs(
         assert a[key] <= b[key], (key, a[key], b[key])
 
 
-def test_a_laptop_with_101_gb_of_others_keeps_resuming_and_says_so(llama, monkeypatch):
+@pytest.mark.parametrize(("turns", "beside"), [(8, False), (26, True)])
+def test_a_laptop_with_101_gb_of_others_keeps_resuming_and_says_so(
+    llama, monkeypatch, turns, beside
+):
     """The laptop as measured (101 GB used by others, 27 GB in swap): the
     machine leaves the engine less than its weights. 70f4e424b refused every
     turn-end store ("Cache entry too large", prefix budget 0): every turn a
     re-prefill. A live conversation's newest resume entry is not optional
     memory: the main resumes every turn; everything optional is given back;
     the shortfall is a capacity choice, logged and counted."""
+    # beside=True, 26 turns: the per-step give-back runs while the subagent
+    # decodes beside main -- capped at EVICT_HEAD it never takes main's
+    # newest entry (raised to EVICT_LAST: misses on turns 24-25 and 5 newest
+    # evictions, review of 9b233fac4)
     scheduler, _device, machine, misses = _ladder(
-        llama, monkeypatch, 1010 * MB, turns=8, beside=False
+        llama, monkeypatch, 1010 * MB, turns=turns, beside=beside
     )
     assert misses == [], misses
     counts = scheduler._memguard().counts
@@ -310,3 +317,62 @@ def test_a_budget_shrink_takes_the_guards_order_not_lru(llama, monkeypatch):
     # the HARD budget (every store obeys it) stays on the device
     assert guard.effective_prefix_budget == hard_before
     assert newest_main in mac._entries
+
+
+def test_an_optional_copy_never_takes_a_live_conversations_newest_entry(cpu):
+    """Under the MACHINE's lower ceiling, main's mid-turn boundary copy is
+    optional (the turn end hands the boundary over). A side request
+    DECODING beside it holds its own mid-turn entry -- its newest, shorter
+    than main's 120k, and its only resume point (its own copy fitted, so it
+    keeps no boundary state). Review of 9b233fac4: the copy's store room
+    took that entry up to EVICT_LAST and the side's next turn missed. Now
+    the copy may take only optional entries (up to EVICT_HEAD): the side's
+    entry stays, main's copy is refused and main keeps its boundary state."""
+    from rapid_mlx.request import Request, SamplingParams
+    from tests.test_memory_guard_boundary_handoff import (
+        RC8_BOUNDARY,
+        _rc8,
+        _rc8_boundary,
+    )
+
+    s, main = _rc8(resident=39.5)
+    mac = s.memory_aware_cache
+    side_key = next(iter(mac._entries))
+    loaned = s.waiting.popleft()  # the side is DECODING now, not waiting
+    side = Request(
+        request_id="side",
+        prompt="ignored",
+        prompt_token_ids=list(loaned.prompt_token_ids),
+        sampling_params=SamplingParams(max_tokens=256),
+    )
+    side.cached_tokens = 0  # its entry is its own mid-turn store
+    side._memguard_line_key = (("session", "side"), (0, 0))
+    s.running["side"] = side
+    s.requests["side"] = side
+    with mac._lock:
+        levels = {k: lv for k, lv, _c in s._memguard_ranked_entries()}
+    from rapid_mlx.memory_guard import EVICT_HEAD
+
+    assert levels[side_key] > EVICT_HEAD  # a live conversation's newest entry
+    # the machine leaves the engine 48 MB (device ceiling 50.10 MB):
+    # main's 8.83 MB copy fits only if the side's 2.16 MB entry goes
+    physical = 100 * MB
+    others = physical - int(memory_budget.SYSTEM_RESERVE_RATIO * physical) - 48 * MB
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(memory_budget, "system_physical_memory", lambda: physical)
+        monkey.setattr(
+            memory_budget,
+            "system_memory_used",
+            lambda: memory_budget.MachineMemory(
+                others + s._current_metal_active_bytes(), 0
+            ),
+        )
+        s._memguard_others_read = None
+        assert s._memguard_cache_ceiling() == pytest.approx(48 * MB, abs=MB // 100)
+        _rc8_boundary(s)
+    finally:
+        monkey.undo()
+    assert side_key in mac._entries
+    assert tuple(range(RC8_BOUNDARY)) not in mac._entries  # the copy: refused
+    assert main._memguard_boundary_state is not None  # handed over at turn end

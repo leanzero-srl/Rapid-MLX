@@ -10273,6 +10273,7 @@ class Scheduler:
         ceiling = self._memguard_ceiling()
         if ceiling <= 0:
             return True  # the guard is inert (no device ceiling)
+        device = ceiling
         if not handoff and not turn_end and kind == "prefix entry":
             # A mid-turn COPY is optional memory: on a machine whose other
             # processes need the room it is refused (a machine that leaves
@@ -10361,16 +10362,26 @@ class Scheduler:
                     key, own_resume_points
                 )
 
+            # Under the MACHINE's lower ceiling this store is an optional
+            # copy (the hand-over at the turn end covers it): it may take only
+            # optional entries, up to EVICT_HEAD -- never another live
+            # conversation's newest entry (review of 9b233fac4: main's
+            # boundary copy took a decoding side request's only entry; the
+            # side kept no boundary state, its own copy having fitted, and
+            # its next turn missed).
+            top = EVICT_HEAD if ceiling < device else EVICT_LAST
             with mac._lock:  # noqa: SLF001
                 ranked = self._memguard_ranked_entries(storing, finished, line)
                 freeable = self._memguard_freeable_bytes()
                 available = sum(
-                    freeable.get(k, 0) for k, lv, _c in ranked if cheaper(k)
+                    freeable.get(k, 0)
+                    for k, lv, _c in ranked
+                    if lv <= top and cheaper(k)
                 )
             if footprint - available + need + margin <= ceiling:
                 while footprint + need + margin > ceiling:
                     if not self._memguard_evict_ordered(
-                        EVICT_LAST,
+                        top,
                         storing=storing,
                         finished=finished,
                         reason="store-room",
