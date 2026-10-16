@@ -715,13 +715,35 @@ def mtp_generate_step(
                 raise RuntimeError(
                     "prompt/MTP target cache violated speculative rollback preflight"
                 )
+        owned: list = []
         for c, restore, snapshots in snapshot_caches:
             if restore is not None:
                 restore(n_to_drop, verify_size)
             else:
                 assert snapshots is not None
-                c[0], c[1] = snapshots
+                conv_snap, ssm_snap = snapshots
+                if isinstance(ssm_snap, mx.array):
+                    # The fused verify kernel returns every restore point as
+                    # ONE stacked array per layer; ``state_snapshots[:, p]``
+                    # is a view, and a view keeps the whole stack alive (all
+                    # S - 1 points: 4.6 GB across the 27B's 48 layers at 31
+                    # rows) until the next step replaces the state -- memory
+                    # nothing can see (``rollback_state`` is None by then),
+                    # and it coexists with the next verify's own points
+                    # (Gabee Forge control, 354c3ac0e: the guard narrowed the
+                    # verify to 4-7 rows and evicted the conversation's only
+                    # entry). Restore an owned copy of the one point kept:
+                    # ``mx.array`` copies; ``mx.contiguous`` would not (a
+                    # row-contiguous view stays inside the stack, mlx 0.32.2,
+                    # CPU and Metal).
+                    with mx.stream(generation_stream):
+                        ssm_snap = mx.array(ssm_snap)
+                    owned.append(ssm_snap)
+                c[0], c[1] = conv_snap, ssm_snap
                 c.rollback_state = None
+        if owned:
+            with mx.stream(generation_stream):
+                mx.eval(owned)
 
     def _rollback_verify_round(n_to_drop: int, verify_size: int | None = None) -> None:
         """Roll back uncommitted target + MTP draft state for one verify round."""
@@ -1222,6 +1244,29 @@ def mtp_generate_step(
 
     while ntoks < max_tokens:
         round_start_perf = time.perf_counter()
+        if pending_drafts is not None:
+            limit = _verify_rows_limit()
+            if (
+                limit is not None
+                and limit <= 1
+                and (
+                    pending_is_prompt_lookup
+                    or all(mc.is_trimmable() for mc in mtp_cache)
+                )
+            ):
+                # The memory guard took speculation off for this round (a
+                # plain one-row decode is cheaper than evicting the
+                # conversation's prefix entry). Drop the pending drafts as a
+                # full reject would -- a chain's K positions leave the MTP
+                # cache -- and run the K=0 round: the target's own token,
+                # the state a reject-then-park reaches.
+                if not pending_is_prompt_lookup:
+                    for mc in mtp_cache:
+                        mc.trim(len(pending_drafts))
+                pending_drafts = None
+                pending_is_prompt_lookup = False
+                pending_draft_ms = 0.0
+                _timing_add("verify_dropped_rounds", 1.0)
         if pending_drafts is None:
             # -------------------------------------------------------
             # Round K=0 (either bootstrap or a park). Plain backbone

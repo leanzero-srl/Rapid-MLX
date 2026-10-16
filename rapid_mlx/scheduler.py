@@ -8009,14 +8009,20 @@ class Scheduler:
         lengths = self._memguard_generation_lengths()
         if not lengths:
             return 0
+        # An MTP verify's restore points, less those of the previous round
+        # still held: the verify drops them as it writes its own -- at a
+        # growth step as at any other (Gabee Forge control, 354c3ac0e: held
+        # restore points of a 31-row round were charged twice at a growth
+        # step, the verify narrowed to 4-7 rows, then even the floor "did not
+        # fit" and the conversation's only entry was evicted).
+        held = _held_rollback_bytes(getattr(gen, "prompt_cache", None))
+        verify = guard.decode_verify(batch=len(lengths))
         if not growing:
-            # An MTP verify's restore points, less those of the previous
-            # round still held (the verify drops them as it writes its own).
-            held = _held_rollback_bytes(getattr(gen, "prompt_cache", None))
-            return max(0, guard.decode_verify(batch=len(lengths)) - held)
-        return guard.decode_growth(
+            return max(0, verify - held)
+        grown = guard.decode_growth(
             max(lengths), batch=len(lengths), kv_footprint=self._kv_footprint_fn()
         )
+        return grown - verify + max(0, verify - held)
 
     def _memguard_decode_write_rows(self) -> int:
         """KV rows one decode step may write per sequence before rolling back:
@@ -8083,14 +8089,44 @@ class Scheduler:
     def _memguard_verify_rows_range(self) -> tuple[int, int] | None:
         """``(floor, widest)`` rows the guard may let one MTP verify write,
         or None when the verify is no knob (off MTP, no restore-point cost).
-        The floor is the MTP chain's own depth + 1: a chain already drafted
-        is verified whole (its positions are in the MTP cache); only a
-        prompt-lookup copy draft is cut at the verify."""
+        The floor is ONE row -- a plain decode, the generator dropping the
+        round's drafts -- when the MTP head's caches can trim a drafted chain
+        back out; else the chain's own depth + 1 (a chain already drafted is
+        then verified whole; only a prompt-lookup copy draft is cut)."""
         widest = self._memguard_decode_write_rows()
         if widest <= 1 or self._memguard_verify_bytes_per_row(2) <= 0:
             return None
+        if self._memguard_mtp_drops_drafts():
+            # The generator can take speculation off a round entirely (a
+            # plain one-row decode, ``verify_rows_cap`` = 1): the floor.
+            return 1, widest
         depth = max(0, int(getattr(self.config, "mtp_max_k", 0) or 0))
         return max(2, min(widest, depth + 1)), widest
+
+    def _memguard_mtp_drops_drafts(self) -> bool:
+        """Whether an already drafted MTP chain can be dropped before its
+        verify: every MTP-head cache is trimmable (the generator then trims
+        the chain out, as a full reject does). Memoized."""
+        cached = getattr(self, "_memguard_mtp_droppable", None)
+        if cached is not None:
+            return cached
+        result = False
+        model = getattr(self, "model", None)
+        for candidate in (model, getattr(model, "language_model", None)):
+            make = getattr(candidate, "make_mtp_cache", None)
+            if not callable(make):
+                continue
+            try:
+                caches = make()
+                result = bool(caches) and all(
+                    callable(getattr(c, "is_trimmable", None)) and c.is_trimmable()
+                    for c in caches
+                )
+            except Exception:  # noqa: BLE001
+                result = False
+            break
+        self._memguard_mtp_droppable = result
+        return result
 
     def _memguard_set_verify_cap(self, rows: int | None) -> None:
         bg = getattr(self, "batch_generator", None)

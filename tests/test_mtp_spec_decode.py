@@ -5990,3 +5990,125 @@ def test_generator_prompt_lookup_honours_the_memory_guards_verify_cap(monkeypatc
     assert tokens == free_tokens
     assert timing["prompt_lookup_drafted_tokens"] == 2  # proposed uncapped
     assert max(widths[1:]) == 2  # verified capped
+
+
+def test_generator_drops_a_drafted_chain_when_the_guard_takes_speculation_off():
+    """``verify_rows_cap`` = 1 (the memory guard's last action before
+    evicting a conversation's prefix entry): a chain drafted before the cap
+    dropped is trimmed out of the MTP cache, as a full reject would, and the
+    round decodes plainly -- the target's own tokens, unchanged."""
+    from rapid_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from rapid_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    reads = {"n": 0}
+
+    def cap():
+        reads["n"] += 1
+        return None if reads["n"] == 1 else 1  # the chain is drafted, then capped
+
+    model = _CacheAdvancingQwen35Model(
+        backbone_outputs=[7, 11, 13, 15], mtp_outputs=[9001, 9002, 9003]
+    )
+    mtp_cache = _CountingKVCache()
+    timing: dict[str, float] = {}
+    emitted = [
+        t
+        for t, _lp, _d in mtp_generate_step(
+            mx.array([1], dtype=mx.uint32),
+            model,
+            max_tokens=4,
+            max_k=1,
+            disable_auto_k=True,
+            prompt_cache=[_CountingKVCache(), mtp_cache],
+            accept_counter=MTPAcceptCounter(),
+            timing_stats=timing,
+            verify_rows_cap=cap,
+        )
+    ]
+    assert emitted == [7, 11, 13, 15]
+    assert timing["verify_dropped_rounds"] == 1
+    assert mtp_cache.trim_calls == [1]  # the one drafted position, gone
+    assert model._mtp_cursor == 1  # never drafted again under the cap
+
+
+def test_a_partial_reject_restores_an_owned_state_not_a_view_of_every_point(
+    monkeypatch,
+):
+    """The fused verify kernel returns all S - 1 restore points as ONE
+    stacked array per layer. Restoring ``stack[:, p]`` (a view) kept the
+    whole stack -- 4.6 GB on the 27B at 31 rows -- alive and invisible until
+    the next step (Gabee Forge control: the memory guard then evicted the
+    conversation's only entry). The kept point is now an owned copy."""
+    import ctypes
+
+    import rapid_mlx.spec_decode.mtp.generator as generator_mod
+    from rapid_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from rapid_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "2")
+    monkeypatch.setattr(
+        generator_mod, "gated_delta_snapshot_rollback_installed", lambda: True
+    )
+
+    class _Recurrent:
+        def __init__(self):
+            self.offset = 0
+            self.state = [mx.zeros((1, 3, 8)), mx.zeros((1, 4, 8, 8))]
+            self.rollback_state = None
+
+        def __getitem__(self, i):
+            return self.state[i]
+
+        def __setitem__(self, i, value):
+            self.state[i] = value
+
+    stacks: list = []
+
+    class _StackingModel(_CacheAdvancingQwen35Model):
+        def __call__(self, inputs, cache=None, n_confirmed: int = 0, **kwargs):
+            result = super().__call__(
+                inputs, cache=cache, n_confirmed=n_confirmed, **kwargs
+            )
+            span = int(inputs.shape[1])
+            if cache and n_confirmed > 0 and span == 2:
+                cache[0].rollback_state = (mx.zeros((1, 3, 8)), mx.zeros((1, 4, 8, 8)))
+            elif cache and n_confirmed > 0 and span > 2:
+                stack = mx.random.normal((1, span - 1, 4, 8, 8))
+                mx.eval(stack)
+                stacks.append(stack)
+                cache[0].rollback_state = [
+                    (mx.zeros((1, 3, 8)), stack[:, p]) for p in range(span - 1)
+                ]
+            return result
+
+    model = _StackingModel(
+        # lookup proposes [20, 21]; the target accepts 20, rejects 21 as 19
+        backbone_outputs=[0, 0, 0, 7, 8, 0, 20, 19, 22],
+        mtp_outputs=[0, 0, 0, 77, 0],
+    )
+    model.mtp_wide_verify_rollback_supported = True
+    head = _Recurrent()
+    list(
+        mtp_generate_step(
+            mx.array([7, 8, 20, 21], dtype=mx.uint32),
+            model,
+            max_tokens=4,
+            max_k=1,
+            disable_auto_k=True,
+            prompt_cache=[head, _CountingKVCache()],
+            accept_counter=MTPAcceptCounter(),
+        )
+    )
+    assert stacks, "the wide verify ran"
+
+    def address(a):
+        return ctypes.addressof(ctypes.c_char.from_buffer(memoryview(a)))
+
+    restored = head.state[1]
+    mx.eval(restored)
+    start = address(stacks[-1])
+    assert not start <= address(restored) < start + stacks[-1].nbytes
+    assert head.rollback_state is None
