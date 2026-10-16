@@ -537,3 +537,79 @@ def test_when_even_the_main_alone_cannot_keep_it_the_side_goes_first(cpu):
     assert deferred == ["side"]
     assert order == ["defer", "evict"]
     assert s._memguard().counts["newest_evictions"] == 1
+
+
+# -- single stream, MTP decode at a KV growth step (Forge control, 354c3ac0e) --
+#
+# Gabee 03:36-03:37Z, one stream, 85,444-token boundary entry (6.07 GB, a
+# copy: evicting it freed 5.5 GB measured). At growth steps the verify
+# narrowed to 4-7 of 32 rows, then "evicted prefix entry tokens=85444
+# level=5 (join) entries_left=0"; every later turn re-prefilled ~88k
+# (562 s). Causes: after a partial reject the generator restored a VIEW of
+# the fused verify's stacked restore points, which kept every point (4.6 GB
+# at 31 rows) resident and invisible until the next step (fixed in the
+# generator: an owned copy; test_mtp_spec_decode.py); the guard charged the
+# previous round's held points on top of the new verify at a growth step;
+# and the cheapest action -- a plain one-row decode -- was not available
+# (the floor was the chain's depth + 1).
+
+HELD = 30 * PER_ROW  # a 31-row round's restore points, still held
+
+
+def _forge(monkeypatch, footprint: int, *, gap: int, ceiling: int = CEILING, droppable=True):
+    """The decode step at the KV buffer's edge: it grows when the verify
+    writes more than ``gap`` rows."""
+    import rapid_mlx.scheduler as sched
+
+    s = _scheduler(ceiling, live=footprint - ENTRY)
+    if droppable:
+        s.model.make_mtp_cache = lambda: [KVCache()]
+    _decoding(s, capacity=PROMPT + gap, idx=PROMPT, context=PROMPT)
+    monkeypatch.setattr(sched, "_held_rollback_bytes", lambda caches: HELD)
+    main = _entry(s, list(range(BOUNDARY)), ENTRY)
+    return s, main
+
+
+def test_held_restore_points_are_not_charged_twice_at_a_growth_step(cpu, monkeypatch):
+    """47.9 GB resident incl. 4.62 GB of the last round's restore points, a
+    step that grows: the new verify replaces them, so the full width fits
+    (354c3ac0e charged both and narrowed to 4 rows)."""
+    s, main = _forge(monkeypatch, int(47.9 * GB), gap=0, droppable=False)
+    assert _plan(s) is None
+    assert main in s.memory_aware_cache._entries
+    assert s._memguard().counts["verify_narrowed"] == 0
+
+
+def test_a_plain_decode_step_comes_before_evicting_the_entry(cpu, monkeypatch):
+    """48.72 GB resident (the entry + 4.62 GB held), one row of room before
+    the buffer grows: any verify grows it and does not fit; a plain one-row
+    decode does. 354c3ac0e evicted the 85,444-token entry here; now the step
+    drops speculation."""
+    s, main = _forge(monkeypatch, int(48.72 * GB), gap=1)
+    cap = _plan(s)
+    assert main in s.memory_aware_cache._entries
+    assert cap == 1
+    assert s._memguard_verify_rows_range() == (1, 32)
+    counts = s._memguard().counts
+    assert counts["newest_evictions"] == 0 and counts["decode_over_ceiling"] == 0
+
+
+def test_a_narrower_verify_that_avoids_the_growth_is_preferred(cpu, monkeypatch):
+    s, main = _forge(monkeypatch, int(48.72 * GB), gap=2)
+    assert _plan(s) == 2
+    assert main in s.memory_aware_cache._entries
+
+
+def test_without_a_droppable_chain_the_floor_is_the_chain(cpu, monkeypatch):
+    """An MTP head whose cache cannot trim keeps the chain's depth + 1 as the
+    floor (a drafted chain is verified whole)."""
+    s, _main = _forge(monkeypatch, int(47.9 * GB), gap=0, droppable=False)
+    assert s._memguard_verify_rows_range() == (4, 32)
+
+
+def test_the_forge_step_on_128_gb_takes_no_action(cpu, monkeypatch):
+    s, main = _forge(monkeypatch, int(48.72 * GB), gap=1, ceiling=BIG_CEILING)
+    assert _plan(s) is None
+    assert main in s.memory_aware_cache._entries
+    counts = s._memguard().counts
+    assert counts["verify_narrowed"] == 0 and counts["newest_evictions"] == 0
