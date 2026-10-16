@@ -13594,11 +13594,13 @@ class Scheduler:
         # own KV cut to the boundary, where the lookahead does not reach
         # (_memguard_hand_over_boundary): an MTP row's cache is kept for that
         # alone, never published as is.
-        request_id = self.uid_to_request_id.get(response.uid)
-        request = self.requests.get(request_id) if request_id else None
-        boundary_kept = (
-            getattr(request, "_memguard_boundary_state", None) is not None
-        )
+        boundary_kept = False
+        if not retain_cache:
+            request_id = getattr(self, "uid_to_request_id", {}).get(response.uid)
+            request = getattr(self, "requests", {}).get(request_id) if request_id else None
+            boundary_kept = (
+                getattr(request, "_memguard_boundary_state", None) is not None
+            )
         caches = batch_generator.remove(
             [response.uid],
             return_prompt_caches=retain_cache or boundary_kept,
