@@ -9443,19 +9443,38 @@ class Scheduler:
             guard.counts["busy_machine_evictions"] += evicted
 
     def _memguard_yield_to_others(self) -> None:
-        """The engine holds more than the machine leaves it (the others'
-        reference grew into the reserve): give prefix entries back in the
-        ONE eviction order, never what a live or queued request needs or a
-        live conversation's newest head (the kernel's WARN rule), and
-        re-derive the budgets. The allocator cache is cleared once, and only
-        after entries went (never on every tick). Nothing happens on a
+        """The machine needs memory back: while the engine holds more than
+        the machine leaves it, or its entries exceed the soft machine budget,
+        give OPTIONAL entries back in the ONE eviction order up to
+        EVICT_HEAD -- superseded entries, abandoned heads, finished side
+        heads, extra fallbacks -- never a live or queued request's entry nor
+        a live conversation's newest head. If the engine still holds more
+        than the machine leaves it, that is a capacity choice (the newest
+        resume entries and the live KV are kept: losing them costs minutes
+        of re-prefill per turn, worse than a little swap): logged once per
+        episode and counted (``busy_machine_short``). The allocator cache is
+        cleared only after entries actually went. Nothing happens on a
         machine with room (a big idle Mac: zero actions)."""
         guard = self._memguard()
         if guard is None or self._memguard_others_bytes() is None:
             return
+        if self._memguard_ceiling_moved():
+            self._memguard_apply_budgets()
         limit = self._memguard_cache_ceiling()
+        mac = getattr(self, "memory_aware_cache", None)
+        soft = getattr(guard, "machine_prefix_budget", None)
+
+        def over() -> bool:
+            if self._metal_footprint_bytes() > limit:
+                return True
+            return (
+                soft is not None
+                and mac is not None
+                and mac._current_memory > soft  # noqa: SLF001
+            )
+
         evicted = 0
-        while self._metal_footprint_bytes() > limit:
+        while over():
             if not self._memguard_evict_ordered(
                 EVICT_HEAD, keep_last=True, reason="machine busy", count=False
             ):
@@ -9472,8 +9491,23 @@ class Scheduler:
                 "y" if evicted == 1 else "ies",
                 limit / 1e9,
             )
-        if self._memguard_ceiling_moved():
-            self._memguard_apply_budgets()
+        short = self._metal_footprint_bytes() - limit
+        if short > 0:
+            if not getattr(self, "_memguard_short_logged", False):
+                self._memguard_short_logged = True
+                guard.counts["busy_machine_short"] += 1
+                logger.warning(
+                    "[memory_guard] the machine is %.2fGB short: the other "
+                    "processes use %.2fGB and the engine keeps only the live "
+                    "conversations' newest resume entries and live KV "
+                    "(%.2fGB) -- the machine may swap; close apps or use a "
+                    "smaller model",
+                    short / 1e9,
+                    (self._memguard_others_read[1] or 0) / 1e9,
+                    self._metal_footprint_bytes() / 1e9,
+                )
+        else:
+            self._memguard_short_logged = False
 
     def _memguard_on_idle(self) -> None:
         """The engine just went idle (step thread): re-measure the idle base
@@ -9495,11 +9529,14 @@ class Scheduler:
     def _memguard_ceiling_moved(self) -> bool:
         """The plan ceiling the budgets were derived from moved by more than
         the reapply ratio (the rest of the machine took or gave memory)."""
-        applied = int(getattr(self, "_memguard_budget_ceiling", 0) or 0)
-        if applied <= 0:
-            return False
+        applied = getattr(self, "_memguard_budget_ceiling", None)
+        if applied is None:
+            return False  # the budgets were never derived
+        applied = int(applied)
         now = self._memguard_cache_ceiling()
-        return abs(now - applied) > REAPPLY_RATIO * max(1, applied)
+        # a machine that leaves nothing (0) still moves when it frees memory
+        scale = max(applied, int(REAPPLY_RATIO * self._memguard_ceiling()), 1)
+        return abs(now - applied) > REAPPLY_RATIO * scale
 
     def memory_guard_max_context(
         self, native_context: int | None = None, *, stable: bool = True
@@ -9662,19 +9699,25 @@ class Scheduler:
         guard = self._memguard()
         if guard is None:
             return
-        ceiling = self._memguard_cache_ceiling()
+        # The HARD budget (the cache's own ``_max_memory``, which every store
+        # obeys -- turn-end stores and hand-overs included) follows the
+        # DEVICE: a live conversation's newest resume entry is not optional
+        # memory (review of 70f4e424b: with 101 GB of others the machine
+        # budget went to 0 and every turn-end store was refused, every turn
+        # a re-prefill). What the machine leaves the engine sets the SOFT
+        # machine budget (``_memguard_machine_budget``), given back in the
+        # guard's order up to EVICT_HEAD only.
+        ceiling = self._memguard_ceiling()
         if ceiling <= 0:
             return
         base = self._memguard_idle_base()
         self._memguard_budget_base = base
-        self._memguard_budget_ceiling = ceiling
-        room = max(
-            0,
-            guard.idle_room(
-                ceiling=ceiling,
-                base=base,
-                fraction=self._memguard_pressure_fraction(),
-            ),
+        machine_ceiling = self._memguard_cache_ceiling(ceiling)
+        self._memguard_budget_ceiling = machine_ceiling
+        fraction = self._memguard_pressure_fraction()
+        room = max(0, guard.idle_room(ceiling=ceiling, base=base, fraction=fraction))
+        machine_room = max(
+            0, guard.idle_room(ceiling=machine_ceiling, base=base, fraction=fraction)
         )
 
         mac = getattr(self, "memory_aware_cache", None)
@@ -9707,7 +9750,7 @@ class Scheduler:
                 # heads last), not the cache's plain LRU.
                 ordered = 0
                 while mac._current_memory > effective and self._memguard_evict_ordered(  # noqa: SLF001
-                    EVICT_LAST, keep_last=True, reason="budget", count=False
+                    EVICT_HEAD, keep_last=True, reason="budget", count=False
                 ):
                     ordered += 1
                 evicted = ordered + mac.set_max_memory(
@@ -9729,6 +9772,11 @@ class Scheduler:
                         evicted,
                     )
             effective = guard.effective_prefix_budget
+            guard.machine_prefix_budget = min(effective, machine_room)
+            # the allocator cache is optional memory too: sized from what the
+            # machine leaves beside the soft budget
+            room = min(room, machine_room)
+            effective = min(effective, guard.machine_prefix_budget)
 
         # The allocator cache's share of the ceiling (lz's own boot share,
         # memory_budget.compute_metal_cache_limit, without its 2 / 32 GiB
@@ -10223,15 +10271,15 @@ class Scheduler:
         if guard is None or not cache:
             return True
         ceiling = self._memguard_ceiling()
+        if ceiling <= 0:
+            return True  # the guard is inert (no device ceiling)
         if not handoff and not turn_end and kind == "prefix entry":
             # A mid-turn COPY is optional memory: on a machine whose other
-            # processes need the room it is refused, and the boundary is
-            # kept as recurrent state and handed over at the turn end (no
-            # copy). A hand-over, a turn's end and that state stay on the
-            # device ceiling.
+            # processes need the room it is refused (a machine that leaves
+            # nothing: 0), and the boundary is kept as recurrent state and
+            # handed over at the turn end (no copy). A hand-over, a turn's
+            # end and that state stay on the device ceiling.
             ceiling = self._memguard_cache_ceiling(ceiling)
-        if ceiling <= 0:
-            return True
         try:
             from .memory_cache import estimate_kv_cache_memory
 
