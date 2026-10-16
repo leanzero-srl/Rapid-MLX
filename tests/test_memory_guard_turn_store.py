@@ -27,8 +27,8 @@ What the store had to find was 0.42 GB, and two things were wrong:
    the main's 87k), or the conversation's own older ones, now give way,
    cheapest first, only for real bytes (an
    entry a queued request's loan shares frees nothing and stays) and only
-   when that makes the store fit. A skip that leaves the conversation with
-   no entry is counted (``orphaned_store_skips``) and logged loudly.
+   when that makes the store fit. A turn that ENDS with the conversation
+   holding no entry is counted (``orphaned_store_skips``) and logged loudly.
 
 Double count of the main's LIVE KV: none. The boundary entry is a copy of a
 row that keeps prefilling and decoding, so live + entry are both real.
@@ -223,7 +223,11 @@ def test_a_costlier_conversation_never_gives_way(cpu):
     entries = s.memory_aware_cache._entries
     assert all(k in entries for k in (big, side_boundary, older_side, helper))
     counts = s._memguard().counts
-    assert counts["store_skips"] == 1 and counts["orphaned_store_skips"] == 1
+    assert counts["store_skips"] == 1
+    # an orphan is known only when the turn ends with no entry (RC8 review)
+    assert counts["orphaned_store_skips"] == 0
+    s._memguard_note_orphaned_turn(s.running["393"])
+    assert counts["orphaned_store_skips"] == 1
 
 
 def test_nothing_is_evicted_when_it_would_not_make_room(cpu):
