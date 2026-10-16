@@ -68,10 +68,20 @@ class ContextExceedsDeviceMemoryError(Exception):
 
     @property
     def message(self) -> str:
+        need, have = self.needed_bytes / 1e9, self.available_bytes / 1e9
+        # A close call needs the digits that tell the two apart, and the
+        # shortfall itself (RC12 Gabee: "needs 50.1 GB but this Mac can hold
+        # 50.1 GB").
+        digits = 1
+        while digits < 3 and f"{need:.{digits}f}" == f"{have:.{digits}f}":
+            digits += 1
+        short = ""
+        if digits > 1:
+            short = f" ({max(0, self.needed_bytes - self.available_bytes) / 1e6:.0f} MB short)"
         return (
             f"This prompt ({self.prompt_tokens} tokens) needs "
-            f"{self.needed_bytes / 1e9:.1f} GB but this Mac can hold "
-            f"{self.available_bytes / 1e9:.1f} GB; the maximum context here "
+            f"{need:.{digits}f} GB but this Mac can hold "
+            f"{have:.{digits}f} GB{short}; the maximum context here "
             f"is {self.max_context} tokens."
         )
 

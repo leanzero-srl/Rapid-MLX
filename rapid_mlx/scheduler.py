@@ -7971,6 +7971,14 @@ class Scheduler:
                     guard.counts["evictions_then_deferred"] += 1
                 self._memguard_defer(row, plan, others)
                 continue
+            if self._memguard_release_waiting_loans(row.request_id):
+                # A QUEUED request's prefix-hit loan pins its entry (the
+                # loan shares its buffers: evicting it frees nothing). It
+                # re-fetches when it is admitted -- or re-prefills, if its
+                # entry goes now -- rather than this request being refused
+                # (RC12 Gabee k=110: a 160k main refused 2.5 min into its
+                # prefill, 0.0x GB short, beside a waiting side's 22.8k loan).
+                continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
         # Every iteration above either returns or changes the state (defer,
         # refuse, hand over, evict) -- reaching here is a planner defect: the
@@ -9068,6 +9076,38 @@ class Scheduler:
             held,
             stored,
         )
+
+    def _memguard_release_waiting_loans(self, keep: str) -> bool:
+        """Drop every QUEUED request's prefix-hit loan (not an SRPF-parked
+        row's own cache, which holds prefill work nobody else has); each
+        re-fetches at its admission. The entries stay in the cache, now
+        evictable. Returns True when a loan was released."""
+        released = 0
+        for request in list(getattr(self, "waiting", ())):
+            if (
+                request.request_id == keep
+                or request.prompt_cache is None
+                or getattr(request, "_srpf_parked", False)
+            ):
+                continue
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            request._memguard_refetch = True
+            released += 1
+        if released:
+            guard = self._memguard()
+            if guard is not None:
+                guard.counts["loans_released"] += released
+            logger.warning(
+                "[memory_guard] released %d queued request%s' prefix loan%s to "
+                "make room for request %s (they re-fetch at admission)",
+                released,
+                "" if released == 1 else "s",
+                "" if released == 1 else "s",
+                keep[:12],
+            )
+        return released > 0
 
     def _memguard_reset_for_requeue(self, request: Request) -> None:
         request.status = RequestStatus.WAITING
@@ -13679,6 +13719,15 @@ class Scheduler:
                 if not shortest_tail:
                     self.waiting.appendleft(request)
                 break
+
+            if getattr(request, "_memguard_refetch", False):
+                # Its loan was released to make room for a running request:
+                # fetch again now (its entry may have gone meanwhile).
+                request._memguard_refetch = False
+                if self.memory_aware_cache is not None and not _pflash_compressed(
+                    request
+                ):
+                    self._fetch_memory_aware_prefix(request)
 
             # Determine tokens to process and cache to use
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
