@@ -783,9 +783,16 @@ class MemoryGuard:
             # Evictions of a conversation's newest entry (EVICT_LAST): the
             # last resort, after every cheaper action.
             "newest_evictions": 0,
-            # Skipped stores that left their conversation with NO entry for
-            # its next turn (nothing cheaper could give the room). Loud.
+            # Turns that ENDED with their conversation holding NO entry for
+            # its next turn after a skipped store (nothing cheaper could give
+            # the room). Loud.
             "orphaned_store_skips": 0,
+            # Hybrid message boundaries whose COPY did not fit beside the live
+            # KV: only the recurrent state was kept there ...
+            "boundary_states_kept": 0,
+            # ... and the entry was built at the turn end from the row's own
+            # KV cut to the boundary, handed over (never two copies).
+            "boundary_handoffs": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,

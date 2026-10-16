@@ -413,6 +413,7 @@ def test_rc8_the_boundary_copy_does_not_fit_and_the_turn_end_keeps_it(cpu, caplo
     )
     assert tuple(10**6 + i for i in range(22_848)) in mac._entries  # side: kept
     assert counts["orphaned_store_skips"] == 0
+    assert counts["boundary_states_kept"] == 1 and counts["boundary_handoffs"] == 1
     assert "keeps NO entry" not in caplog.text
     # the next main turn resumes from it
     nxt = list(range(RC8_BOUNDARY)) + [7] * (126_664 - RC8_BOUNDARY)
@@ -469,6 +470,7 @@ def test_rc8_128_gb_copies_as_today(cpu):
     assert getattr(main, "_memguard_boundary_state", None) is None
     counts = s._memguard().counts
     assert counts["store_skips"] == 0 and counts["orphaned_store_skips"] == 0
+    assert counts["boundary_states_kept"] == 0 and counts["boundary_handoffs"] == 0
 
 
 def test_a_cancelled_turn_keeps_its_boundary_too(hybrid4):
@@ -490,3 +492,16 @@ def test_a_cancelled_turn_keeps_its_boundary_too(hybrid4):
     assert cached_2["t2"] == BOUNDARY_1
     _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
     assert tokens_2["t2"] == copied_2
+
+
+def test_rc8_the_handoff_is_planned_at_its_real_transient(cpu):
+    """Each layer is cut from the finished row's copy: for a moment that
+    layer's full copy (0.97 MB) and its cut copy (0.97 MB) both exist. At
+    47.5 MB resident one layer fits under the margin and two do not: the
+    handoff is refused, honestly, rather than planned at one layer."""
+    s, main = _rc8(resident=47.5)
+    _rc8_boundary(s)
+    assert getattr(main, "_memguard_boundary_state", None) is not None
+    _rc8_turn_end(s, main)
+    assert tuple(range(RC8_BOUNDARY)) not in s.memory_aware_cache._entries
+    assert s._memguard().counts["orphaned_store_skips"] == 1

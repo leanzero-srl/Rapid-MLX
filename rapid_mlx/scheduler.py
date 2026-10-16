@@ -8598,6 +8598,9 @@ class Scheduler:
             return
         own_cache_bytes(state)
         request._memguard_boundary_state = (int(boundary), kept)
+        guard = getattr(self, "_memory_guard", None)
+        if guard is not None:
+            guard.counts["boundary_states_kept"] += 1
         logger.info(
             "[memory_guard] request %s keeps its %d-token message boundary as "
             "recurrent state only (%.2fGB); its own KV, trimmed to the "
@@ -8637,36 +8640,21 @@ class Scheduler:
             return False
         boundary, states = kept
         prompt = list(request.prompt_token_ids or ())
-        cache = list(kv)
-        if boundary > len(prompt) or len(cache) != len(states):
+        if boundary > len(prompt):
             return False
         if any(
             len(key) >= boundary and self._memguard_is_prefix(key, prompt)
             for key in list(mac._entries)  # noqa: SLF001
         ):
             return False  # a later store of this turn already resumes it
-        held = 0
-        transient = 0
-        for index, (layer, state) in enumerate(zip(cache, states, strict=True)):
-            if state is not None:
-                cache[index] = state
-                continue
-            keys = getattr(layer, "keys", None)
-            values = getattr(layer, "values", None)
-            if (
-                not isinstance(layer, KVCache)
-                or not isinstance(keys, mx.array)
-                or not isinstance(values, mx.array)
-            ):
-                return False
-            offset = int(layer.offset)
-            if offset < boundary or keys.shape[2] < offset:
-                return False
-            held = max(held, offset)
-            full = int(keys.nbytes) + int(values.nbytes)
-            transient = max(transient, full + full * boundary // keys.shape[2])
-        if held <= 0:
+        plan = self._memguard_boundary_cut(kept, kv)
+        if plan is None:
             return False
+        held, transient = plan
+        cache = [
+            state if state is not None else layer
+            for layer, state in zip(kv, states, strict=True)
+        ]
         uid = self.request_id_to_uid.get(request.request_id)
         gen = getattr(self.batch_generator, "_generation_batch", None)
         try:
@@ -8697,6 +8685,9 @@ class Scheduler:
         )
         if stored:
             request._cache_snapshot_stored = True
+            guard = getattr(self, "_memory_guard", None)
+            if guard is not None:
+                guard.counts["boundary_handoffs"] += 1
             logger.warning(
                 "[memory_guard] request %s keeps its %d-token message-boundary "
                 "entry by handing over its own KV (cut from %d tokens; no copy "
@@ -8706,6 +8697,44 @@ class Scheduler:
                 held,
             )
         return bool(stored)
+
+    @staticmethod
+    def _memguard_boundary_cut(kept: Any, kv: Any) -> tuple[int, int] | None:
+        """``(tokens held, per-layer transient bytes)`` when the finished
+        row ``kv`` can be cut to the kept boundary (same layout as at the
+        boundary; every KV layer a plain ``KVCache`` holding at least the
+        boundary), else ``None``."""
+        from mlx_lm.models.cache import KVCache
+
+        if kept is None or not kv:
+            return None
+        boundary, states = kept
+        layers = list(kv)
+        if len(layers) != len(states):
+            return None
+        held = 0
+        transient = 0
+        for layer, state in zip(layers, states, strict=True):
+            if state is not None:
+                continue
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if (
+                type(layer) is not KVCache
+                or not isinstance(keys, mx.array)
+                or not isinstance(values, mx.array)
+            ):
+                return None
+            offset = int(layer.offset)
+            if offset < boundary or keys.shape[2] < offset or keys.shape[2] <= 0:
+                return None
+            held = max(held, offset)
+            # cut from the row's (lazy) copy: its full copy and the cut one
+            full = int(keys.nbytes) + int(values.nbytes)
+            transient = max(transient, full + full * boundary // keys.shape[2])
+        if held <= 0:
+            return None
+        return held, transient
 
     def _memguard_keep_requeued_kv(
         self, request: Request, payload: Any, *, solo: bool
@@ -13954,11 +13983,13 @@ class Scheduler:
                 # (prompt + output) gives way: the KV is held once.
                 uncommitted = getattr(response, "_lz_uncommitted_cache", None)
                 response._lz_uncommitted_cache = None
-                if getattr(request, "_memguard_boundary_state", None) is not None:
+                kept = getattr(request, "_memguard_boundary_state", None)
+                if kept is not None and self.block_aware_cache is None:
                     turn_kv = getattr(request, "_extracted_cache", None) or uncommitted
-                    if turn_kv and self.block_aware_cache is None:
+                    if self._memguard_boundary_cut(kept, turn_kv) is not None:
                         request._extracted_cache = None
                         request._memguard_turn_end_kv = turn_kv
+                    del turn_kv
                 del uncommitted
 
                 # Continuous self-MTP terminal responses carry the detached
