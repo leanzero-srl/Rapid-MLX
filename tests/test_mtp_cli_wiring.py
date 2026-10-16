@@ -2640,6 +2640,10 @@ def test_scheduler_continuous_mtp_headroom_uses_unified_process_pressure(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._resolve_metal_cap_bytes = lambda: cap
     scheduler._current_metal_active_bytes = lambda: metal
+    # The live MLX allocator cache (freed buffers earlier tests left, e.g.
+    # 24 bytes -> 36 != 40) must not reach the arithmetic: it made this case
+    # pass or fail by test order.
+    scheduler._current_metal_cache_bytes = lambda: 0
     scheduler._current_process_resident_bytes = lambda: resident
 
     assert scheduler._continuous_mtp_free_bytes() == expected

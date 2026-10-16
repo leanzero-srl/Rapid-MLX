@@ -8694,13 +8694,37 @@ class Scheduler:
         entries = self.memory_aware_cache._entries  # noqa: SLF001
         arm = []
         for r in covering:
+            if len(key) > self._memguard_resume_limit(r):
+                # Past the row's message boundary: not a resume point of its
+                # next (re-rendered) prompt, so evicting it loses nothing --
+                # and arming it would replace the boundary the row keeps
+                # with a dead entry (review of d03e2e5af: a requeue entry
+                # prompt[:held] past the boundary overwrote RC9's kept (B,
+                # state); the turn end stored held, B was lost, turn 2
+                # cached 8 instead of 48).
+                continue
             kept = getattr(r, "_memguard_boundary_state", None)
             if kept is not None and kept[0] >= len(key):
-                continue  # it rebuilds a later boundary already
+                continue  # it rebuilds a resume point at least as good
             if self._memguard_resume_point_kept(r, len(key), entries, skip=key):
                 continue
             arm.append(r)
         return ("arm", arm) if arm else ("fine", [])
+
+    @staticmethod
+    def _memguard_resume_limit(request: Request) -> int:
+        """The longest entry that can resume ``request``'s NEXT prompt: its
+        message boundary when it has one (the reply after it is
+        re-rendered), else its whole prompt."""
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        return boundary if boundary > 0 else len(request.prompt_token_ids or ())
 
     def _memguard_resume_point_kept(
         self, request: Request, at_least: int, entries: Any, skip: Any = None

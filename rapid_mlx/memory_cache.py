@@ -2743,11 +2743,15 @@ class MemoryAwarePrefixCache:
     def _notify_evict(self, tokens_key: tuple[int, ...], reason: str) -> None:
         """Tell the owner (the scheduler's memory guard, ``evict_hook``) an
         entry is about to leave, with the entry still readable. Every path
-        that drops an entry calls it, except an admission handoff (the
-        entry is not lost: a request takes it over). Caller holds the lock;
-        a failing hook never blocks the eviction."""
+        that drops an entry calls it -- an admission handoff too: the request
+        that takes the buffers over runs PAST the entry and cannot give it
+        back unless it keeps the entry's state (review of d03e2e5af: an
+        SRPF-parked row resumed with its boundary as ``cached_tokens``, the
+        handoff evicted that boundary entry, the next turn cached 0). Caller
+        holds the lock; a failing hook never blocks the eviction."""
+        del reason
         hook = getattr(self, "evict_hook", None)
-        if hook is None or reason == "handoff":
+        if hook is None:
             return
         entry = self._entries.get(tokens_key)
         if entry is None:

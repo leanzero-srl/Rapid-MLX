@@ -241,3 +241,124 @@ def test_a_kept_resume_point_keeps_the_end_of_turn_store(hybrid4, kernel):
     lengths = sorted(len(k) for k in s.memory_aware_cache._entries)
     assert lengths[-1] == len(turn_1) + 4, lengths  # prompt + output stored
     assert 16 not in lengths
+
+
+# -- review of d03e2e5af (probes in scratchpad rc10probe/) ------------------
+
+HELD = 56  # past the 48-token boundary, inside the 61-token prompt
+
+
+def test_an_entry_past_the_boundary_never_replaces_the_kept_boundary(hybrid4, kernel):
+    """D1 (regression): RC9 kept (48, state) because the copy did not fit;
+    the row then holds a requeue-style entry prompt[:56] (a deferral's
+    re-fetch) and that entry is evicted. Arming it replaced the kept state:
+    the turn end stored a dead 56-token entry and turn 2 cached 8 (RC9: 48).
+    An entry past the row's message boundary is no resume point of its next
+    prompt: evicting it arms nothing."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    turn_1, turn_2 = _conversation()
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=True)
+    main = _turn("t1", turn_1, BOUNDARY_1, 6)
+    s.add_request(main)
+    mac = s.memory_aware_cache
+    done = False
+    for _ in range(400):
+        s.step()
+        kept = getattr(main, "_memguard_boundary_state", None)
+        if (
+            not done
+            and kept is not None
+            and main.request_id in s.running
+            and main.num_output_tokens >= 1
+        ):
+            assert kept[0] == BOUNDARY_1
+            fresh = make_prompt_cache(hybrid4)
+            hybrid4(mx.array([turn_1[:HELD]]), cache=fresh)
+            mx.eval([c.state for c in fresh])
+            assert mac.store(list(turn_1[:HELD]), fresh, evict_prefixes=False)
+            main.cached_tokens = HELD
+            with mac._lock:
+                mac._evict_entry_locked(tuple(turn_1[:HELD]), reason="system pressure")
+            assert main._memguard_boundary_state[0] == BOUNDARY_1
+            done = True
+        if done and not s.has_requests():
+            break
+    assert done
+    assert sorted(len(k) for k in mac._entries) == [BOUNDARY_1]
+    _, tokens_2, cached_2 = _run(s, {0: [_turn("t2", turn_2, BOUNDARY_2, 8)]})
+    assert cached_2["t2"] == BOUNDARY_1
+    _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
+    assert tokens_2["t2"] == copied_2
+
+
+@pytest.mark.parametrize("reason", ["handoff", "system pressure", "lru_evict"])
+def test_every_eviction_path_arms_the_covering_row(hybrid4, kernel, reason):
+    """D2: an admission handoff evicts prompt[:cached]; an SRPF-parked row
+    resumes with exactly its boundary as cached_tokens (RC9 chatcmpl-898:
+    80,717), so the handed-over key is the boundary entry itself. The hook
+    skipped "handoff": turn 2 cached 0. Every reason arms now."""
+    turn_1, turn_2 = _conversation()
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=False)
+    main = _turn("t1", turn_1, BOUNDARY_1, 6)
+    s.add_request(main)
+    key = tuple(turn_1[:BOUNDARY_1])
+    done = False
+    for _ in range(400):
+        s.step()
+        if (
+            not done
+            and key in s.memory_aware_cache._entries
+            and main.request_id in s.running
+            and main.num_output_tokens >= 1
+        ):
+            main.cached_tokens = BOUNDARY_1  # as after the SRPF park
+            mac = s.memory_aware_cache
+            with mac._lock:
+                mac._evict_entry_locked(key, reason=reason)
+            done = True
+        if done and not s.has_requests():
+            break
+    assert done
+    _, tokens_2, cached_2 = _run(s, {0: [_turn("t2", turn_2, BOUNDARY_2, 8)]})
+    assert cached_2["t2"] == BOUNDARY_1
+    _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
+    assert tokens_2["t2"] == copied_2
+
+
+def test_a_true_admission_handoff_answers_as_a_copy_would(hybrid4, kernel):
+    """A real admission handoff: turn 2 takes turn 1's boundary entry's
+    buffers over (the copy "does not fit"), and the hook arms it with that
+    entry's recurrent state by reference. The turn-2 answer is unchanged,
+    the state is superseded by turn 2's own stored boundary, and turn 3
+    resumes from that boundary."""
+    turn_1, turn_2 = _conversation()
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=False)
+    _run(s, {0: [_turn("t1", turn_1, BOUNDARY_1, 6)]})
+    key = tuple(turn_1[:BOUNDARY_1])
+    assert key in s.memory_aware_cache._entries
+    t2 = _turn("t2", turn_2, BOUNDARY_2, 8)
+    real = s._memguard_admit_handoffs
+    armed = {}
+
+    def handoff(guard, ceiling, rows):
+        # force the hand-over branch: the copy-on-admit "does not fit"
+        s._metal_footprint_bytes = lambda **_k: 10**15
+        try:
+            return real(guard, ceiling, rows)
+        finally:
+            del s._metal_footprint_bytes
+            state = getattr(t2, "_memguard_boundary_state", None)
+            if state is not None:
+                armed.setdefault("state", state)
+
+    s._memguard_admit_handoffs = handoff
+    _, tokens_2, cached_2 = _run(s, {0: [t2]})
+    assert cached_2["t2"] == BOUNDARY_1
+    assert s._memguard().counts["admission_handoffs"] >= 1
+    assert armed.get("state") is not None and armed["state"][0] == BOUNDARY_1
+    _, copied_2, *_ = _two_turns(hybrid4, refuse_copies=False)
+    assert tokens_2["t2"] == copied_2
+    assert t2._memguard_boundary_state is None
+    assert tuple(turn_2[:BOUNDARY_2]) in s.memory_aware_cache._entries
