@@ -53,6 +53,15 @@ from tests.test_lz_singleton_srpf import (  # noqa: E402,F401
 )
 
 BOUNDARY_1, PROMPT_1 = 48, 61
+
+
+@pytest.fixture(autouse=True)
+def _calm_kernel(monkeypatch):
+    """The laptop's own kernel pressure level must not reach these tests
+    (the guard gives entries back at WARN)."""
+    import rapid_mlx.memory_budget as memory_budget
+
+    monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: 0)
 BOUNDARY_2, PROMPT_2 = 72, 83
 
 

@@ -182,3 +182,62 @@ def test_an_armable_entry_is_credited_without_the_state_it_hands_on(hybrid4, ker
     assert recurrent > 0
     total = sum(int(a.nbytes) for _l, _s, a in _layer_arrays(entry.cache))
     assert after == pytest.approx(before * (total - recurrent) / total, abs=2)
+
+
+def _plain_hybrid(model):
+    """The hybrid without MTP: its turn end stores prompt + output."""
+    from tests.test_lz_singleton_srpf import _scheduler
+
+    return _scheduler(
+        model,
+        enable_prefix_cache=True,
+        use_memory_aware_cache=True,
+        hybrid_cache_entries=8,
+        spec_decode="none",
+        max_num_seqs=1,
+    )
+
+
+def _arm_at(request, length, model):
+    from mlx_lm.models.cache import ArraysCache
+
+    states = [
+        ArraysCache(2) if layer.is_linear else None for layer in model.layers
+    ]
+    request._memguard_boundary_state = (length, states)
+
+
+def test_a_boundary_stored_after_an_arm_supersedes_it(hybrid4, kernel):
+    """A row armed at a shorter entry (evicted before the row reached its
+    boundary) that then stores its boundary copy keeps no armed state: the
+    copy is the better resume point."""
+    turn_1, _ = _conversation()
+    s = _plain_hybrid(hybrid4)
+    main = _turn("t1", turn_1, BOUNDARY_1, 4)
+    s.add_request(main)
+    _arm_at(main, 16, hybrid4)
+    for _ in range(200):
+        s.step()
+        if tuple(turn_1[:BOUNDARY_1]) in s.memory_aware_cache._entries:
+            break
+    assert tuple(turn_1[:BOUNDARY_1]) in s.memory_aware_cache._entries
+    assert main._memguard_boundary_state is None
+
+
+def test_a_kept_resume_point_keeps_the_end_of_turn_store(hybrid4, kernel):
+    """An armed row whose conversation already holds a resume point at
+    least as good does not trade its end-of-turn entry for a cut."""
+    turn_1, _ = _conversation()
+    s = _plain_hybrid(hybrid4)
+    main = _turn("t1", turn_1, BOUNDARY_1, 4)
+    s.add_request(main)
+    for _ in range(200):
+        s.step()
+        if tuple(turn_1[:BOUNDARY_1]) in s.memory_aware_cache._entries:
+            break
+    _arm_at(main, 16, hybrid4)  # armed, with the 48-token boundary kept
+    while s.has_requests():
+        s.step()
+    lengths = sorted(len(k) for k in s.memory_aware_cache._entries)
+    assert lengths[-1] == len(turn_1) + 4, lengths  # prompt + output stored
+    assert 16 not in lengths
