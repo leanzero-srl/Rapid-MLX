@@ -5538,7 +5538,9 @@ class Scheduler:
                 )
                 return
 
-            if not self._memguard_room_for_store(request, extracted_cache):
+            if not self._memguard_room_for_store(
+                request, extracted_cache, tokens=len(request.prompt_token_ids)
+            ):
                 return
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
@@ -5855,7 +5857,9 @@ class Scheduler:
             prefix_tokens = list(request.prompt_token_ids[:prefix_boundary])
             _t0 = _time.monotonic()
             stored = False
-            if not self._memguard_room_for_store(request, reconstructed):
+            if not self._memguard_room_for_store(
+                request, reconstructed, tokens=len(prefix_tokens)
+            ):
                 request._boundary_snapshot_taken = True
                 request._cache_snapshot_stored = False
                 continue
@@ -7401,10 +7405,12 @@ class Scheduler:
         ]:
             holders.append(getattr(request, "prompt_cache", None))
             holders.append(getattr(request, "_extracted_cache", None))
+        held_arrays: list[Any] = []
         for caches in holders:
             if isinstance(caches, (list, tuple)):
                 for _layer, _slot, a in _layer_arrays(caches):
                     held_ids.add(id(a))
+                    held_arrays.append(a)
         arrays: dict[tuple, list[tuple[Any, int | None]]] = {}
         counts: dict[int, int] = {}
         for key, entry in entries.items():
@@ -7415,6 +7421,22 @@ class Scheduler:
                 if address is not None:
                     counts[address] = counts.get(address, 0) + 1
             arrays[key] = items
+        # A prefix hit's loan is a ``copy.deepcopy`` of the entry: new array
+        # objects over the SAME buffers (mlx 0.32.2: no copy, not even on
+        # eval). Matched by address -- only arrays the size of an entry's
+        # (a whole buffer), so nothing in flight or lazy is evaluated for it.
+        # A live buffer an entry shares since a mid-turn store is not held:
+        # evicting cancels its planned re-allocation (see above).
+        sizes = {
+            int(a.nbytes) for items in arrays.values() for a, addr in items if addr
+        }
+        pending = set(getattr(self, "_memguard_shared", {}) or {})
+        held_addresses: set[int] = set()
+        for a in held_arrays:
+            if int(a.nbytes) in sizes:
+                address = _buffer_address(a)
+                if address is not None and address not in pending:
+                    held_addresses.add(address)
         out: dict[tuple, int] = {}
         for key, entry in entries.items():
             if not hasattr(entry, "memory_bytes"):
@@ -7432,6 +7454,7 @@ class Scheduler:
                 int(a.nbytes)
                 for a, address in items
                 if id(a) in held_ids
+                or address in held_addresses
                 or (address is not None and counts.get(address, 0) > 1)
             )
             out[key] = int(charge * max(0, total - held) / total)
@@ -7452,11 +7475,16 @@ class Scheduler:
             )
 
     def _memguard_next_eviction(
-        self, max_level: int, ranked: list | None = None, freeable: dict | None = None
+        self,
+        max_level: int,
+        ranked: list | None = None,
+        freeable: dict | None = None,
+        accept: Any = None,
     ) -> tuple[tuple, int, int] | None:
         """``(key, level, bytes it frees)`` of the entry the ONE policy takes
         next at ``max_level``: the first in eviction order whose eviction
-        frees something. Caller holds the cache lock."""
+        frees something (and that ``accept(key)`` allows). Caller holds the
+        cache lock."""
         if ranked is None:
             ranked = self._memguard_ranked_entries()
         if freeable is None:
@@ -7464,6 +7492,8 @@ class Scheduler:
         for key, level, _cost in ranked:
             if level > max_level:
                 return None
+            if accept is not None and not accept(key):
+                continue
             frees = freeable.get(key, 0)
             if frees > 0:
                 return key, level, frees
@@ -7487,6 +7517,7 @@ class Scheduler:
         reason: str = "memory_guard",
         count: bool = True,
         storing_line: tuple[Any, Any] | None = None,
+        accept: Any = None,
     ) -> bool:
         """THE prefix-cache eviction policy (E1, E5, the pressure evictor and
         store-time room all call it): evict the least-recently-used entry of
@@ -7512,7 +7543,7 @@ class Scheduler:
                 # The first entry in order whose eviction frees something: one
                 # whose buffers a live cache, a loan or another entry still
                 # holds would give no room and cost what it holds.
-                nxt = self._memguard_next_eviction(max_level, ranked)
+                nxt = self._memguard_next_eviction(max_level, ranked, accept=accept)
                 if nxt is None:
                     return False
                 best_key, best_level, _frees = nxt
@@ -8505,7 +8536,9 @@ class Scheduler:
             layer.__dict__.pop("_lz_sole_owner", None)
         tokens = list(request.prompt_token_ids[:held])
         try:
-            if not self._memguard_room_for_store(request, cache, handoff=solo):
+            if not self._memguard_room_for_store(
+                request, cache, handoff=solo, tokens=len(tokens)
+            ):
                 return
             stored = mac.store(
                 tokens,
@@ -9516,9 +9549,13 @@ class Scheduler:
         guard = getattr(self, "_memory_guard", None)
         uid = self.request_id_to_uid.get(request.request_id) if guard else None
         gen = getattr(self.batch_generator, "_generation_batch", None)
-        if uid is None or uid not in list(getattr(gen, "uids", None) or ()):
+        if uid is None:
             return 0
         knob = self._memguard_verify_rows_range()
+        if uid not in list(getattr(gen, "uids", None) or ()):
+            # Still prefilling (a message-boundary snapshot): its decode comes
+            # next -- at least the narrowest verify's restore points.
+            return self._memguard_verify_bytes_per_row(knob[0]) if knob else 0
         try:
             need = self._memguard_decode_growth(
                 guard, writes=knob[0] if knob is not None else None
@@ -9527,6 +9564,35 @@ class Scheduler:
             self._memguard_decode_growth(guard)  # the plan's own charge back
         return max(0, int(need))
 
+    def _memguard_resident_checkpoint_bytes(self, cache: Any) -> int:
+        """Bytes of ``cache``'s recurrent-state checkpoints that are already
+        resident: they ride on the layer BY REFERENCE (the very arrays a live
+        request's checkpoint holders, or a stored entry, hold), so storing
+        them allocates nothing. RC7 ladder (Gabee, 87,375 tokens): a 6.50 GB
+        boundary entry was refused for 0.42 GB while 0.62 GB of it were
+        these arrays -- the conversation lost its only entry."""
+        held: set[int] = set()
+        for holders in list(getattr(self, "_hybrid_checkpoints", {}).values()):
+            for holder in holders or ():
+                if holder is not None:
+                    held.update(id(a) for a in holder.arrays())
+        mac = getattr(self, "memory_aware_cache", None)
+        held.update(getattr(mac, "_shared_refs", None) or {})
+        seen: set[int] = set()
+        total = 0
+        try:
+            holders = _collect_state_checkpoints(cache)
+        except Exception:  # noqa: BLE001
+            return 0
+        for holder in holders:
+            if holder is None:
+                continue
+            for a in holder.arrays():
+                if id(a) in held and id(a) not in seen:
+                    seen.add(id(a))
+                    total += int(getattr(a, "nbytes", 0) or 0)
+        return total
+
     def _memguard_room_for_store(
         self,
         request: Request | None,
@@ -9534,12 +9600,16 @@ class Scheduler:
         *,
         handoff: bool = False,
         turn_end: bool = False,
+        tokens: int = 0,
     ) -> bool:
         """Before a prefix entry is copied in (E3 store-time): the copy must
         fit beside everything resident now. Make room with the ONE eviction
-        policy up to the redundant level (never an entry a live session still
-        needs); if it still does not fit, skip this store (logged) -- never
-        an OOM in the copy."""
+        policy: up to the redundant level; then, for a conversation's entry
+        (``tokens``: its length), entries of OTHER conversations that are
+        cheaper to re-prefill (fewer tokens), cheapest first, up to their
+        newest -- only for real bytes, and only when that makes it fit. If it
+        still does not fit, skip this store (logged loudly when it leaves the
+        conversation with no entry) -- never an OOM in the copy."""
         guard = getattr(self, "_memory_guard", None)
         if guard is None or not cache:
             return True
@@ -9558,6 +9628,7 @@ class Scheduler:
                 )
             else:
                 need = int(estimate_kv_cache_memory(cache))
+                need -= self._memguard_resident_checkpoint_bytes(cache)
         except Exception:  # noqa: BLE001
             return True
         if not handoff and not turn_end and request is not None:
@@ -9586,6 +9657,7 @@ class Scheduler:
                 request.prompt_token_ids,
                 int(getattr(request, "cached_tokens", 0) or 0),
             )
+        line = self._memguard_line(request) if request is not None else None
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - need - margin)
         while footprint + need + margin > ceiling:
             if not self._memguard_evict_ordered(
@@ -9593,25 +9665,65 @@ class Scheduler:
                 storing=storing,
                 finished=finished,
                 reason="store-room",
-                storing_line=(
-                    self._memguard_line(request) if request is not None else None
-                ),
+                storing_line=line,
             ):
                 break
             mx.clear_cache()
             footprint = self._metal_footprint_bytes()
+        mac = getattr(self, "memory_aware_cache", None)
+        if footprint + need + margin > ceiling and tokens > 0 and mac is not None:
+            # The conversation's next-turn entry (RC7 ladder: its loss cost
+            # the main 567 s per turn, every turn after). Entries that cost
+            # less to re-prefill give way -- another conversation's, or this
+            # one's own older ones (this entry supersedes them).
+            def cheaper(key: tuple) -> bool:
+                return key in mac._entries and len(key) < tokens  # noqa: SLF001
+
+            with mac._lock:  # noqa: SLF001
+                ranked = self._memguard_ranked_entries(storing, finished, line)
+                freeable = self._memguard_freeable_bytes()
+                available = sum(
+                    freeable.get(k, 0) for k, lv, _c in ranked if cheaper(k)
+                )
+            if footprint - available + need + margin <= ceiling:
+                while footprint + need + margin > ceiling:
+                    if not self._memguard_evict_ordered(
+                        EVICT_LAST,
+                        storing=storing,
+                        finished=finished,
+                        reason="store-room",
+                        storing_line=line,
+                        accept=cheaper,
+                    ):
+                        break
+                    mx.clear_cache()
+                    footprint = self._metal_footprint_bytes()
         if footprint + need + margin <= ceiling:
             return True
         guard.counts["store_skips"] += 1
         if turn_end:
             guard.counts["turn_store_skips"] += 1
+        orphaned = False
+        if request is not None and mac is not None:
+            prompt = request.prompt_token_ids
+            orphaned = not any(
+                self._memguard_is_prefix(k, prompt) for k in list(mac._entries)  # noqa: SLF001
+            )
+            if orphaned:
+                guard.counts["orphaned_store_skips"] += 1
         logger.warning(
             "[memory_guard] skipped storing a %.2fGB prefix entry: resident "
-            "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB",
+            "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB%s",
             need / 1e9,
             footprint / 1e9,
             margin / 1e9,
             ceiling / 1e9,
+            (
+                " -- the conversation keeps NO entry for its next turn "
+                "(nothing cheaper could give the room)"
+                if orphaned
+                else ""
+            ),
         )
         return False
 
@@ -13817,7 +13929,11 @@ class Scheduler:
                             except TypeError:
                                 solo = False
                             stored = self._memguard_room_for_store(
-                                request, handed, handoff=solo, turn_end=True
+                                request,
+                                handed,
+                                handoff=solo,
+                                turn_end=True,
+                                tokens=len(full_token_sequence),
                             ) and self.memory_aware_cache.store(
                                 full_token_sequence,
                                 handed,
