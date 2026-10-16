@@ -1258,7 +1258,10 @@ def _render_prompt(
                     len(dropped_kinds),
                     sorted(set(dropped_kinds)),
                 )
-            content = "".join(text_pieces)
+            # Newline-joined, like ``extract_multimodal_content`` on the
+            # standard server: a text part next to an image notice must not
+            # run into it mid-sentence.
+            content = "\n".join(text_pieces)
         message["content"] = content
         messages.append(message)
 
