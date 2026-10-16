@@ -2758,6 +2758,13 @@ def _install_mtp_vendored(
         for response in responses:
             if getattr(response, "finish_reason", None) is not None:
                 if response.uid in _state and hasattr(response, "prompt_cache"):
+                    # Never published as is. Kept aside, still lazy (no
+                    # bytes of its own), for the one consumer that cuts it to
+                    # a point the lookahead cannot reach: a hybrid
+                    # boundary rebuilt at the turn end
+                    # (Scheduler._memguard_hand_over_boundary). Dropped with
+                    # the response otherwise.
+                    response._lz_uncommitted_cache = response.prompt_cache
                     response.prompt_cache = None
                 _reap_uid(response.uid)
         return responses
@@ -5862,6 +5869,12 @@ class Scheduler:
             ):
                 request._boundary_snapshot_taken = True
                 request._cache_snapshot_stored = False
+                # The COPY does not fit beside the live KV: keep only what
+                # cannot be trimmed, and build the entry from the request's
+                # own KV at its turn end (_memguard_hand_over_boundary).
+                self._memguard_keep_boundary_state(
+                    request, reconstructed, prefix_boundary
+                )
                 continue
             try:
                 # evict_prefixes=False matches the prompt-cache save
@@ -8542,6 +8555,158 @@ class Scheduler:
         self._memguard_reset_for_requeue(request)
         self.waiting.appendleft(request)
 
+    def _memguard_keep_boundary_state(
+        self, request: Request, cache: list[Any], boundary: int
+    ) -> None:
+        """A hybrid message-boundary COPY did not fit beside the live KV (RC8
+        Gabee 05:34:10: 9.22 GB at 120k tokens, resident 43.08 GB, ceiling
+        50.10 GB -- the conversation lost its only entry and the next turn
+        re-prefilled 126,664 tokens). Keep ONLY what cannot be trimmed: the
+        recurrent layers' state at the boundary (conv + SSM state; ~147 MB
+        on the 27B). The full-attention KV is not copied: the request's own
+        KV, trimmed back to the boundary at its turn end, is that KV
+        (:meth:`_memguard_hand_over_boundary`).
+
+        Only for a cache whose every layer is either a recurrent
+        ``ArraysCache`` or a plain ``KVCache`` (the layouts the turn end can
+        rebuild); anything else keeps today's behaviour."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from .memory_cache import _layer_is_non_trimmable, own_cache_bytes
+
+        if (
+            self.memory_aware_cache is None
+            or boundary <= 0
+            or not cache
+            or not _cache_has_non_trimmable(cache)
+        ):
+            return
+        kept: list[Any] = []
+        for layer in cache:
+            if _layer_is_non_trimmable(layer):
+                if type(layer) is not ArraysCache:
+                    return
+                kept.append(layer)
+            elif type(layer) is KVCache:
+                kept.append(None)
+            else:
+                return
+        state = [layer for layer in kept if layer is not None]
+        if not self._memguard_room_for_store(
+            request, state, kind="boundary recurrent state"
+        ):
+            return
+        own_cache_bytes(state)
+        request._memguard_boundary_state = (int(boundary), kept)
+        logger.info(
+            "[memory_guard] request %s keeps its %d-token message boundary as "
+            "recurrent state only (%.2fGB); its own KV, trimmed to the "
+            "boundary at the turn end, becomes the entry",
+            request.request_id[:12],
+            boundary,
+            sum(int(a.nbytes) for _l, _s, a in _layer_arrays(state)) / 1e9,
+        )
+
+    def _memguard_hand_over_boundary(self, request: Request, kv: Any) -> bool:
+        """At a turn end: build the message-boundary entry the copy could not
+        hold (:meth:`_memguard_keep_boundary_state`) from the finished row's
+        own KV, and hand it over -- never two copies of the session.
+
+        Correct because a KV position below the boundary is written once, by
+        the prefill, and never again: decode appends past the prompt, an MTP
+        verify appends its rows and a rejected draft is trimmed back to
+        them, and every batch transform (merge/extend/filter/extract) moves
+        rows and padding without rewriting a position's content. So the KV
+        trimmed to the boundary is the boundary's KV whatever the verifier
+        left past it -- the speculative lookahead an MTP turn end must never
+        publish (``_mtp_next``) is cut off with the rest of the turn. The
+        recurrent layers cannot be trimmed: the state kept at the boundary
+        replaces them.
+
+        The finished row arrives as offset-trimmed copies still LAZY over the
+        live buffers; each layer is cut to the boundary and made owned in
+        turn, so a layer's transient is its full copy plus its trimmed copy,
+        and its live buffer is freed as the copy lands (a solo row). The
+        guard plans exactly that."""
+        from mlx_lm.models.cache import KVCache
+
+        kept = getattr(request, "_memguard_boundary_state", None)
+        request._memguard_boundary_state = None
+        mac = getattr(self, "memory_aware_cache", None)
+        if kept is None or mac is None or not kv:
+            return False
+        boundary, states = kept
+        prompt = list(request.prompt_token_ids or ())
+        cache = list(kv)
+        if boundary > len(prompt) or len(cache) != len(states):
+            return False
+        if any(
+            len(key) >= boundary and self._memguard_is_prefix(key, prompt)
+            for key in list(mac._entries)  # noqa: SLF001
+        ):
+            return False  # a later store of this turn already resumes it
+        held = 0
+        transient = 0
+        for index, (layer, state) in enumerate(zip(cache, states, strict=True)):
+            if state is not None:
+                cache[index] = state
+                continue
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if (
+                not isinstance(layer, KVCache)
+                or not isinstance(keys, mx.array)
+                or not isinstance(values, mx.array)
+            ):
+                return False
+            offset = int(layer.offset)
+            if offset < boundary or keys.shape[2] < offset:
+                return False
+            held = max(held, offset)
+            full = int(keys.nbytes) + int(values.nbytes)
+            transient = max(transient, full + full * boundary // keys.shape[2])
+        if held <= 0:
+            return False
+        uid = self.request_id_to_uid.get(request.request_id)
+        gen = getattr(self.batch_generator, "_generation_batch", None)
+        try:
+            solo = gen is None or len(gen) == 0
+        except TypeError:
+            solo = False
+        for layer in cache:
+            if type(layer) is KVCache:
+                layer.trim(int(layer.offset) - boundary)
+        self._attach_hybrid_checkpoints(uid, cache, length=boundary)
+        tokens = prompt[:boundary]
+        if not self._memguard_room_for_store(
+            request,
+            cache,
+            handoff=solo,
+            turn_end=True,
+            tokens=boundary,
+            need=transient if solo else None,
+        ):
+            return False
+        stored = mac.store(
+            tokens,
+            cache,
+            evict_prefixes=False,
+            message_boundary=True,
+            handoff=True,
+            **self._memguard_owner(request),
+        )
+        if stored:
+            request._cache_snapshot_stored = True
+            logger.warning(
+                "[memory_guard] request %s keeps its %d-token message-boundary "
+                "entry by handing over its own KV (cut from %d tokens; no copy "
+                "of the session)",
+                request.request_id[:12],
+                boundary,
+                held,
+            )
+        return bool(stored)
+
     def _memguard_keep_requeued_kv(
         self, request: Request, payload: Any, *, solo: bool
     ) -> None:
@@ -9648,6 +9813,8 @@ class Scheduler:
         handoff: bool = False,
         turn_end: bool = False,
         tokens: int = 0,
+        need: int | None = None,
+        kind: str = "prefix entry",
     ) -> bool:
         """Before a prefix entry is copied in (E3 store-time): the copy must
         fit beside everything resident now. Make room with the ONE eviction
@@ -9656,7 +9823,11 @@ class Scheduler:
         cheaper to re-prefill (fewer tokens), cheapest first, up to their
         newest -- only for real bytes, and only when that makes it fit. If it
         still does not fit, skip this store (logged loudly when it leaves the
-        conversation with no entry) -- never an OOM in the copy."""
+        conversation with no entry) -- never an OOM in the copy.
+
+        ``need``: the caller's own byte count, when it knows the copy's
+        transient better than the estimate (a boundary handed over from a
+        finished row). ``kind`` names what is stored, in the skip log."""
         guard = getattr(self, "_memory_guard", None)
         if guard is None or not cache:
             return True
@@ -9666,7 +9837,9 @@ class Scheduler:
         try:
             from .memory_cache import estimate_kv_cache_memory
 
-            if handoff:
+            if need is not None:
+                need = int(need)
+            elif handoff:
                 # Layer-by-layer takeover of a finished request's cache whose
                 # source buffers die as each copy lands: one layer of room.
                 need = max(
@@ -9766,32 +9939,52 @@ class Scheduler:
         guard.counts["store_skips"] += 1
         if turn_end:
             guard.counts["turn_store_skips"] += 1
-        orphaned = False
-        if request is not None and mac is not None and _cache_has_non_trimmable(cache):
-            # Hybrid only: a non-trimmable conversation resumes from its
-            # mid-turn snapshots alone (no end-of-turn entry matches its next,
-            # re-rendered prompt); a plain KV one still stores at turn end.
-            prompt = request.prompt_token_ids
-            orphaned = not any(
-                self._memguard_is_prefix(k, prompt) for k in list(mac._entries)  # noqa: SLF001
-            )
-            if orphaned:
-                guard.counts["orphaned_store_skips"] += 1
+        if request is not None and _cache_has_non_trimmable(cache):
+            # Whether the conversation is left with NO entry is known only
+            # when its turn ends (a later store of this turn may still keep
+            # one): _memguard_note_orphaned_turn, from _cleanup_finished.
+            request._memguard_store_skipped = True
         logger.warning(
-            "[memory_guard] skipped storing a %.2fGB prefix entry: resident "
-            "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB%s",
+            "[memory_guard] skipped storing a %.2fGB %s: resident "
+            "%.2fGB + entry + margin %.2fGB > ceiling %.2fGB",
             need / 1e9,
+            kind,
             footprint / 1e9,
             margin / 1e9,
             ceiling / 1e9,
-            (
-                " -- the conversation keeps NO entry for its next turn "
-                "(nothing cheaper could give the room)"
-                if orphaned
-                else ""
-            ),
         )
         return False
+
+    def _memguard_note_orphaned_turn(self, request: Request) -> None:
+        """At a turn end: a hybrid conversation that had a store skipped this
+        turn and holds no entry its next prompt can resume from is counted
+        (``orphaned_store_skips``) and logged loudly -- once, and only now.
+        A skip mid-prefill is not an orphan when a later store of the same
+        turn keeps an entry (RC8 05:28:34: the warning fired, and 4 s later
+        the 99,963-token prompt entry was stored and the next step HIT)."""
+        if not getattr(request, "_memguard_store_skipped", False):
+            return
+        request._memguard_store_skipped = False
+        guard = getattr(self, "_memory_guard", None)
+        mac = getattr(self, "memory_aware_cache", None)
+        if guard is None or mac is None:
+            return
+        prompt = request.prompt_token_ids or ()
+        # Hybrid only (the flag is set for non-trimmable caches): it resumes
+        # from an entry at an exact boundary of its own prompt alone (no
+        # end-of-turn entry matches its next, re-rendered prompt).
+        kept = any(
+            self._memguard_is_prefix(k, prompt) for k in list(mac._entries)  # noqa: SLF001
+        )
+        if kept:
+            return
+        guard.counts["orphaned_store_skips"] += 1
+        logger.warning(
+            "[memory_guard] request %s ends its turn and the conversation "
+            "keeps NO entry for its next turn (its stores did not fit; "
+            "nothing cheaper could give the room)",
+            request.request_id[:12],
+        )
 
     def _memguard_backstop(
         self,
@@ -12157,8 +12350,32 @@ class Scheduler:
             was_running = True
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
-                self.batch_generator.remove([uid])
+                boundary_kept = (
+                    request is not None
+                    and getattr(request, "_memguard_boundary_state", None) is not None
+                )
+                if boundary_kept:
+                    kept = self.batch_generator.remove(
+                        [uid], return_prompt_caches=True
+                    )
+                else:
+                    kept = None
+                    self.batch_generator.remove([uid])
                 removed_from_batch = True
+                if boundary_kept:
+                    # A cancelled turn still keeps the boundary its copy
+                    # could not hold: the row's own KV cut to it.
+                    payload = kept.get(uid) if isinstance(kept, dict) else None
+                    del kept
+                    try:
+                        if isinstance(payload, tuple) and payload[0]:
+                            self._memguard_hand_over_boundary(request, payload[0])
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "[memory_guard] boundary handoff on abort failed",
+                            exc_info=True,
+                        )
+                    del payload
             del self.uid_to_request_id[uid]
             self._hybrid_checkpoints.pop(uid, None)
             # #558 PR-3: drop the aborted uid's grammar processor state (the
@@ -12181,6 +12398,9 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
+            request._memguard_turn_end_kv = None
+            request._memguard_boundary_state = None
+            self._memguard_note_orphaned_turn(request)
         if self.block_aware_cache is not None:
             # A cancelled request stores nothing, so nothing owns the block
             # refs its fetch hit acquired — release them here. Idempotent
@@ -13330,14 +13550,24 @@ class Scheduler:
                 "scheduler generated a terminal response without a BatchGenerator"
             )
         retain_cache = getattr(self, "spec_decode_runtime_method", None) != "mtp"
+        # A hybrid boundary whose copy did not fit is rebuilt from the row's
+        # own KV cut to the boundary, where the lookahead does not reach
+        # (_memguard_hand_over_boundary): an MTP row's cache is kept for that
+        # alone, never published as is.
+        request_id = self.uid_to_request_id.get(response.uid)
+        request = self.requests.get(request_id) if request_id else None
+        boundary_kept = (
+            getattr(request, "_memguard_boundary_state", None) is not None
+        )
         caches = batch_generator.remove(
             [response.uid],
-            return_prompt_caches=retain_cache,
+            return_prompt_caches=retain_cache or boundary_kept,
         )
-        if not retain_cache:
-            return
         cached = caches.get(response.uid) if isinstance(caches, dict) else None
         if cached is None:
+            return
+        if not retain_cache:
+            response._lz_uncommitted_cache = cached[0]
             return
         response.prompt_cache, response.all_tokens = cached
 
@@ -13716,6 +13946,21 @@ class Scheduler:
                     except Exception as e:
                         logger.debug(f"Failed to extract cache for {request_id}: {e}")
 
+                # A hybrid boundary whose copy did not fit is rebuilt from
+                # this row's own KV (cut to the boundary). An MTP row's cache
+                # can be ahead of its emitted tokens and is never published
+                # as is; cut to the boundary it is exact
+                # (_memguard_hand_over_boundary). The end-of-turn entry
+                # (prompt + output) gives way: the KV is held once.
+                uncommitted = getattr(response, "_lz_uncommitted_cache", None)
+                response._lz_uncommitted_cache = None
+                if getattr(request, "_memguard_boundary_state", None) is not None:
+                    turn_kv = getattr(request, "_extracted_cache", None) or uncommitted
+                    if turn_kv and self.block_aware_cache is None:
+                        request._extracted_cache = None
+                        request._memguard_turn_end_kv = turn_kv
+                del uncommitted
+
                 # Continuous self-MTP terminal responses carry the detached
                 # draft cache plus exact seed hidden state alongside the target
                 # cache. Keep that opaque sidecar on the request through
@@ -13964,6 +14209,18 @@ class Scheduler:
                     # requests that share a common prefix (e.g. same system
                     # prompt + tools but different user message).  LRU
                     # eviction handles memory pressure.
+                    turn_kv = getattr(request, "_memguard_turn_end_kv", None)
+                    request._memguard_turn_end_kv = None
+                    if turn_kv is not None:
+                        try:
+                            self._memguard_hand_over_boundary(request, turn_kv)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "[memory_guard] boundary handoff failed for %s",
+                                request_id,
+                                exc_info=True,
+                            )
+                        del turn_kv
 
                     # Store in memory-aware prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
@@ -14087,6 +14344,9 @@ class Scheduler:
             if request is not None:
                 request.prompt_cache = None
                 request._extracted_cache = None
+                request._memguard_turn_end_kv = None
+                request._memguard_boundary_state = None
+                self._memguard_note_orphaned_turn(request)
 
             # Remove from running
             if request_id in self.running:
