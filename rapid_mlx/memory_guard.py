@@ -128,6 +128,9 @@ PRIOR_MLP_COPIES = 3
 # rounding). The ceiling itself is already the engine's Metal cap
 # (0.90-0.97 of the recommended working set), so the physical OOM line sits
 # a further 3-10% above it.
+# mlx-lm's KV buffers grow in whole steps of this many tokens
+# (``KVCache.step``); a sequence's buffer holds up to one step more than it uses.
+KV_ALLOC_STEP_TOKENS = 256
 MARGIN_CEILING_RATIO = 0.02
 # ratio: margin on the projected step transient = the peak model's own
 # error bound. The synthetic ladder above varied 5% run-to-run for the same
@@ -800,6 +803,9 @@ class MemoryGuard:
             # newest resume entries and live KV, still needed more than the
             # machine left it (a capacity choice, logged loudly).
             "busy_machine_short": 0,
+            # Queued requests' prefix-hit loans released (they re-fetch at
+            # admission) so a running request was not refused.
+            "loans_released": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
@@ -1289,7 +1295,12 @@ class MemoryGuard:
         transient, margin = self.need(shape, ceiling, backstop=False)
         decode = self.decode_growth(context, kv_footprint=kv_footprint)
         step = max(transient + margin, decode + self.margin(decode, ceiling))
-        return int(base) + int(kv_footprint(context)) + step
+        # The KV buffers are allocated in whole steps (mlx-lm KVCache.step,
+        # 256 tokens): a sequence holds up to one step more than its context.
+        # Without it the advertised window had zero slack at its edge and a
+        # prompt inside it was refused at its last chunks, ~0.3% short.
+        held = -(-max(1, context) // KV_ALLOC_STEP_TOKENS) * KV_ALLOC_STEP_TOKENS
+        return int(base) + int(kv_footprint(held)) + step
 
     def max_context(
         self,
