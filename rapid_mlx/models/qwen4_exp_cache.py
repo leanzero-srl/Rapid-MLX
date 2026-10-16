@@ -90,7 +90,19 @@ class Qwen4ExpStateCache(ArraysCache):
                 f"invalid Qwen4 rollback boundary: keep={keep}, "
                 f"snapshots={len(snapshots)}"
             )
-        self.cache = list(snapshots[keep - 1])
+        # The GDN slot's restore points are views into the fused verify's
+        # ONE stacked array (``state_snapshots[:, p]``); a view keeps every
+        # point of the stack resident until the next step replaces it --
+        # memory nothing accounts for. Restore owned copies (``mx.array``;
+        # ``mx.contiguous`` would not copy such a view, mlx 0.32.2).
+        restored = [
+            mx.array(item) if isinstance(item, mx.array) else item
+            for item in snapshots[keep - 1]
+        ]
+        owned = [item for item in restored if isinstance(item, mx.array)]
+        if owned:
+            mx.eval(owned)
+        self.cache = restored
         self.rollback_state = None
         self._rollback_slots = None
 
