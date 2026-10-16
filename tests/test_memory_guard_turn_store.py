@@ -218,11 +218,14 @@ def test_cheaper_conversations_give_way_for_the_next_turn_entry(cpu):
 
 def test_a_costlier_conversation_never_gives_way(cpu):
     """An entry of another conversation LONGER than the one being stored is
-    not traded for it: the skip happens, loudly, and is counted."""
-    s, snapshot, side_boundary, older_side, helper = _trace(resident_extra=4 * MB)
+    not traded for it, even when it alone would complete the room (2.80 MB
+    short; the cheaper ones give 2.46): the skip happens, loudly, and is
+    counted -- and nothing is evicted for a store that does not happen."""
+    s, snapshot, side_boundary, older_side, helper = _trace(resident_extra=MB)
     big = _other(s, [4 * 10**6 + i for i in range(90_000)], int(2.0 * MB), "other-main")
     assert not _boundary_store(s, snapshot)
-    assert big in s.memory_aware_cache._entries
+    entries = s.memory_aware_cache._entries
+    assert all(k in entries for k in (big, side_boundary, older_side, helper))
     counts = s._memguard().counts
     assert counts["store_skips"] == 1 and counts["orphaned_store_skips"] == 1
 
