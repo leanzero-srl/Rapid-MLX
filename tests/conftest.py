@@ -64,6 +64,10 @@ def _hermetic_system_memory_pressure(monkeypatch):
         yield
         return
     monkeypatch.setattr(memory_budget, "system_memory_pressure", lambda: 1)
+    # Same for the host's free-memory share: the guard plans under what the
+    # machine leaves the engine. Unmeasured here (the device ceiling alone);
+    # a test that exercises a busy machine patches it in its own body.
+    monkeypatch.setattr(memory_budget, "system_memory_free_fraction", lambda: None)
     yield
 
 

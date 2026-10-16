@@ -793,6 +793,12 @@ class MemoryGuard:
             # ... and the entry was built at the turn end from the row's own
             # KV cut to the boundary, handed over (never two copies).
             "boundary_handoffs": 0,
+            # Entries given back because the REST of the machine grew into
+            # the RAM kept free for it (free share under the reserve).
+            "busy_machine_evictions": 0,
+            # Lone requests that ran under the device ceiling because only
+            # the machine's other processes were in the way.
+            "busy_machine_fallbacks": 0,
             # Steps whose plan did not converge and dispatched unplanned
             # (a planner defect signal; expected 0).
             "plan_exhausted": 0,
