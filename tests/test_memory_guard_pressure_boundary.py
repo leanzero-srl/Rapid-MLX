@@ -362,3 +362,34 @@ def test_a_true_admission_handoff_answers_as_a_copy_would(hybrid4, kernel):
     assert tokens_2["t2"] == copied_2
     assert t2._memguard_boundary_state is None
     assert tuple(turn_2[:BOUNDARY_2]) in s.memory_aware_cache._entries
+
+
+# -- RC10: dead weight in one line ------------------------------------------
+
+
+def test_a_line_keeps_its_newest_boundary_and_one_fallback(hybrid4, kernel):
+    """RC10 128 GB: the prefix cache held 7 hybrid entries (40.2 GB) for one
+    main conversation and one side request, ``superseded`` 0 -- an MTP turn
+    stores no end-of-turn entry, the only path that superseded anything. A
+    newer boundary of the same line now supersedes the older ones it extends
+    as soon as it is stored, except the one this turn resumed FROM (a branch
+    may still extend it; review 4). RED on 150a141ee: one entry per turn,
+    all kept. Every turn still resumes from the previous boundary."""
+    s, _ = _cached_scheduler(hybrid4, refuse_copies=False)
+    prompt = [(7 * i + 3) % 120 + 1 for i in range(40)]
+    boundary = len(prompt) - 13
+    counts = []
+    cached = []
+    for turn in range(6):
+        rid = f"t{turn}"
+        _, _tokens, got = _run(s, {0: [_turn(rid, prompt, boundary, 4)]})
+        cached.append(got[rid])
+        counts.append(sorted(len(k) for k in s.memory_aware_cache._entries))
+        # the next turn: up to this boundary, then the re-rendered reply,
+        # the tool result and a new generation prompt
+        tail = [(11 * i + 5 * turn) % 120 + 1 for i in range(24 + 13)]
+        prompt = prompt[:boundary] + tail
+        boundary = len(prompt) - 13
+    assert all(len(c) <= 2 for c in counts), counts
+    assert cached[1:] == [c[-1] for c in counts[:-1]], (cached, counts)
+    assert s._memguard().counts["superseded"] >= 4

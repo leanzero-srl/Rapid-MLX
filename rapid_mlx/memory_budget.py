@@ -298,3 +298,49 @@ def system_memory_pressure() -> int:
         return int(value.value)
     except Exception:  # noqa: BLE001
         return 0
+
+
+# LeanZero memory guard: the share of the machine's RAM kept FREE for
+# everything that is not the engine (other apps, other engines, the OS's own
+# file cache). The engine's planning ceiling is what the machine leaves it:
+# physical RAM - what the other processes use now - this reserve. A ratio of
+# physical RAM, the same headroom auto mode charges on top of the weights.
+SYSTEM_RESERVE_RATIO = _AUTO_HEADROOM_FRACTION
+
+
+def _sysctl_int(name: bytes, ctype_name: str = "c_int") -> int | None:
+    try:
+        import ctypes
+        import ctypes.util
+        import sys
+
+        if sys.platform != "darwin":
+            return None
+        global _LIBC
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+        value = getattr(ctypes, ctype_name)(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if _LIBC.sysctlbyname(name, ctypes.byref(value), ctypes.byref(size), None, 0):
+            return None
+        return int(value.value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def system_memory_free_fraction() -> float | None:
+    """The share of the machine's RAM free or reclaimable now, as the
+    kernel measures it (``kern.memorystatus_level``: what ``memory_pressure``
+    prints as "System-wide memory free percentage"). ``None`` when
+    unavailable (not Darwin). Finer than the pressure LEVEL, which stayed at
+    1 (normal) on a 128 GB laptop at 5% free with 46.8 GB of swap in use
+    (RC10 ladder, 2026-10-16)."""
+    level = _sysctl_int(b"kern.memorystatus_level")
+    if level is None or not 0 <= level <= 100:
+        return None
+    return level / 100.0
+
+
+def system_physical_memory() -> int:
+    """The machine's physical RAM in bytes (``hw.memsize``); 0 if unknown."""
+    return int(_sysctl_int(b"hw.memsize", "c_uint64") or 0)

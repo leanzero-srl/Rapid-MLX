@@ -312,6 +312,8 @@ _BOUNDARY_SUPERSEDES_PROMPT_MAX_GAP = 64
 # re-plan defers, refuses, hands over or evicts something, so a converging
 # plan needs at most one per row and entry).
 _PLAN_ATTEMPTS = 64
+# How often the guard re-reads what the rest of the machine uses (one sysctl).
+_MEMGUARD_SYSTEM_READ_S = 1.0
 # The memory guard's line for requests that carry no SessionHint (raw
 # prompts): one conversation, as before per-session identity existed.
 _ANONYMOUS_LINE = ("anonymous",)
@@ -5567,6 +5569,7 @@ class Scheduler:
             _dt = _time.monotonic() - _t0
             if stored:
                 self._memguard_note_shared(prompt_tokens)
+                self._memguard_supersede(request, prompt_tokens)
                 logger.info(
                     f"[prompt_cache_save] request={request_id[:12]} "
                     f"prompt_tokens={len(prompt_tokens)} "
@@ -5910,6 +5913,12 @@ class Scheduler:
                 if kept is not None and kept[0] <= len(prefix_tokens):
                     request._memguard_boundary_state = None  # superseded
                 self._memguard_note_shared(prefix_tokens)
+                # The line's older boundaries this one extends are dead
+                # weight now (RC10 128 GB: 7 hybrid entries, 40.2 GB, for one
+                # conversation and one side request; superseded stayed 0 --
+                # an MTP turn stores no end-of-turn entry, so nothing ever
+                # superseded them).
+                self._memguard_supersede(request, prefix_tokens)
                 logger.info(
                     f"[boundary_snapshot] request={request_id[:12]} "
                     f"saved {prefix_boundary} tokens at message boundary "
@@ -6823,6 +6832,59 @@ class Scheduler:
         from .memory_budget import AUTO_UTILIZATION_FLOOR
 
         return int(base * AUTO_UTILIZATION_FLOOR) if base > 0 else 0
+
+    def _memguard_others_bytes(self) -> int | None:
+        """RAM the REST of the machine uses now (other apps, other engines,
+        the OS), measured: physical x (1 - kernel free share) - the engine's
+        own Metal footprint, read together. Refreshed at most every
+        ``_MEMGUARD_SYSTEM_READ_S`` (the engine's own growth and frees move
+        the free share and the footprint by the same bytes, so the figure is
+        stable between reads). ``None`` when the machine cannot be read."""
+        import time as _time
+
+        from . import memory_budget
+
+        now = _time.monotonic()
+        cached = getattr(self, "_memguard_others_read", None)
+        if cached is not None and now - cached[0] < _MEMGUARD_SYSTEM_READ_S:
+            return cached[1]
+        free = memory_budget.system_memory_free_fraction()
+        physical = memory_budget.system_physical_memory()
+        others = None
+        if free is not None and physical > 0:
+            engine = self._current_metal_active_bytes() + self._current_metal_cache_bytes()
+            others = max(0, int(physical * (1.0 - free)) - engine)
+        self._memguard_others_read = (now, others, physical)
+        return others
+
+    def _memguard_system_ceiling(self) -> int | None:
+        """What the machine leaves the engine: physical RAM - what the other
+        processes use now - ``SYSTEM_RESERVE_RATIO`` of physical kept free
+        (RC10, a busy 128 GB laptop: the device-only ceiling let the engine
+        take 91 GB, 5% of RAM stayed free and 46.8 GB went to swap while the
+        kernel's pressure level still said normal). ``None`` unmeasured."""
+        from .memory_budget import SYSTEM_RESERVE_RATIO
+
+        others = self._memguard_others_bytes()
+        if others is None:
+            return None
+        physical = self._memguard_others_read[2]
+        return max(0, physical - others - int(SYSTEM_RESERVE_RATIO * physical))
+
+    def _memguard_plan_ceiling(self, device: int | None = None) -> int:
+        """The ceiling the guard PLANS under: the device ceiling, or less when
+        the rest of the machine needs the difference. A big idle Mac: the
+        device ceiling, unchanged. Feasibility (the advertised window, a
+        refusal) stays on the device ceiling: a busy machine defers work, it
+        never declares a prompt too long."""
+        if device is None:
+            device = self._memguard_ceiling()
+        if device <= 0:
+            return device
+        system = self._memguard_system_ceiling()
+        if system is None or system >= device:
+            return device
+        return system
 
     def _current_metal_cache_bytes(self) -> int:
         """MLX allocator cache: freed buffers MLX still holds (E2)."""
@@ -7794,9 +7856,10 @@ class Scheduler:
         guard = self._memguard()
         if guard is None or self.batch_generator is None:
             return None, refusals
-        ceiling = self._memguard_ceiling()
-        if ceiling <= 0:
+        device = self._memguard_ceiling()
+        if device <= 0:
             return None, refusals
+        ceiling = self._memguard_plan_ceiling(device)
         # The verify width is the generator's own choice unless THIS step's
         # decode plan narrows it (``_memguard_room_for_decode``).
         self._memguard_set_verify_cap(None)
@@ -7866,15 +7929,34 @@ class Scheduler:
             others = [rid for rid in self.running if rid != row.request_id]
             kv_fn = self._kv_footprint_fn()
             prompt = row.prompt_tokens or (row.offset + row.segment)
+            # Feasibility on the DEVICE: the rest of the machine's use is a
+            # reason to wait or to run small, never to declare it too long.
             fits_alone = kv_fn is not None and (
                 guard.single_sequence_need(
                     prompt,
                     base=self._memguard_idle_base(),
                     kv_footprint=kv_fn,
-                    ceiling=ceiling,
+                    ceiling=device,
                 )
-                <= ceiling
+                <= device
             )
+            if fits_alone and not others and ceiling < device:
+                # Alone, and only the machine's other processes are in the
+                # way: run it at the floor under the device ceiling (they
+                # may give memory back; the engine has nothing left to).
+                guard.counts["busy_machine_fallbacks"] += 1
+                if getattr(self, "_memguard_fallback_logged", None) != row.request_id:
+                    self._memguard_fallback_logged = row.request_id
+                    logger.warning(
+                        "[memory_guard] the machine leaves %.2fGB (device "
+                        "ceiling %.2fGB): request %s runs alone under the "
+                        "device ceiling",
+                        ceiling / 1e9,
+                        device / 1e9,
+                        row.request_id[:12],
+                    )
+                ceiling = device
+                continue
             if fits_alone and others:
                 # It fits this Mac once the requests beside it finish: wait,
                 # never context_length_exceeded (the client would compact a
@@ -8868,6 +8950,7 @@ class Scheduler:
         )
         if stored:
             request._cache_snapshot_stored = True
+            self._memguard_supersede(request, tokens)
             guard = getattr(self, "_memory_guard", None)
             if guard is not None:
                 guard.counts["boundary_handoffs"] += 1
@@ -9309,6 +9392,7 @@ class Scheduler:
             system_memory_pressure,
         )
 
+        self._memguard_yield_to_others()
         level = system_memory_pressure()
         if level < SYSTEM_PRESSURE_WARN:
             return
@@ -9331,6 +9415,39 @@ class Scheduler:
                 "y" if evicted == 1 else "ies",
             )
 
+    def _memguard_yield_to_others(self) -> None:
+        """The rest of the machine grew into the reserve kept free for it
+        (free share < ``SYSTEM_RESERVE_RATIO``): give prefix entries back,
+        in the ONE eviction order and never what a live or queued request
+        needs or a live conversation's newest head (the kernel's WARN
+        rule), until the engine is back under what the machine leaves it --
+        and re-derive the budgets from it. Measured: nothing happens on a
+        machine with room (a big idle Mac: zero actions)."""
+        guard = self._memguard()
+        system = self._memguard_system_ceiling()
+        if guard is None or system is None:
+            return
+        evicted = 0
+        while self._metal_footprint_bytes(reclaim_over=system) > system:
+            if not self._memguard_evict_ordered(
+                EVICT_HEAD, keep_last=True, reason="machine busy", count=False
+            ):
+                break
+            mx.clear_cache()
+            evicted += 1
+        if evicted:
+            guard.counts["busy_machine_evictions"] += evicted
+            logger.warning(
+                "[memory_guard] the rest of the machine uses %.2fGB: gave back %d "
+                "prefix entr%s to stay under %.2fGB",
+                (self._memguard_others_read[1] or 0) / 1e9,
+                evicted,
+                "y" if evicted == 1 else "ies",
+                system / 1e9,
+            )
+        if self._memguard_ceiling_moved():
+            self._memguard_apply_budgets()
+
     def _memguard_on_idle(self) -> None:
         """The engine just went idle (step thread): re-measure the idle base
         and re-derive the budgets when it moved."""
@@ -9341,8 +9458,21 @@ class Scheduler:
         self._memguard_yield_to_system()
         base = self._memguard_idle_base(sample=True)
         applied = int(getattr(self, "_memguard_budget_base", 0) or 0)
-        if applied <= 0 or abs(base - applied) > REAPPLY_RATIO * max(1, applied):
+        if (
+            applied <= 0
+            or abs(base - applied) > REAPPLY_RATIO * max(1, applied)
+            or self._memguard_ceiling_moved()
+        ):
             self._memguard_apply_budgets()
+
+    def _memguard_ceiling_moved(self) -> bool:
+        """The plan ceiling the budgets were derived from moved by more than
+        the reapply ratio (the rest of the machine took or gave memory)."""
+        applied = int(getattr(self, "_memguard_budget_ceiling", 0) or 0)
+        if applied <= 0:
+            return False
+        now = self._memguard_plan_ceiling()
+        return abs(now - applied) > REAPPLY_RATIO * max(1, applied)
 
     def memory_guard_max_context(
         self, native_context: int | None = None, *, stable: bool = True
@@ -9505,11 +9635,12 @@ class Scheduler:
         guard = self._memguard()
         if guard is None:
             return
-        ceiling = self._memguard_ceiling()
+        ceiling = self._memguard_plan_ceiling()
         if ceiling <= 0:
             return
         base = self._memguard_idle_base()
         self._memguard_budget_base = base
+        self._memguard_budget_ceiling = ceiling
         room = max(
             0,
             guard.idle_room(
@@ -10054,7 +10185,7 @@ class Scheduler:
         guard = getattr(self, "_memory_guard", None)
         if guard is None or not cache:
             return True
-        ceiling = self._memguard_ceiling()
+        ceiling = self._memguard_plan_ceiling()
         if ceiling <= 0:
             return True
         try:
@@ -15620,6 +15751,9 @@ class Scheduler:
                 getattr(self, "_memguard_idle_base_bytes", 0) / 2**20, 1
             )
             snap["ceiling_bytes"] = int(self._memguard_ceiling())
+            snap["plan_ceiling_bytes"] = int(self._memguard_plan_ceiling())
+            others = self._memguard_others_bytes()
+            snap["others_bytes"] = None if others is None else int(others)
             # The stable idle window /v1/models advertises as max_model_len.
             snap["max_context_idle"] = self.memory_guard_max_context(
                 self._memguard_native_context()
