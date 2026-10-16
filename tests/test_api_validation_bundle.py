@@ -480,8 +480,12 @@ class TestChatRejectsImageOnTextOnlyModel:
     def test_image_url_on_text_only_engine_400(self, patched_config, monkeypatch):
         """Before this fix, extract_multimodal_content silently stripped
         the image part on a text-only engine and the model would
-        confidently caption an image it never saw (R9P1 sweep)."""
+        confidently caption an image it never saw (R9P1 sweep).
+
+        Policy ``reject``; the default ``notice`` swaps the image for a text
+        notice instead (tests/test_text_only_image_notice.py)."""
         client = _build_chat_app(patched_config, monkeypatch)
+        patched_config(text_only_image_policy="reject")
         r = client.post(
             "/v1/chat/completions",
             json={

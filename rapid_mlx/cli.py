@@ -4654,6 +4654,7 @@ def serve_command(args):
     server._relocate_mid_conversation_system = getattr(
         args, "relocate_mid_conversation_system", False
     )
+    server._text_only_image_policy = getattr(args, "text_only_image_policy", "notice")
 
     # Configure tool calling
     if args.enable_auto_tool_choice and args.tool_call_parser:
@@ -12900,6 +12901,18 @@ Examples:
             "reminders mid-session (Claude Code); OFF by default because the "
             "relocated text carries user authority rather than system "
             "authority."
+        ),
+    )
+    serve_parser.add_argument(
+        "--text-only-image-policy",
+        choices=["notice", "reject"],
+        default="notice",
+        help=(
+            "What a text-only engine does with an image content part. "
+            "'notice' (default) replaces it with a text part saying the image "
+            "could not be viewed, so an agent's turn goes through instead of "
+            "ending on an error; 'reject' answers HTTP 400 "
+            "image_input_unsupported. Video and audio parts are unaffected."
         ),
     )
     # Multimodal option

@@ -2120,6 +2120,7 @@ class TestValidateContentBlocksForCapabilities:
         cfg.no_thinking = True
         cfg.tool_call_parser = None
         cfg.reasoning_parser_name = None
+        cfg.text_only_image_policy = "reject"  # pin the pre-notice 400
         app = FastAPI()
         app.include_router(router)
 

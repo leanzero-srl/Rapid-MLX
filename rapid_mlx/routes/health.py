@@ -386,6 +386,18 @@ async def clear_cache():
     return {"status": "ok", "message": "No prompt cache to clear"}
 
 
+def _text_only_image_stats() -> dict:
+    from ..api.text_only_images import text_only_image_stats
+
+    return text_only_image_stats()
+
+
+def _text_only_image_policy() -> str:
+    from ..api.text_only_images import text_only_image_policy
+
+    return text_only_image_policy()
+
+
 @router.get("/v1/status")
 async def status():
     """Real-time status with per-request details."""
@@ -452,6 +464,14 @@ async def status():
         # Memory guard (LeanZero fork): ceiling, margin, peak-model
         # coefficients, action counts, refusals and backstop firings.
         "memory_guard": stats.get("memory_guard", {"enabled": False}),
+        # Text-only image notice (LeanZero fork): how many image parts a
+        # text-only engine swapped for a text notice instead of a 400.
+        "text_only_images_replaced": _text_only_image_stats()["images_replaced"],
+        "text_only_image": {
+            "policy": _text_only_image_policy(),
+            "serving_text_only": not bool(getattr(cfg.engine, "is_mllm", False)),
+            **_text_only_image_stats(),
+        },
         "requests": stats.get("requests", []),
     }
 

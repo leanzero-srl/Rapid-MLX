@@ -58,6 +58,12 @@ from ..api.strict_json_schema import (
     strict_enforcement_enabled,
     validate_and_envelope,
 )
+from ..api.text_only_images import (
+    record_text_only_image_replacements,
+    replace_images_in_openai_messages,
+    replace_images_in_responses_input,
+    should_replace_images,
+)
 from ..api.tool_calling import (
     check_schema_validity,
     convert_tools_for_template,
@@ -1011,6 +1017,18 @@ async def create_response(request: Request):
         # global ``_pydantic_validation_handler`` (H-17) which routes
         # it through the sanitized 400 envelope — no more ``str(e)``
         # echo that leaked the model class name and pydantic version.
+        # LeanZero fork: a text-only engine turns image parts into a text
+        # notice (policy ``notice``) instead of a 400. Structured
+        # ``function_call_output`` lists are handled BEFORE the adapter,
+        # which JSON-encodes them verbatim (an image there would land in the
+        # prompt as a base64 blob); message images are handled on the
+        # converted request just before the capability validator.
+        _replace_text_only_images = should_replace_images(engine)
+        _text_only_images_replaced = (
+            replace_images_in_responses_input(responses_request)
+            if _replace_text_only_images
+            else 0
+        )
         try:
             cfg_for_adapter = get_config()
             openai_request = responses_to_openai(
@@ -1320,6 +1338,14 @@ async def create_response(request: Request):
                 "(or reasoning / reasoning_max_tokens / reasoning_effort) "
                 "to opt back in.",
                 get_config().reasoning_parser_name,
+            )
+
+        if _replace_text_only_images:
+            _text_only_images_replaced += replace_images_in_openai_messages(
+                openai_request.messages
+            )
+            record_text_only_image_replacements(
+                _text_only_images_replaced, route="/v1/responses"
             )
 
         try:

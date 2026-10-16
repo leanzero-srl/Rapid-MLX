@@ -368,6 +368,9 @@ class TestResponsesNonStream:
         # This fixed-list protocol test also guards the typed multimodal
         # rejection envelope before either path can enter generation.
         engine.serving_lane_reason = "vision_hybrid_runtime_unsupported"
+        from rapid_mlx.config import get_config
+
+        monkeypatch.setattr(get_config(), "text_only_image_policy", "reject")
         image_response = responses_client.client.post(
             "/v1/responses",
             json=_payload(
@@ -786,9 +789,16 @@ class TestResponsesNonStream:
             SimpleNamespace(is_mllm=False), request
         ) == [{"role": "user", "content": "hi"}]
 
-    def test_input_image_rejected_on_text_only_engine(self, responses_client):
+    def test_input_image_rejected_on_text_only_engine(
+        self, responses_client, monkeypatch
+    ):
         client = responses_client.client
         engine = responses_client.engine
+        # Policy ``reject``; the default ``notice`` swaps the image for a
+        # text notice (tests/test_text_only_image_notice.py).
+        from rapid_mlx.config import get_config
+
+        monkeypatch.setattr(get_config(), "text_only_image_policy", "reject")
 
         response = client.post(
             "/v1/responses",

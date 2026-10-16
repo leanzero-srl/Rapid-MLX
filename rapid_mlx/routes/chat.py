@@ -46,6 +46,11 @@ from ..api.strict_json_schema import (
     strict_enforcement_enabled,
     validate_and_envelope,
 )
+from ..api.text_only_images import (
+    record_text_only_image_replacements,
+    replace_images_in_openai_messages,
+    should_replace_images,
+)
 from ..api.tool_calling import (
     build_json_system_prompt,
     check_schema_validity,
@@ -4114,6 +4119,18 @@ async def _create_chat_completion_impl(
     # SSE-leak path in F-131 is closed by construction (a 400 is
     # returned before any byte of SSE is flushed).
     _scan_messages_for_lone_surrogates(request.messages)
+
+    # LeanZero fork: on a text-only engine an image part becomes a text
+    # notice (policy ``notice``, the default) instead of a 400 that an agent
+    # client treats as fatal. Runs BEFORE the F-111 tool-content check (so a
+    # mixed text+image tool reply keeps its text), before the capability
+    # validator, and before any template render / prefix-cache keying. The
+    # notice is deterministic, so replays of the same image still cache-hit.
+    if should_replace_images(engine):
+        record_text_only_image_replacements(
+            replace_images_in_openai_messages(request.messages),
+            route="/v1/chat/completions",
+        )
 
     # F-111 / F-112 / F-051: tool-message schema validation.
     #

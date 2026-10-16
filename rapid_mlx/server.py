@@ -373,6 +373,11 @@ _no_thinking: bool = (
 #: ``serve --relocate-mid-conversation-system``; OFF by default.
 _relocate_mid_conversation_system: bool = False
 
+#: What a text-only engine does with an image part: ``notice`` (swap it for
+#: a text notice) or ``reject`` (HTTP 400). Set from
+#: ``serve --text-only-image-policy``; ``notice`` by default.
+_text_only_image_policy: str = "notice"
+
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
@@ -3149,6 +3154,7 @@ def _sync_config() -> None:
     cfg.gc_control = _gc_control
     cfg.no_thinking = _no_thinking
     cfg.relocate_mid_conversation_system = _relocate_mid_conversation_system
+    cfg.text_only_image_policy = _text_only_image_policy
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
