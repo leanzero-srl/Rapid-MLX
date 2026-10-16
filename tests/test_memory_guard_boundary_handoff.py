@@ -505,3 +505,23 @@ def test_rc8_the_handoff_is_planned_at_its_real_transient(cpu):
     _rc8_turn_end(s, main)
     assert tuple(range(RC8_BOUNDARY)) not in s.memory_aware_cache._entries
     assert s._memguard().counts["orphaned_store_skips"] == 1
+
+
+def test_the_cut_plan_prices_a_handover_and_a_copy(cpu):
+    """Solo row: one layer's full copy + its cut copy. A batch still
+    running keeps its buffers, so the cut copies all stay, plus one full
+    copy in flight. A layout the turn end cannot rebuild is refused."""
+    from rapid_mlx.scheduler import Scheduler
+
+    kv = [_recurrent(), _kv_rows(1000), _kv_rows(1000)]
+    full = 2 * 1000 * 4
+    kept = (400, [kv[0], None, None])
+    assert Scheduler._memguard_boundary_cut(kept, kv) == (
+        1000,
+        full + full * 400 // 1000,
+        2 * (full * 400 // 1000) + full,
+    )
+    assert Scheduler._memguard_boundary_cut((1200, [kv[0], None, None]), kv) is None
+    assert Scheduler._memguard_boundary_cut((400, [kv[0], None]), kv) is None
+    rotating = [kv[0], ArraysCache(size=2), kv[2]]
+    assert Scheduler._memguard_boundary_cut(kept, rotating) is None

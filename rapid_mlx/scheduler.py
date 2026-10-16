@@ -8650,7 +8650,7 @@ class Scheduler:
         plan = self._memguard_boundary_cut(kept, kv)
         if plan is None:
             return False
-        held, transient = plan
+        held, handed_need, copied_need = plan
         cache = [
             state if state is not None else layer
             for layer, state in zip(kv, states, strict=True)
@@ -8672,7 +8672,7 @@ class Scheduler:
             handoff=solo,
             turn_end=True,
             tokens=boundary,
-            need=transient if solo else None,
+            need=handed_need if solo else copied_need,
         ):
             return False
         stored = mac.store(
@@ -8699,11 +8699,18 @@ class Scheduler:
         return bool(stored)
 
     @staticmethod
-    def _memguard_boundary_cut(kept: Any, kv: Any) -> tuple[int, int] | None:
-        """``(tokens held, per-layer transient bytes)`` when the finished
-        row ``kv`` can be cut to the kept boundary (same layout as at the
-        boundary; every KV layer a plain ``KVCache`` holding at least the
-        boundary), else ``None``."""
+    def _memguard_boundary_cut(kept: Any, kv: Any) -> tuple[int, int, int] | None:
+        """``(tokens held, bytes needed handed over, bytes needed copied)``
+        when the finished row ``kv`` can be cut to the kept boundary (same
+        layout as at the boundary; every KV layer a plain ``KVCache``
+        holding at least the boundary), else ``None``.
+
+        Each layer is cut from the row's (lazy) copy: that layer's full copy
+        and its cut copy exist together for a moment. Handed over (a solo
+        row: its live buffer dies as the copy lands) that is the whole need;
+        copied (a batch still running keeps its buffer) every cut copy stays,
+        plus one full copy in flight. The recurrent state was kept (owned)
+        at the boundary: nothing new."""
         from mlx_lm.models.cache import KVCache
 
         if kept is None or not kv:
@@ -8714,6 +8721,8 @@ class Scheduler:
             return None
         held = 0
         transient = 0
+        cut_total = 0
+        widest = 0
         for layer, state in zip(layers, states, strict=True):
             if state is not None:
                 continue
@@ -8729,12 +8738,14 @@ class Scheduler:
             if offset < boundary or keys.shape[2] < offset or keys.shape[2] <= 0:
                 return None
             held = max(held, offset)
-            # cut from the row's (lazy) copy: its full copy and the cut one
             full = int(keys.nbytes) + int(values.nbytes)
-            transient = max(transient, full + full * boundary // keys.shape[2])
+            cut = full * boundary // keys.shape[2]
+            transient = max(transient, full + cut)
+            cut_total += cut
+            widest = max(widest, full)
         if held <= 0:
             return None
-        return held, transient
+        return held, transient, cut_total + widest
 
     def _memguard_keep_requeued_kv(
         self, request: Request, payload: Any, *, solo: bool
