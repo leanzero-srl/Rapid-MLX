@@ -4551,6 +4551,10 @@ class Scheduler:
                 # The hybrid entry-count bound evicts in the memory guard's
                 # order while the guard is on (plain LRU otherwise).
                 self.memory_aware_cache.bound_order = self._memguard_bound_order
+                # Before any path drops an entry a running hybrid row covers,
+                # that row takes its recurrent state over (the turn end
+                # rebuilds the entry from the row's own KV).
+                self.memory_aware_cache.evict_hook = self._memguard_on_evict
                 logger.info(
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB, "
@@ -5902,6 +5906,9 @@ class Scheduler:
             request._cache_snapshot_stored = stored
 
             if stored:
+                kept = getattr(request, "_memguard_boundary_state", None)
+                if kept is not None and kept[0] <= len(prefix_tokens):
+                    request._memguard_boundary_state = None  # superseded
                 self._memguard_note_shared(prefix_tokens)
                 logger.info(
                     f"[boundary_snapshot] request={request_id[:12]} "
@@ -7351,6 +7358,15 @@ class Scheduler:
         for position, (key, entry) in enumerate(entries.items()):  # LRU -> MRU
             level = self._memguard_entry_level(key, live, waiting)
             if (
+                level == EVICT_REDUNDANT
+                and self._memguard_boundary_cover(key, entry, finished)[0]
+                == "impossible"
+            ):
+                # "Duplicated in the live cache" is false for a hybrid row
+                # that cannot rebuild it: it is that conversation's resume
+                # point (see _memguard_boundary_cover).
+                level = EVICT_LAST
+            if (
                 (key in heads or key in protected)
                 and key not in branches
                 and (
@@ -7418,6 +7434,9 @@ class Scheduler:
         ]:
             holders.append(getattr(request, "prompt_cache", None))
             holders.append(getattr(request, "_extracted_cache", None))
+            kept = getattr(request, "_memguard_boundary_state", None)
+            if kept is not None:
+                holders.append([state for state in kept[1] if state is not None])
         held_arrays: list[Any] = []
         for caches in holders:
             if isinstance(caches, (list, tuple)):
@@ -7426,10 +7445,12 @@ class Scheduler:
                     held_arrays.append(a)
         arrays: dict[tuple, list[tuple[Any, int | None]]] = {}
         counts: dict[int, int] = {}
+        address_of: dict[int, int | None] = {}
         for key, entry in entries.items():
             items = []
             for _layer, _slot, a in _layer_arrays(getattr(entry, "cache", None)):
                 address = None if id(a) in held_ids else _buffer_address(a)
+                address_of[id(a)] = address
                 items.append((a, address))
                 if address is not None:
                     counts[address] = counts.get(address, 0) + 1
@@ -7470,6 +7491,24 @@ class Scheduler:
                 or address in held_addresses
                 or (address is not None and counts.get(address, 0) > 1)
             )
+            if self._memguard_boundary_cover(key, entry)[0] == "arm":
+                # Evicting it hands its recurrent state to the covering row
+                # (_memguard_on_evict): those arrays stay resident.
+                from .memory_cache import _layer_is_non_trimmable
+
+                def already(a: Any) -> bool:
+                    address = address_of.get(id(a))
+                    return (
+                        id(a) in held_ids
+                        or address in held_addresses
+                        or (address is not None and counts.get(address, 0) > 1)
+                    )
+
+                held += sum(
+                    int(a.nbytes)
+                    for layer, _slot, a in _layer_arrays(entry.cache)
+                    if _layer_is_non_trimmable(layer) and not already(a)
+                )
             out[key] = int(charge * max(0, total - held) / total)
         return out
 
@@ -8610,6 +8649,119 @@ class Scheduler:
             sum(int(a.nbytes) for _l, _s, a in _layer_arrays(state)) / 1e9,
         )
 
+    def _memguard_boundary_cover(
+        self, key: tuple, entry: Any, finished: str | None = None
+    ) -> tuple[str, list[Request]]:
+        """Can evicting non-trimmable entry ``key`` really lose nothing?
+
+        It ranks REDUNDANT when a running request already holds it (``len(key)
+        <= fetched``). For a trimmable cache that is true; for a hybrid one it
+        is true only if that row can REBUILD the entry: its live KV runs past
+        ``key`` and cannot be cut back unless the row keeps the recurrent
+        state at ``key`` and cuts its KV there at its turn end (RC9 128 GB:
+        the pressure evictor took chatcmpl-898's 80,717-token boundary while it
+        decoded; nothing rebuilt it and the next turn re-prefilled 86,500
+        tokens, 759 s).
+
+        Returns ``("none", [])`` when no running row covers it (the entry's
+        level is not this question), ``("fine", [])`` when every covering row
+        already keeps a resume point at least as good, ``("arm", rows)`` with
+        the rows to switch into boundary-state mode before the eviction,
+        ``("impossible", [])`` when the switch cannot be made (a layout the
+        turn end cannot rebuild)."""
+        from mlx_lm.models.cache import ArraysCache
+
+        from .memory_cache import _layer_is_non_trimmable
+
+        cache = list(getattr(entry, "cache", None) or ())
+        if not cache or not _cache_has_non_trimmable(cache):
+            return "none", []
+        covering = [
+            r
+            for r in list(getattr(self, "running", {}).values())
+            if r.request_id != finished
+            and not r.is_finished()
+            and len(key) <= int(getattr(r, "cached_tokens", 0) or 0)
+            and self._memguard_is_prefix(key, r.prompt_token_ids)
+        ]
+        if not covering:
+            return "none", []
+        if getattr(self, "memory_aware_cache", None) is None or any(
+            _layer_is_non_trimmable(layer) and type(layer) is not ArraysCache
+            for layer in cache
+        ):
+            return "impossible", []
+        entries = self.memory_aware_cache._entries  # noqa: SLF001
+        arm = []
+        for r in covering:
+            kept = getattr(r, "_memguard_boundary_state", None)
+            if kept is not None and kept[0] >= len(key):
+                continue  # it rebuilds a later boundary already
+            if self._memguard_resume_point_kept(r, len(key), entries, skip=key):
+                continue
+            arm.append(r)
+        return ("arm", arm) if arm else ("fine", [])
+
+    def _memguard_resume_point_kept(
+        self, request: Request, at_least: int, entries: Any, skip: Any = None
+    ) -> bool:
+        """An entry other than ``skip`` resumes ``request``'s next turn as well
+        as one at ``at_least`` tokens: a prefix of its prompt, at least that
+        long and no longer than its message boundary (a longer non-trimmable
+        entry cannot resume a re-rendered next prompt)."""
+        boundary = int(
+            getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            or 0
+        )
+        limit = max(boundary, at_least)
+        prompt = request.prompt_token_ids
+        return any(
+            k != skip
+            and at_least <= len(k) <= limit
+            and self._memguard_is_prefix(k, prompt)
+            for k in list(entries)
+        )
+
+    def _memguard_on_evict(self, key: tuple, entry: Any) -> None:
+        """The memory-aware cache is about to drop ``key`` (any path: the
+        guard's ordered eviction, the pressure evictor, the cache's own LRU
+        and count bounds, prefix-subset eviction). A running hybrid row that
+        covers it takes the entry's recurrent state over -- the arrays, by
+        reference (~147 MB on the 27B, already resident) -- and rebuilds the
+        entry at its turn end from its own KV cut to ``len(key)``. Then the
+        eviction loses nothing. Caller holds the cache lock."""
+        from mlx_lm.models.cache import ArraysCache
+
+        from .memory_cache import _layer_is_non_trimmable
+
+        verdict, rows = self._memguard_boundary_cover(key, entry)
+        if verdict != "arm":
+            return
+        states: list[Any] = []
+        for layer in entry.cache:
+            if _layer_is_non_trimmable(layer):
+                state = ArraysCache(len(layer.cache))
+                state.cache = list(layer.cache)
+                states.append(state)
+            else:
+                states.append(None)
+        guard = getattr(self, "_memory_guard", None)
+        for request in rows:
+            request._memguard_boundary_state = (len(key), states)
+            if guard is not None:
+                guard.counts["boundary_states_kept"] += 1
+            logger.warning(
+                "[memory_guard] request %s covers the %d-token entry being "
+                "evicted: it keeps that boundary's recurrent state and rebuilds "
+                "the entry from its own KV at its turn end",
+                request.request_id[:12],
+                len(key),
+            )
+
     def _memguard_hand_over_boundary(
         self, request: Request, kv: Any, *, solo: bool | None = None
     ) -> bool:
@@ -8644,7 +8796,9 @@ class Scheduler:
         prompt = list(request.prompt_token_ids or ())
         if boundary > len(prompt):
             return False
-        if tuple(prompt[:boundary]) in mac._entries:  # noqa: SLF001
+        if self._memguard_resume_point_kept(
+            request, boundary, mac._entries  # noqa: SLF001
+        ):
             return False  # stored meanwhile (a later copy fitted after all)
         # A LONGER entry of this prompt (its prompt-end entry, stored when the
         # copy did fit later) is no substitute: the next prompt re-renders
@@ -14058,7 +14212,14 @@ class Scheduler:
                 uncommitted = getattr(response, "_lz_uncommitted_cache", None)
                 response._lz_uncommitted_cache = None
                 kept = getattr(request, "_memguard_boundary_state", None)
-                if kept is not None and self.block_aware_cache is None:
+                if (
+                    kept is not None
+                    and self.block_aware_cache is None
+                    and self.memory_aware_cache is not None
+                    and not self._memguard_resume_point_kept(
+                        request, kept[0], self.memory_aware_cache._entries  # noqa: SLF001
+                    )
+                ):
                     turn_kv = getattr(request, "_extracted_cache", None) or uncommitted
                     if self._memguard_boundary_cut(kept, turn_kv) is not None:
                         request._extracted_cache = None
