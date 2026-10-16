@@ -364,8 +364,14 @@ def test_route_accepts_text_only_array_on_tool() -> None:
     assert tool_msg["content"] == "RESULT_42"
 
 
-def test_route_rejects_non_text_part_on_tool() -> None:
+def test_route_rejects_non_text_part_on_tool(monkeypatch) -> None:
+    """Policy ``reject``. Under the default ``notice`` a text-only engine
+    swaps the image for a text notice first, so F-111 sees text only (see
+    tests/test_text_only_image_notice.py)."""
     client, _ = _client()
+    from rapid_mlx.config import get_config
+
+    monkeypatch.setattr(get_config(), "text_only_image_policy", "reject")
     r = client.post(
         "/v1/chat/completions",
         json={
