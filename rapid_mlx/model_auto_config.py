@@ -1378,6 +1378,23 @@ def _detect_metadata_config(
         if "<think>" in template and "enable_thinking" in template:
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Granite enable_thinking template")
+    # Liquid LFM2 / LFM2.5 (incl. the lfm2_moe 24B) serve their own pythonic
+    # tool wire (``<|tool_call_start|>[f(a=...)]<|tool_call_end|>``).  The
+    # aliases cover only the hub repos they name, so a local snapshot (the
+    # app mounts a folder path) reached here with no parser and every call
+    # came back as plain content.  LFM2.5 also opens ``<think>`` in its
+    # generation prompt unconditionally.
+    if any(model_type.startswith("lfm2") for model_type in model_types) and (
+        "<|tool_call_start|>" in (metadata.chat_template or "")
+    ):
+        settings["tool_call_parser"] = "lfm"
+        reasons.append("Liquid LFM tool template")
+        if "<think>" in (metadata.chat_template or ""):
+            # Unconditionally primed and no ``enable_thinking`` switch: the
+            # distill parser's contract.  ``qwen3`` streamed the thought as
+            # content whenever tools auto-disabled thinking.
+            settings["reasoning_parser"] = "deepseek_r1_distill"
+            reasons.append("LFM unconditional thinking template")
 
     if not settings:
         return None
