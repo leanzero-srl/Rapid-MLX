@@ -2714,6 +2714,35 @@ class TestCheckpointMetadataFallback:
         assert config.supports_spec_decode is False
         assert config.experimental is True
 
+    def test_lfm_local_snapshot_gets_the_lfm_parsers(self, monkeypatch):
+        """A local LFM2.5 folder (no alias names it) still parses its own tool wire."""
+        template = (
+            '{{- "<|tool_call_start|>[" + calls + "]<|tool_call_end|>" -}}'
+            '{%- if add_generation_prompt -%}{{- "<|im_start|>assistant\\n<think>" -}}{%- endif -%}'
+        )
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "lfm2_moe"}, template),
+        )
+
+        config = detect_model_config("/Volumes/models/LFM2.5-24B-A2B-MLX-8bit")
+
+        assert config is not None
+        assert config.tool_call_parser == "lfm"
+        assert config.reasoning_parser == "deepseek_r1_distill"
+
+    def test_lfm_without_its_tool_template_gets_no_parser(self, monkeypatch):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "lfm2"}, "{{ messages }}"),
+        )
+
+        config = detect_model_config("/models/lfm-repack")
+
+        assert config is None or config.tool_call_parser is None
+
     def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
         log = mock.Mock()
         monkeypatch.setattr(
