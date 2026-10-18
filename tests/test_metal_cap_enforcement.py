@@ -328,6 +328,11 @@ class TestProjectedKVAdmissionGate:
         must use UTF-8 byte length so the gate stays conservative
         on adversarial prompts."""
         sched = self._make_scheduler_with_kv_estimate(kv_bytes_per_token=1)
+        # The fallback runs only when the engine tokenizer cannot count the
+        # prompt (RUN-ISSUES I-17: a usable tokenizer now gives the exact
+        # count, tests/test_gemma4_kv_admission.py). A bare MagicMock's
+        # encode returns no token list, so this exercises the fallback.
+        sched.tokenizer = MagicMock()
         req = Request(
             request_id="emoji-prompt",
             # 100 skulls, each 4 UTF-8 bytes = 400 bytes. ``len(str)``
