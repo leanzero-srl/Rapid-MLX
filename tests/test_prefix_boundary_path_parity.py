@@ -525,3 +525,46 @@ def test_prefix_boundary_rejects_last_user_rewrite_on_next_turn(monkeypatch):
     boundary = engine._compute_prefix_boundary(messages)
     assert boundary < len(render(messages, add_generation_prompt=False))
     assert boundary == len("shared|TURN:system|") - 8
+
+
+def test_boundary_when_the_template_adds_no_generation_suffix(monkeypatch):
+    """Gemma 4 (gemma-4-31B/12B-it, 2026-10-18): after a ``tool`` message the
+    template renders the SAME text with and without the generation prompt.
+    The stable render equals the real prompt, so the strict-prefix check
+    (``stable_lcp < len(real)``) failed and the fallback dummied the LAST USER
+    message -- in an agent loop that is the original task, so every turn of a
+    Forge build snapshotted the same 3,265-token boundary (Gabee: 12 % reuse
+    at 30k tokens). The real prompt IS a prefix of the next turn's render: the
+    boundary is just inside its end."""
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        body = "|".join(
+            f"{m.get('role')}:{m.get('content', '')}<turn|>" for m in messages
+        )
+        # like Gemma 4: no generation marker after a tool response
+        if add_generation_prompt and messages[-1].get("role") != "tool":
+            body += "|model:"
+        return body
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system prompt and tools"},
+        {"role": "user", "content": "build the app"},
+        {"role": "assistant", "content": "call 1"},
+        {"role": "tool", "content": "result 1"},
+        {"role": "assistant", "content": "call 2"},
+        {"role": "tool", "content": "result 2 " * 20},
+    ]
+    real = render(messages, add_generation_prompt=True)
+    assert real == render(messages, add_generation_prompt=False)
+    first_user_end = len(render(messages[:2], add_generation_prompt=False))
+
+    boundary = engine._compute_prefix_boundary(messages)
+
+    assert boundary == len(real) - 8
+    assert boundary > first_user_end

@@ -8700,10 +8700,21 @@ class Scheduler:
         KV, trimmed back to the boundary at its turn end, is that KV
         (:meth:`_memguard_hand_over_boundary`).
 
-        Only for a cache whose every layer is either a recurrent
-        ``ArraysCache`` or a plain ``KVCache`` (the layouts the turn end can
-        rebuild); anything else keeps today's behaviour."""
-        from mlx_lm.models.cache import ArraysCache, KVCache
+        A sliding-window model is the same case (Gabee 2026-10-18,
+        gemma-4-31B 8-bit, 50 ``RotatingKVCache`` layers of window 1024 + 10
+        full-attention layers: every 25-30k-token boundary copy, 3.7-4.4 GB,
+        was skipped against a ~43 GB ceiling, and the turn-end prompt+output
+        entry cannot serve the next turn -- the next prompt re-renders the
+        reply and a wrapped ring cannot be trimmed back past it -- so each
+        turn resumed from an old 3,265-token boundary: 12 % reuse). A ring
+        layer is kept like a recurrent one: its state at the boundary is
+        bounded by the window, not by the context.
+
+        Only for a cache whose every layer is a recurrent ``ArraysCache``, a
+        ``RotatingKVCache`` or a plain ``KVCache`` (the layouts the turn end
+        can rebuild), with at least one layer that cannot be cut back at the
+        turn end; anything else keeps today's behaviour."""
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
         from .memory_cache import _layer_is_non_trimmable, own_cache_bytes
 
@@ -8711,12 +8722,21 @@ class Scheduler:
             self.memory_aware_cache is None
             or boundary <= 0
             or not cache
-            or not _cache_has_non_trimmable(cache)
+            or not (
+                _cache_has_non_trimmable(cache)
+                or any(type(layer) is RotatingKVCache for layer in cache)
+            )
         ):
             return
         kept: list[Any] = []
         for layer in cache:
-            if _layer_is_non_trimmable(layer):
+            if type(layer) is RotatingKVCache:
+                # the ring at the boundary (this cache is already the
+                # boundary's reconstructed copy): at most the window. Checked
+                # first: a WRAPPED ring reports is_trimmable() False, so it also
+                # reads as non-trimmable below.
+                kept.append(layer)
+            elif _layer_is_non_trimmable(layer):
                 if type(layer) is not ArraysCache:
                     return
                 kept.append(layer)
@@ -8736,8 +8756,8 @@ class Scheduler:
             guard.counts["boundary_states_kept"] += 1
         logger.info(
             "[memory_guard] request %s keeps its %d-token message boundary as "
-            "recurrent state only (%.2fGB); its own KV, trimmed to the "
-            "boundary at the turn end, becomes the entry",
+            "recurrent/sliding-window state only (%.2fGB); its own KV, trimmed "
+            "to the boundary at the turn end, becomes the entry",
             request.request_id[:12],
             boundary,
             sum(int(a.nbytes) for _l, _s, a in _layer_arrays(state)) / 1e9,

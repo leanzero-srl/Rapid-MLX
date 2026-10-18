@@ -3829,12 +3829,23 @@ class BatchedEngine(BaseEngine):
                 if real_token != next_token:
                     break
                 next_turn_lcp += 1
+            stable_boundary = max(0, stable_lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
             if (
                 stable_lcp == len(stable_tokens)
                 and next_turn_lcp >= len(stable_tokens)
-                and stable_lcp < len(real_tokens)
+                and (
+                    stable_lcp < len(real_tokens)
+                    # A template that adds NO generation suffix (Gemma 4 after a
+                    # ``tool`` message) renders the real prompt itself: it is
+                    # still a prefix of the next turn, and the replay margin
+                    # keeps the boundary strictly inside it. Falling through
+                    # dummied the LAST USER message -- in an agent loop the
+                    # original task -- so every turn snapshotted the same
+                    # system+task boundary (Gabee 2026-10-18: 3,265 of 30k).
+                    or 0 < stable_boundary < len(real_tokens)
+                )
             ):
-                return max(0, stable_lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+                return stable_boundary
 
             # Conservative fallback for templates whose no-generation form is
             # not a strict prefix of their generation form.
