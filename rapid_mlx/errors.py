@@ -12,7 +12,19 @@ class BackpressureError(Exception):
     Route handlers convert this to HTTP 503 with a Retry-After header.  It is
     distinct from ``ValueError`` so narrow batch-error handlers do not swallow
     admission failures.
+
+    ``error_object`` is set when waiting cannot help -- the request does not fit
+    the device even with nothing else running -- and is then the
+    ``context_length_exceeded`` body a client compacts on (HTTP 400 before a
+    stream commits, the SSE error after). ``None`` = transient load shedding: a
+    503 with Retry-After, or mid-stream the OpenAI ``rate_limit_exceeded`` code
+    goose retries with backoff (RUN-ISSUES I-17: it was masked as "Internal
+    error during streaming" and the run was refused after 3 tries).
     """
+
+    def __init__(self, *args, error_object: dict | None = None) -> None:
+        super().__init__(*args)
+        self.error_object = dict(error_object) if isinstance(error_object, dict) else None
 
 
 class PagedCacheUnsupportedLayoutError(Exception):

@@ -237,7 +237,15 @@ def _raise_backpressure_503(exc: Exception) -> None:
     the error reaches FastAPI's generic 500 handler and the client
     sees an opaque ``Internal server error`` body, defeating the
     point of admission control.
+
+    A refusal that waiting cannot cure (``exc.error_object``: the request
+    does not fit the device even alone) is the HTTP 400
+    ``context_length_exceeded`` body instead, so the client compacts rather
+    than re-sending the same request into the same refusal (RUN-ISSUES I-17).
     """
+    error_object = getattr(exc, "error_object", None)
+    if isinstance(error_object, dict):
+        raise HTTPException(status_code=400, detail={"error": dict(error_object)})
     raise HTTPException(
         status_code=503,
         # 1s is a sensible default — the cap usually clears within
@@ -4439,7 +4447,33 @@ async def _disconnect_guard(
                 from ..request import ClientRequestError, InferenceAbortedError
 
                 _sse_error_object = None
-                if (
+                if isinstance(exc, BackpressureError):
+                    # D-METAL-CAP refused the request after the stream was
+                    # committed (admission runs inside the generator). Our own
+                    # bounded carrier, so its words may reach the client: a
+                    # request that never fits gets the context_length_exceeded
+                    # object (compact); load shedding gets OpenAI's
+                    # rate_limit_exceeded code, which goose maps to a retry with
+                    # backoff. Masked as "Internal error during streaming" it was
+                    # retried 3x into the same refusal and the run was refused
+                    # (RUN-ISSUES I-17).
+                    if isinstance(getattr(exc, "error_object", None), dict):
+                        _sse_error_object = dict(exc.error_object)
+                        _sse_type = _sse_error_object.get("type", "invalid_request_error")
+                        _sse_message = _sse_error_object.get("message", str(exc))
+                        _sse_code = _sse_error_object.get("code")
+                    else:
+                        _sse_type = "server_error"
+                        _sse_message = str(exc)
+                        _sse_code = "rate_limit_exceeded"
+                        _sse_error_object = {
+                            "message": _sse_message,
+                            "type": _sse_type,
+                            "code": _sse_code,
+                            "lz_reason": "metal_cap_backpressure",
+                            "retry_after_seconds": 1,
+                        }
+                elif (
                     isinstance(exc, InferenceAbortedError)
                     and exc.error_kind == DEVICE_MEMORY_ERROR_KIND
                     and isinstance(getattr(exc, "detail", None), dict)

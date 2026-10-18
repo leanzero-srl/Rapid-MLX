@@ -745,3 +745,53 @@ def latent_attention_bytes_per_layer(model: Any, dtype_bytes: int) -> tuple[int,
             return None
         per_layer = max(per_layer, (rank + rope) * dtype_bytes)
     return len(layers), per_layer
+
+
+def attention_module_kv_bytes(model: Any, dtype_bytes: int) -> tuple[int, int] | None:
+    """``(growth bytes per token, sliding bytes per slot)`` read from the loaded
+    attention modules of a sliding/full hybrid, else ``None``.
+
+    Gemma 4 (and other Gemma-style stacks) mix window-bounded sliding layers with
+    full-attention layers whose KV SHAPE DIFFERS from the config's
+    ``num_key_value_heads`` / ``head_dim``: Gemma 4 12B's full layers cache 1
+    global KV head x 512 (``num_global_key_value_heads`` / ``global_head_dim``,
+    K = V shared but both stored) while the config's base fields describe the
+    8 x 256 sliding layers. Pricing every full layer with the base shape (and the
+    fp32 dtype fallback when the inner ``TextConfig`` carries no ``dtype``)
+    charged 131,072 B/token against a measured 16,384, which refused a ~45k-token
+    conversation at "42.6 GB projected" on a 96 GB Mac (RUN-ISSUES I-17,
+    2026-10-19).
+
+    Recognised only when EVERY decoder layer's ``self_attn`` exposes integer
+    ``n_kv_heads`` and ``head_dim`` and a boolean ``is_sliding`` (the Gemma
+    attention contract); a KV-sharing borrower layer (``is_kv_shared_layer``)
+    allocates nothing. Anything else returns ``None`` and keeps the existing,
+    over-estimate-safe accounting."""
+    if not isinstance(dtype_bytes, int) or isinstance(dtype_bytes, bool) or dtype_bytes <= 0:
+        return None
+    layers = _model_layers(model)
+    if not layers:
+        return None
+    growth = 0
+    slot = 0
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            return None
+        heads = getattr(attn, "n_kv_heads", None)
+        dim = getattr(attn, "head_dim", None)
+        sliding = getattr(attn, "is_sliding", None)
+        if not (isinstance(heads, int) and not isinstance(heads, bool) and heads > 0):
+            return None
+        if not (isinstance(dim, int) and not isinstance(dim, bool) and dim > 0):
+            return None
+        if not isinstance(sliding, bool):
+            return None
+        if getattr(attn, "is_kv_shared_layer", False) is True:
+            continue
+        per_layer = 2 * heads * dim * dtype_bytes
+        if sliding:
+            slot += per_layer
+        else:
+            growth += per_layer
+    return growth, slot

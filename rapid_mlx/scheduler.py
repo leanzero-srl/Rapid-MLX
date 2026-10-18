@@ -59,6 +59,7 @@ from .kv_estimation import (  # noqa: E402
     _cfg_get,
     _valid_layer_types,
     estimate_kv_footprint,
+    attention_module_kv_bytes,
     latent_attention_bytes_per_layer,
     rotating_cache_slots,
 )
@@ -10688,6 +10689,24 @@ class Scheduler:
                 mx.clear_cache()
         return aborted, outputs
 
+    def _kv_element_bytes(self, model_config: Any) -> int:
+        """Bytes per KV element: the activation dtype the loaded floating
+        parameters carry (norms, quantization scales), else the config probe.
+
+        mlx-lm / mlx-vlm ``ModelArgs`` usually drop the HF ``dtype`` key (Gemma 4's
+        inner ``TextConfig`` has none), so the config probe alone falls back to fp32
+        and doubles every bf16 projection (RUN-ISSUES I-17). The peak prior already
+        prefers the loaded itemsize for the same reason; the KV growth, the latent
+        override and the quantized re-pricing now share it, so one figure prices
+        a token everywhere."""
+        try:
+            compute = int(self._memguard_compute_itemsize() or 0)
+        except Exception:  # noqa: BLE001
+            compute = 0
+        if compute > 0:
+            return compute
+        return int(self._infer_kv_dtype_bytes(model_config))
+
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
 
@@ -10932,7 +10951,7 @@ class Scheduler:
                 # estimating in the safe direction. Operators on
                 # quantized-KV deployments can still pin a tighter
                 # value via ``metal_cap_kv_bytes_per_token``.
-                dtype_bytes = self._infer_kv_dtype_bytes(model_config)
+                dtype_bytes = self._kv_element_bytes(model_config)
                 if num_layers > 0 and num_kv_heads > 0 and head_dim > 0:
                     per_tok = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
                     # Architecture-aware refinement. For dense / unknown
@@ -10999,6 +11018,18 @@ class Scheduler:
             fixed_baseline = 0
             sliding_slot_bytes = 0
             sliding_window = 0
+        # Sliding/full hybrids whose full layers have their OWN KV shape (Gemma 4:
+        # 1 global KV head x 512 vs the config's 8 x 256 sliding shape): size both
+        # terms from the loaded attention modules in the real activation dtype
+        # (RUN-ISSUES I-17). Applied only with no latent override, no recurrent
+        # baseline, and a known window whenever there is a sliding term.
+        if latent is None and fixed_baseline == 0:
+            module = self._attention_module_kv_bytes()
+            if module is not None:
+                growth, slot = module
+                if slot == 0 or sliding_window > 0:
+                    per_tok = growth
+                    sliding_slot_bytes = slot
         self._kv_sliding_slot_bytes = sliding_slot_bytes
         self._kv_sliding_window = sliding_window
         per_tok = self._live_quantized_growth_bytes(per_tok)
@@ -11014,18 +11045,26 @@ class Scheduler:
         the activation dtype: the loaded floating parameters' itemsize, else the
         config dtype probe."""
         try:
+            dtype_bytes = self._kv_element_bytes(getattr(self.model, "config", None))
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            return latent_attention_bytes_per_layer(getattr(self, "model", None), dtype_bytes)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _attention_module_kv_bytes(self) -> tuple[int, int] | None:
+        """``(growth bytes per token, sliding bytes per slot)`` from the loaded
+        attention modules (``kv_estimation.attention_module_kv_bytes``), priced in
+        the activation dtype of the loaded floating parameters, else ``None``."""
+        try:
             dtype_bytes = int(self._memguard_compute_itemsize() or 0)
         except Exception:  # noqa: BLE001
             dtype_bytes = 0
         if dtype_bytes <= 0:
-            try:
-                dtype_bytes = int(
-                    self._infer_kv_dtype_bytes(getattr(self.model, "config", None))
-                )
-            except Exception:  # noqa: BLE001
-                return None
+            return None
         try:
-            return latent_attention_bytes_per_layer(getattr(self, "model", None), dtype_bytes)
+            return attention_module_kv_bytes(getattr(self, "model", None), dtype_bytes)
         except Exception:  # noqa: BLE001
             return None
 
@@ -11052,7 +11091,8 @@ class Scheduler:
             return per_tok
         bits = int(getattr(self.config, "kv_cache_quantization_bits", 8))
         group = int(getattr(self, "_kv_quant_group_size", 64))
-        dtype_bytes = self._infer_kv_dtype_bytes(getattr(self.model, "config", None))
+        # The SAME element size the growth was priced in (see _kv_element_bytes).
+        dtype_bytes = self._kv_element_bytes(getattr(self.model, "config", None))
         if bits <= 0 or group <= 0 or dtype_bytes <= 0:
             return per_tok
         per_element = bits / 8 + 2 * dtype_bytes / group
@@ -11244,6 +11284,68 @@ class Scheduler:
             # Never let a memory-probe failure break the models endpoint.
             return None
 
+    def _admission_token_count(self, raw: str) -> int | None:
+        """Exact token count of an untokenized prompt via the engine tokenizer,
+        or ``None`` (no tokenizer, not a real tokenizer, or encode failed)."""
+        tokenizer = getattr(self, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            return None
+        try:
+            ids = encode(raw)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(ids, (list, tuple)):
+            return len(ids)
+        return None
+
+    def _admission_prompt_tokens(self, request: Request) -> int:
+        """The prompt length the admission projection charges (see
+        ``_estimate_request_kv_bytes``)."""
+        # ``num_prompt_tokens`` is populated by either the route layer
+        # (when prompt_token_ids was supplied) or zero at this point
+        # (tokenization runs AFTER admission). Fall back to the length
+        # of the raw prompt as a best-effort proxy in the zero case so
+        # the cap still bites on a 32k-string prompt that has not been
+        # tokenized yet.
+        prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        if prompt_tokens <= 0:
+            raw_prompt = getattr(request, "prompt_token_ids", None)
+            if raw_prompt is not None:
+                prompt_tokens = len(raw_prompt)
+            else:
+                raw = getattr(request, "prompt", "")
+                # Codex round 6 HIGH #1: ``len(str)`` counts Python
+                # code points, NOT tokenizer tokens. For ASCII English
+                # this OVER-estimates (3–5 chars/token typical), but
+                # adversarial inputs can UNDER-estimate:
+                # - byte-fallback BPE turns a single code point like
+                #   ``💀`` (1 char, 4 UTF-8 bytes) into 4 byte tokens
+                # - sentencepiece on rare CJK glyphs can emit 2+
+                #   tokens per code point
+                # Both reintroduce the D-METAL-CAP under-estimate path
+                # codex flagged. The byte-length of the UTF-8 encoding
+                # is a strict upper bound for every byte-level
+                # tokenizer (one byte ≥ one byte token) and a safe
+                # ceiling for SentencePiece (worst-case 1 byte → 1
+                # token). Lists and tuples we already trust as token
+                # IDs.
+                if isinstance(raw, str):
+                    # The engine's own tokenizer gives the exact count (RUN-ISSUES
+                    # I-17: a ~45k-token agent conversation counted as ~290k UTF-8
+                    # bytes and was refused); the byte length stays the fallback.
+                    counted = self._admission_token_count(raw)
+                    if counted is not None:
+                        prompt_tokens = counted
+                    else:
+                        try:
+                            prompt_tokens = len(raw.encode("utf-8"))
+                        except (UnicodeError, AttributeError):
+                            prompt_tokens = len(raw)
+                elif isinstance(raw, (list, tuple, bytes, bytearray)):
+                    prompt_tokens = len(raw)
+        return prompt_tokens
+
     def _estimate_request_kv_bytes(self, request: Request) -> int:
         """Project KV-cache memory the new request would consume.
 
@@ -11290,41 +11392,7 @@ class Scheduler:
         sliding_window = self._kv_sliding_window
         if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
             return 0
-        # ``num_prompt_tokens`` is populated by either the route layer
-        # (when prompt_token_ids was supplied) or zero at this point
-        # (tokenization runs AFTER admission). Fall back to the length
-        # of the raw prompt as a best-effort proxy in the zero case so
-        # the cap still bites on a 32k-string prompt that has not been
-        # tokenized yet.
-        prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
-        if prompt_tokens <= 0:
-            raw_prompt = getattr(request, "prompt_token_ids", None)
-            if raw_prompt is not None:
-                prompt_tokens = len(raw_prompt)
-            else:
-                raw = getattr(request, "prompt", "")
-                # Codex round 6 HIGH #1: ``len(str)`` counts Python
-                # code points, NOT tokenizer tokens. For ASCII English
-                # this OVER-estimates (3–5 chars/token typical), but
-                # adversarial inputs can UNDER-estimate:
-                # - byte-fallback BPE turns a single code point like
-                #   ``💀`` (1 char, 4 UTF-8 bytes) into 4 byte tokens
-                # - sentencepiece on rare CJK glyphs can emit 2+
-                #   tokens per code point
-                # Both reintroduce the D-METAL-CAP under-estimate path
-                # codex flagged. The byte-length of the UTF-8 encoding
-                # is a strict upper bound for every byte-level
-                # tokenizer (one byte ≥ one byte token) and a safe
-                # ceiling for SentencePiece (worst-case 1 byte → 1
-                # token). Lists and tuples we already trust as token
-                # IDs.
-                if isinstance(raw, str):
-                    try:
-                        prompt_tokens = len(raw.encode("utf-8"))
-                    except (UnicodeError, AttributeError):
-                        prompt_tokens = len(raw)
-                elif isinstance(raw, (list, tuple, bytes, bytearray)):
-                    prompt_tokens = len(raw)
+        prompt_tokens = self._admission_prompt_tokens(request)
         max_tokens = int(
             getattr(getattr(request, "sampling_params", None), "max_tokens", 0) or 0
         )
@@ -11638,8 +11706,68 @@ class Scheduler:
             f"on top of {active / 1e9:.1f} GB already in use "
             f"(reserved KV {reserved_kv / 1e9:.1f} GB + projected KV "
             f"{projected_kv / 1e9:.1f} GB), but the current limit is "
-            f"{cap / 1e9:.1f} GB (D-METAL-CAP)." + raise_advice
+            f"{cap / 1e9:.1f} GB (D-METAL-CAP)." + raise_advice,
+            error_object=self._metal_cap_context_refusal(
+                request, cap=cap, active=active, reserved_kv=reserved_kv,
+                projected_kv=projected_kv,
+            ),
         )
+
+    def _metal_cap_context_refusal(
+        self,
+        request: Request,
+        *,
+        cap: int,
+        active: int,
+        reserved_kv: int,
+        projected_kv: int,
+    ) -> dict | None:
+        """The ``context_length_exceeded`` body for a D-METAL-CAP refusal that
+        waiting cannot cure, else ``None`` (transient: retry after a delay).
+
+        Nothing else holds KV (``reserved_kv == 0``) and the request still does
+        not fit on the idle engine (weights + fixed state, the memory guard's
+        feasibility base, else Metal active now): retrying the same request is
+        refused forever, so the client must shorten it. ``n_ctx`` is the largest
+        prompt that fits beside the request's own ``max_tokens`` reservation."""
+        try:
+            if reserved_kv > 0:
+                return None
+            base = int(active)
+            if self._memguard() is not None:
+                idle = int(self._memguard_idle_base() or 0)
+                if idle > 0:
+                    base = min(base, idle)
+            if base + projected_kv < cap:
+                return None
+            kv_fn = self._kv_footprint_fn()
+            if kv_fn is None:
+                return None
+            max_tokens = int(
+                getattr(getattr(request, "sampling_params", None), "max_tokens", 0) or 0
+            )
+            prompt = self._admission_prompt_tokens(request)
+            lo, hi = 0, max(0, prompt - 1)
+            if base + kv_fn(max_tokens) >= cap:
+                hi = 0
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if base + kv_fn(mid + max_tokens) < cap:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            refusal = ContextExceedsDeviceMemoryError(
+                prompt_tokens=prompt,
+                needed_bytes=base + projected_kv,
+                available_bytes=cap,
+                max_context=lo,
+            )
+            body = refusal.error_object()
+            body["lz_reason"] = "metal_cap_exceeds_device"
+            return body
+        except Exception:  # noqa: BLE001
+            logger.debug("[D-METAL-CAP] refusal classification failed", exc_info=True)
+            return None
 
     def _resolve_pressure_evict_fraction(self) -> float:
         """Return the clamped ``(0, 1]`` fraction used for pressure thresholds.
