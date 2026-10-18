@@ -568,3 +568,47 @@ def test_boundary_when_the_template_adds_no_generation_suffix(monkeypatch):
 
     assert boundary == len(real) - 8
     assert boundary > first_user_end
+
+
+def test_boundary_when_the_next_turn_retokenises_the_tail(monkeypatch):
+    """Gemma 4 31B, live (Gabee 2026-10-19): after a ``tool`` message the real
+    prompt equals the stable render, but appending the next assistant message
+    changes the LAST few tokens of that render (37,469 stable vs a 37,466-token
+    next-turn LCP). Requiring the WHOLE stable render to prefix the next turn
+    rejected the boundary and fell back to the last user message (3,491 of
+    37k cached every turn). The boundary only needs to sit inside the next
+    turn's prefix, which the 8-token replay margin guarantees here."""
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        body = "|".join(
+            f"{m.get('role')}:{m.get('content', '')}<turn|>" for m in messages
+        )
+        if add_generation_prompt and messages[-1].get("role") != "tool":
+            body += "|model:"
+        # a trailing run the template renders only at the very END of the
+        # conversation: the next message replaces it (like Gemma's final newline)
+        return body + "~~~"
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system prompt and tools"},
+        {"role": "user", "content": "build the app"},
+        {"role": "assistant", "content": "call 1"},
+        {"role": "tool", "content": "result 1 " * 20},
+    ]
+    real = render(messages, add_generation_prompt=True)
+    nxt = render([*messages, {"role": "assistant", "content": "x"}], add_generation_prompt=False)
+    lcp = next(i for i, (a, b) in enumerate(zip(real, nxt)) if a != b)
+    assert lcp == len(real) - 3  # the tail differs, like the live Gemma render
+    first_user_end = len(render(messages[:2], add_generation_prompt=False))
+
+    boundary = engine._compute_prefix_boundary(messages)
+
+    assert boundary == len(real) - 8
+    assert boundary <= lcp
+    assert boundary > first_user_end

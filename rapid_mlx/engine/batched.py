@@ -3832,7 +3832,13 @@ class BatchedEngine(BaseEngine):
             stable_boundary = max(0, stable_lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
             if (
                 stable_lcp == len(stable_tokens)
-                and next_turn_lcp >= len(stable_tokens)
+                # The snapshot must lie inside the NEXT turn's prefix -- not the
+                # whole stable render: Gemma 4 re-tokenises its last 3 tokens
+                # when another message follows (Gabee 2026-10-19, 31B 8-bit:
+                # stable 37,469, next-turn LCP 37,466), so the old
+                # ``>= len(stable_tokens)`` fell back to the last-user dummy and
+                # every turn re-used only the 3,491-token system+task boundary.
+                and next_turn_lcp >= stable_boundary
                 and (
                     stable_lcp < len(real_tokens)
                     # A template that adds NO generation suffix (Gemma 4 after a
