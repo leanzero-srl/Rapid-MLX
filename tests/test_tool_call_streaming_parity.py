@@ -262,6 +262,24 @@ PARITY_FIXTURES: list = [
         ),
         [("read_file", {"path": "/etc/hostname"})],
     ),
+    # Xing4.0 — <param_key>/<param_value> pairs, one line, raw string
+    # values (non-strings as JSON). Two calls: the first reaches the wire at
+    # its close, the second from the complete output (GLM-4.7's contract).
+    (
+        "xing4",
+        "xing_param_tool_call",
+        (
+            "<tool_call>get_current_weather<param_key>location</param_key>"
+            "<param_value>Paris</param_value><param_key>days</param_key>"
+            "<param_value>3</param_value></tool_call>"
+            "<tool_call>read_file<param_key>path</param_key>"
+            "<param_value>/etc/hostname</param_value></tool_call>"
+        ),
+        [
+            ("get_current_weather", {"location": "Paris", "days": 3}),
+            ("read_file", {"path": "/etc/hostname"}),
+        ],
+    ),
 ]
 
 
@@ -316,6 +334,8 @@ _PARITY_COVERAGE_EXEMPT: dict[str, str] = {
     "ui-tars": "alias of ui_tars (kebab-case spelling)",
     "uitars": "alias of ui_tars (no-separator spelling)",
     "liquid": "alias of lfm",
+    "xing4_0": "alias of xing4",
+    "xing": "alias of xing4",
     "k2_horizon": (
         "IFM extraction requires the request's declared tool schema; dedicated "
         "character-boundary stream/non-stream contracts live in "

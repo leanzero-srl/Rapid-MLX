@@ -796,6 +796,41 @@ def _register_vendored_archs() -> None:
         # transformers AutoConfig cannot resolve this custom model type.
         _VENDORED_MODEL_TYPES.add("g9v3")
 
+    if "mlx_lm.models.xing4_0" not in sys.modules:
+        # XingChen-AGI Xing4.0 (``xing4_0``): DeepSeek-V3 MLA + MoE with
+        # manifold-constrained hyper-connections, vendored from mlx-lm PR
+        # #1901 (see ``rapid_mlx/models/xing4_0.py``). Defers to native
+        # mlx-lm support the moment upstream ships it, same probe as
+        # ``hy_v3`` above.
+        import importlib.util as _importlib_util
+
+        _xing_native_spec = None
+        try:
+            _xing_native_spec = _importlib_util.find_spec("mlx_lm.models.xing4_0")
+        except (ImportError, ValueError):
+            _xing_native_spec = None
+
+        if _xing_native_spec is None:
+            try:
+                from ..models import xing4_0 as _xing4_0
+
+                sys.modules.setdefault("mlx_lm.models.xing4_0", _xing4_0)
+            except Exception as e:
+                logger.warning(
+                    "xing4_0 vendored module failed to register — "
+                    "XingChen-AGI/Xing4.0 conversions will not load until "
+                    "resolved: %s",
+                    e,
+                )
+            else:
+                _VENDORED_MODEL_TYPES.add("xing4_0")
+        else:
+            _VENDORED_MODEL_TYPES.add("xing4_0")
+    elif sys.modules.get("mlx_lm.models.xing4_0") is not None:
+        # Same reason as g9v3: the tokenizer must take the fallback path
+        # (transformers AutoConfig cannot resolve ``xing4_0``).
+        _VENDORED_MODEL_TYPES.add("xing4_0")
+
     if "mlx_lm.models.bailing_hybrid" not in sys.modules:
         # inclusionAI Ling 3.0 family (tiny/flash) + Ling 2.6 — vendored
         # KDA+MLA hybrid backbone (see ``rapid_mlx/models/bailing_hybrid.py``
@@ -2199,9 +2234,34 @@ def _load_with_tokenizer_fallback(
         # repeating its answer (real-weights mini smoke, 2026-08-10).
         augment_eos_token_ids_from_generation_config(tokenizer, str(model_path))
         logger.info("Tokenizer loaded via fallback successfully")
+    elif _xing4_0_sentencepiece_checkpoint(model_path):
+        # Xing4.0 ships only a SentencePiece tokenizer.model behind a
+        # remote-code class; the vendored copy loads it without running any
+        # checkpoint code (rapid_mlx/models/xing4_0_tokenizer.py).
+        from ..models.xing4_0_tokenizer import load_xing4_0_tokenizer
+
+        logger.info(
+            "Loading tokenizer from tokenizer.model (vendored Xing4_0Tokenizer)"
+        )
+        tokenizer = load_xing4_0_tokenizer(model_path)
+        if not getattr(tokenizer, "chat_template", None):
+            _apply_chat_template_sidecar(model_path, tokenizer)
+        augment_eos_token_ids_from_generation_config(tokenizer, str(model_path))
+        logger.info("Tokenizer loaded via fallback successfully")
     else:
         raise ValueError(f"No tokenizer.json found in {model_path}")
     return model, tokenizer
+
+
+def _xing4_0_sentencepiece_checkpoint(model_path: Path) -> bool:
+    """A ``xing4_0`` checkpoint whose only tokenizer is ``tokenizer.model``."""
+    if not (Path(model_path) / "tokenizer.model").is_file():
+        return False
+    try:
+        with open(Path(model_path) / "config.json") as f:
+            return json.load(f).get("model_type") == "xing4_0"
+    except (OSError, ValueError):
+        return False
 
 
 def _deepseek_v4_quantization_override(

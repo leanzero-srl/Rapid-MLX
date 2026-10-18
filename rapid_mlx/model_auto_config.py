@@ -1294,6 +1294,26 @@ def _detect_metadata_config(
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Nemotron enable_thinking template")
 
+    # XingChen-AGI Xing4.0 (``xing4_0``: DeepSeek-V3 MLA attention, 64 routed
+    # experts + 1 shared, manifold-constrained hyper-connections; vendored in
+    # rapid_mlx/models/xing4_0.py). No hub alias names a local folder, so
+    # without this a mounted snapshot got no profile: its
+    # ``<tool_call>NAME<param_key>..`` calls would stream as content and its
+    # primed thought (the template opens ``<think>\n`` behind
+    # ``enable_thinking`` and renders ``</think>`` when it is off: qwen3's
+    # implicit-reasoning contract) as the answer. Plain attention caches only
+    # (MLA latent KV), so not hybrid.
+    if "xing4_0" in model_types:
+        template = metadata.chat_template or ""
+        settings["is_moe"] = bool(config.get("n_routed_experts"))
+        reasons.append("Xing4.0 MoE architecture")
+        if all(m in template for m in ("<tool_call>", "<param_key>", "<param_value>")):
+            settings["tool_call_parser"] = "xing4"
+            reasons.append("Xing4.0 param_key tool template")
+        if "<think>" in template and "enable_thinking" in template:
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Xing4.0 enable_thinking template")
+
     if not settings:
         return None
     profile = ModelConfig(**settings)

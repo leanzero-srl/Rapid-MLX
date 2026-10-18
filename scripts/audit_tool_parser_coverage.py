@@ -118,6 +118,15 @@ MATRIX_EXEMPT: dict[str, str] = {
         "tests/test_tool_call_value_fidelity.py, and "
         "tests/test_tool_call_streaming_parity.py"
     ),
+    "xing4": (
+        "TODO: add Xing4.0-29B-A4B (8-bit, 31 GB) to golden_models when the "
+        "matrix has a 48 GB+ slot; parser unit, hostile-value fidelity and "
+        "streaming-parity coverage live in tests/test_xing4_tool_parser.py, "
+        "tests/test_tool_call_value_fidelity.py and "
+        "tests/test_tool_call_streaming_parity.py"
+    ),
+    "xing4_0": "alias of xing4",
+    "xing": "alias of xing4",
     "k2_horizon": (
         "TODO: add K2 Horizon to golden_models when a correctness-grade "
         "8-bit checkpoint is available; the current public 4-bit checkpoint "

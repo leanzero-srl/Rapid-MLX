@@ -2766,6 +2766,56 @@ class TestCheckpointMetadataFallback:
         assert config.reasoning_parser is None
         assert config.is_hybrid is True
 
+    # Excerpt of XingChen-AGI/Xing4.0-29B-A4B chat_template.jinja: the tool
+    # wire as instructions, the native call rendering, and the primed think.
+    _XING_TEMPLATE = (
+        "For each function call, output the function name and arguments within "
+        "the following XML format:\n<tool_call>{function-name}<param_key>"
+        "{param-key-1}</param_key><param_value>{param-value-1}</param_value>"
+        "...</tool_call>"
+        "{{- '<tool_call>' + tc.name -}}{%- for k, v in _args.items() %}"
+        "<param_key>{{ k }}</param_key><param_value>{{ v }}</param_value>"
+        "{% endfor %}{{ '</tool_call>' }}"
+        "{%- if add_generation_prompt -%}<_bot>{{- '</think>' if (enable_thinking "
+        "is defined and not enable_thinking) else '<think>\\n' -}}{%- endif -%}"
+    )
+
+    def test_xing4_0_local_snapshot_gets_the_xing_parsers(self, monkeypatch):
+        """A local Xing4.0 folder (no alias names it) parses its calls and splits reasoning."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "xing4_0", "n_routed_experts": 64}, self._XING_TEMPLATE
+            ),
+        )
+
+        config = detect_model_config(
+            "/Users/x/.goose/models/TokenAI-zer/Xing4.0-29B-A4B-8bit-MLX"
+        )
+
+        assert config is not None
+        assert config.tool_call_parser == "xing4"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_moe is True
+        assert config.is_hybrid is False
+
+    def test_xing4_0_without_think_or_tools_gets_only_its_architecture(self, monkeypatch):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "xing4_0", "n_routed_experts": 64}, "{{ messages }}"
+            ),
+        )
+
+        config = detect_model_config("/models/xing-repack")
+
+        assert config is not None
+        assert config.tool_call_parser is None
+        assert config.reasoning_parser is None
+        assert config.is_moe is True
+
     def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
         log = mock.Mock()
         monkeypatch.setattr(

@@ -76,6 +76,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `qwen3_coder_xml` | | Qwen3-Coder (XML function blocks) | `<function=name><parameter=key>` XML |
 | `seed_oss` | `seed`, `gpt_oss` | Seed-OSS, GPT-OSS | `<seed:tool_call><function=name><parameter=key>` |
 | `ui_tars` | `ui-tars`, `uitars` | UI-TARS GUI-agent VLMs | `Action: verb(args)` computer-use lines |
+| `xing4` | `xing4_0`, `xing` | XingChen-AGI Xing4.0 | `<tool_call>name<param_key>`/`<param_value>` pairs, raw string values |
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 
 Two easy mix-ups to watch for:

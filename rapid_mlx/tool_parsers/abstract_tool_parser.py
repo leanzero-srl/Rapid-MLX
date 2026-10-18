@@ -188,6 +188,9 @@ def settle_cut_call(
 #                           recipient-routed channels (Meta Muse Glimmer)
 #   k2_ifm                — <ifm|tool_calls><ifm|tool_call>NAME plus IFM
 #                           argument key/type/value tags (K2 Horizon)
+#   xing_param_tool_call  — <tool_call>NAME<param_key>K</param_key>
+#                           <param_value>V</param_value></tool_call>
+#                           (XingChen-AGI Xing4.0; raw string values)
 WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
     {
         "tool_call_json",
@@ -216,6 +219,7 @@ WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
         "minicpm_native",
         "muse_atem",
         "k2_ifm",
+        "xing_param_tool_call",
     }
 )
 

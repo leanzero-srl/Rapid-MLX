@@ -127,6 +127,14 @@ def _render_muse_atem(name: str, key: str, value: str) -> str:
     )
 
 
+def _render_xing_param(name: str, key: str, value: str) -> str:
+    # Xing4.0 template: string values are written raw, no escaping layer.
+    return (
+        f"<tool_call>{name}<param_key>{key}</param_key>"
+        f"<param_value>{value}</param_value></tool_call>"
+    )
+
+
 RENDERERS = {
     "json_body": _render_json_body,
     "raw_json": _render_raw_json,
@@ -134,6 +142,7 @@ RENDERERS = {
     "xml_body": _render_xml_body,
     "minicpm_native": _render_minicpm,
     "muse_atem": _render_muse_atem,
+    "xing_param": _render_xing_param,
 }
 
 # (parser_name, wire_format) pairs this file exercises. Parser names are the
@@ -157,6 +166,9 @@ COVERED: list[tuple[str, str]] = [
     ("minicpm", "minicpm_native"),
     ("xlam", "raw_json_array"),
     ("muse", "muse_atem"),
+    ("xing4", "xing_param"),
+    ("xing4_0", "xing_param"),
+    ("xing", "xing_param"),
 ]
 
 # Formats whose escaping rules this file does not model yet. Each entry is a
@@ -263,6 +275,12 @@ _SCANNER_BLIND: dict[tuple[str, str], str] = {
         "muse_atem",
     ): "parse_tool_calls does not recognise Muse ATEM markup; curated Muse "
     "aliases always select the dedicated parser",
+    **{
+        (name, "xing_param"): "parse_tool_calls does not recognise Xing4.0 "
+        "<param_key>/<param_value> markup; xing4_0 checkpoints always get the "
+        "xing4 parser from model_auto_config"
+        for name in ("xing4", "xing4_0", "xing")
+    },
 }
 
 _KEY = "body"
