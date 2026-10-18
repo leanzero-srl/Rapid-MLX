@@ -2714,6 +2714,58 @@ class TestCheckpointMetadataFallback:
         assert config.supports_spec_decode is False
         assert config.experimental is True
 
+    # The shape of NVIDIA-Nemotron-3.5-Super-VL-120B-A12B's chat_template.jinja: the tool
+    # wire appears only inside the instruction string; tools are listed as <function><name>.
+    _NEMOTRON_TEMPLATE = (
+        "{%- set enable_thinking = enable_thinking if enable_thinking is defined else True %}"
+        "{%- if tools is iterable and tools | length > 0 %}"
+        '{{- "<tools>" }}{%- for tool in tools %}'
+        '{{- "\\n<function>\\n<name>" ~ tool.name ~ "</name>" }}{%- endfor %}'
+        '{{- "\\n</tools>" }}'
+        '{{- "If you choose to call a function ONLY reply in the following format with NO suffix:'
+        "\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>"
+        '\\nvalue_1\\n</parameter>\\n</function>\\n</tool_call>" }}'
+        "{%- endif %}"
+        "{%- if add_generation_prompt %}{%- if enable_thinking %}"
+        '{{- "<|im_start|>assistant\\n<think>\\n" }}'
+        '{%- else %}{{- "<|im_start|>assistant\\n<think></think>" }}{%- endif %}{%- endif %}'
+    )
+
+    def test_nemotron_h_local_snapshot_gets_the_nemotron_parsers(self, monkeypatch):
+        """A local Nemotron 3.5 Super VL folder (no alias names it) parses calls and splits reasoning."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "nemotron_h", "n_routed_experts": 512}, self._NEMOTRON_TEMPLATE
+            ),
+        )
+
+        config = detect_model_config(
+            "/Users/x/.goose/models/rapid-mlx/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-MLX-4bit"
+        )
+
+        assert config is not None
+        assert config.tool_call_parser == "nemotron"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_hybrid is True
+        assert config.supports_spec_decode is False
+        assert config.is_moe is True
+
+    def test_nemotron_h_without_think_or_tools_gets_only_its_architecture(self, monkeypatch):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "nemotron_h"}, "{{ messages }}"),
+        )
+
+        config = detect_model_config("/models/nemotron-h-repack")
+
+        assert config is not None
+        assert config.tool_call_parser is None
+        assert config.reasoning_parser is None
+        assert config.is_hybrid is True
+
     def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
         log = mock.Mock()
         monkeypatch.setattr(

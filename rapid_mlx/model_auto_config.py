@@ -1261,6 +1261,39 @@ def _detect_metadata_config(
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Qwen thinking template")
 
+    # NVIDIA Nemotron-H (Nemotron 3 / 3.5 Nano, Super, Super VL: Mamba2 +
+    # attention + routed experts).  Its template describes the tool wire only
+    # as an EXAMPLE string ("<tool_call>\n<function=example_function_name>
+    # \n<parameter=...") and lists the tools as <function><name>..</name>
+    # blocks, so the nested-XML detector above never matches, the config
+    # declares no linear attention, and a local snapshot (the app mounts a
+    # folder) reached here with NO profile: calls streamed as content, the
+    # primed thought streamed as content, and the Nemotron think-prefix
+    # (postprocessor, only without a reasoning parser) put a lone "<think>"
+    # in front of every answer.  The hub alias for the same family
+    # (nemotron-3.5-lightning) uses the nemotron tool parser and qwen3
+    # reasoning: the template primes "<think>\n" when enable_thinking is on
+    # and renders "<think></think>" when it is off, which is qwen3's
+    # implicit-reasoning contract.
+    if "nemotron_h" in model_types:
+        template = metadata.chat_template or ""
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        if config.get("n_routed_experts") or (
+            (config.get("text_config") or {}).get("n_routed_experts")
+        ):
+            settings["is_moe"] = True
+        reasons.append("Nemotron-H hybrid architecture")
+        if all(m in template for m in ("<tool_call>", "<function=", "<parameter=")):
+            settings["tool_call_parser"] = "nemotron"
+            reasons.append("Nemotron XML tool template")
+        if "<think>" in template and "enable_thinking" in template:
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Nemotron enable_thinking template")
+
     if not settings:
         return None
     profile = ModelConfig(**settings)
