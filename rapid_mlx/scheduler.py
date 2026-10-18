@@ -11332,9 +11332,19 @@ class Scheduler:
                 # IDs.
                 if isinstance(raw, str):
                     # The engine's own tokenizer gives the exact count (RUN-ISSUES
-                    # I-17: a ~45k-token agent conversation counted as ~290k UTF-8
-                    # bytes and was refused); the byte length stays the fallback.
+                    # I-17: an agent turn's untokenized prompt counted as UTF-8
+                    # bytes, ~2.3x its tokens); the byte length stays the fallback.
+                    # Counted ONCE per request: _sum_in_flight_kv_bytes re-projects
+                    # every waiting request on each admission, under the lock.
+                    cached = getattr(request, "_lz_admission_prompt_tokens", None)
+                    if isinstance(cached, tuple) and cached[0] == len(raw):
+                        return cached[1]
                     counted = self._admission_token_count(raw)
+                    if counted is not None:
+                        try:
+                            request._lz_admission_prompt_tokens = (len(raw), counted)
+                        except (AttributeError, TypeError):
+                            pass
                     if counted is not None:
                         prompt_tokens = counted
                     else:

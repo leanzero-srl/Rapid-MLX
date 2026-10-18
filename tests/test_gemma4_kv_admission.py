@@ -277,3 +277,17 @@ def test_pre_stream_load_shedding_is_still_503_with_retry_after():
         _raise_backpressure_503(BackpressureError("busy"))
     assert raised.value.status_code == 503
     assert raised.value.headers == {"Retry-After": "1"}
+
+
+def test_a_waiting_prompt_is_tokenized_once_across_admissions():
+    calls = []
+
+    def encode(s):
+        calls.append(len(s))
+        return s.split()
+
+    sched = _sched(_GemmaLike(), SimpleNamespace(encode=encode, decode=lambda ids, **_: ""))
+    request = _request("tok " * 3000, max_tokens=0)
+    first = sched._estimate_request_kv_bytes(request)
+    assert sched._estimate_request_kv_bytes(request) == first
+    assert calls == [len("tok " * 3000)]
