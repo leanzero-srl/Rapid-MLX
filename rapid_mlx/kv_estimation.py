@@ -673,3 +673,75 @@ def estimate_kv_footprint(
         sliding_slot_bytes=int(sliding_slot_bytes),
         sliding_window=int(effective_sliding_window),
     )
+
+
+def _model_layers(model: Any) -> list[Any] | None:
+    """The decoder layer list of a loaded mlx-lm model, or ``None``.
+
+    Tries the usual homes (``model.model.layers``, ``model.layers``, a
+    multimodal ``language_model``). Only a real ``list``/``tuple`` counts: a
+    ``MagicMock`` stub model answers every attribute and must NOT look like a
+    model with layers (it would change admission accounting in unit tests)."""
+    candidates = (
+        ("model", "layers"),
+        ("layers",),
+        ("language_model", "model", "layers"),
+        ("language_model", "layers"),
+    )
+    for path in candidates:
+        obj = model
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        if isinstance(obj, (list, tuple)) and obj:
+            return list(obj)
+    return None
+
+
+def latent_attention_bytes_per_layer(model: Any, dtype_bytes: int) -> tuple[int, int] | None:
+    """``(layers, bytes per layer per token)`` when EVERY decoder layer of the
+    loaded model caches the MLA LATENT, else ``None``.
+
+    mlx-lm's absorbed multi-head latent attention (``deepseek_v3``,
+    ``deepseek_v32``, ``glm4_moe_lite``, ``longcat_flash`` and the vendored
+    ``xing4_0``, which reuses ``DeepseekV3Attention``) never stores per-head
+    K/V: ``cache.update_and_fetch(kv_latent, k_pe)`` keeps ONE head of
+    ``kv_lora_rank`` latent values as the keys and ``qk_rope_head_dim`` rope
+    values as the values. Its cache per layer per token is therefore
+    ``(kv_lora_rank + qk_rope_head_dim) * dtype_bytes`` -- the uniform
+    ``2 * num_key_value_heads * head_dim * dtype_bytes`` formula over-states
+    it 12.4x for Xing4.0-29B-A4B (573,440 vs 46,080 B/token over 40 layers),
+    which capped a 96 GB Mac at 35,328 tokens (RUN-ISSUES I-7, 2026-10-18).
+
+    Recognised from the loaded attention module, never from the config alone:
+    a latent-caching attention carries the ``embed_q`` absorption projection
+    next to integer ``kv_lora_rank`` / ``qk_rope_head_dim``. mlx-lm's
+    ``deepseek_v2`` has ``kv_lora_rank`` too but caches full per-head K/V
+    (no ``embed_q``), so it keeps the uniform estimate. Any layer that is not
+    latent (or not inspectable) returns ``None``: mixed or unknown stacks keep
+    the existing, over-estimate-safe accounting."""
+    if not isinstance(dtype_bytes, int) or dtype_bytes <= 0:
+        return None
+    layers = _model_layers(model)
+    if not layers:
+        return None
+    per_layer = 0
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            return None
+        rank = getattr(attn, "kv_lora_rank", None)
+        rope = getattr(attn, "qk_rope_head_dim", None)
+        if not (isinstance(rank, int) and not isinstance(rank, bool) and rank > 0):
+            return None
+        if not (isinstance(rope, int) and not isinstance(rope, bool) and rope >= 0):
+            return None
+        try:
+            absorbed = getattr(attn, "embed_q", None) is not None
+        except Exception:  # noqa: BLE001
+            absorbed = False
+        if not absorbed:
+            return None
+        per_layer = max(per_layer, (rank + rope) * dtype_bytes)
+    return len(layers), per_layer

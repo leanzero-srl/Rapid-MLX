@@ -59,6 +59,7 @@ from .kv_estimation import (  # noqa: E402
     _cfg_get,
     _valid_layer_types,
     estimate_kv_footprint,
+    latent_attention_bytes_per_layer,
     rotating_cache_slots,
 )
 
@@ -6784,6 +6785,7 @@ class Scheduler:
         if compute:
             dtype_bytes = compute
         query_heads = _int("num_attention_heads") or kv_heads
+        latent = self._mla_latent_layer_bytes()
         hidden = _int("hidden_size")
         mlp = _int("intermediate_size")
         moe = _int("moe_intermediate_size") * max(1, _int("num_experts_per_tok"))
@@ -6794,7 +6796,9 @@ class Scheduler:
             hidden_size=hidden,
             mlp_intermediate=mlp,
             kv_bytes_per_token=per_tok,
-            layer_kv_bytes_per_token=2 * kv_heads * head_dim * dtype_bytes,
+            layer_kv_bytes_per_token=(
+                latent[1] if latent is not None else 2 * kv_heads * head_dim * dtype_bytes
+            ),
         )
 
     def _memguard_compute_itemsize(self) -> int:
@@ -10982,6 +10986,19 @@ class Scheduler:
             fixed_baseline = 0
             sliding_slot_bytes = 0
             sliding_window = 0
+        # Latent attention (MLA, mlx-lm deepseek_v3-style absorbed cache): the
+        # config formula above sizes per-head K/V the model never stores. When
+        # EVERY layer caches the latent, its real growth is layers x
+        # (kv_lora_rank + qk_rope_head_dim) x dtype -- 12.4x below the uniform
+        # figure for Xing4.0 (RUN-ISSUES I-7). Read from the loaded modules; a
+        # stub / mixed / non-latent model returns None and nothing changes.
+        latent = self._mla_latent_layer_bytes()
+        if latent is not None:
+            layers, per_layer = latent
+            per_tok = layers * per_layer
+            fixed_baseline = 0
+            sliding_slot_bytes = 0
+            sliding_window = 0
         self._kv_sliding_slot_bytes = sliding_slot_bytes
         self._kv_sliding_window = sliding_window
         per_tok = self._live_quantized_growth_bytes(per_tok)
@@ -10989,6 +11006,28 @@ class Scheduler:
         self._kv_fixed_baseline_bytes = fixed_baseline
         self._kv_bytes_per_token_resolved = True
         return per_tok
+
+    def _mla_latent_layer_bytes(self) -> tuple[int, int] | None:
+        """``(layers, bytes per layer per token)`` of a latent-attention (MLA)
+        model's real cache, or ``None`` (see
+        ``kv_estimation.latent_attention_bytes_per_layer``). The latent is in
+        the activation dtype: the loaded floating parameters' itemsize, else the
+        config dtype probe."""
+        try:
+            dtype_bytes = int(self._memguard_compute_itemsize() or 0)
+        except Exception:  # noqa: BLE001
+            dtype_bytes = 0
+        if dtype_bytes <= 0:
+            try:
+                dtype_bytes = int(
+                    self._infer_kv_dtype_bytes(getattr(self.model, "config", None))
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        try:
+            return latent_attention_bytes_per_layer(getattr(self, "model", None), dtype_bytes)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _live_quantized_growth_bytes(self, per_tok: int) -> int:
         """The auto-derived per-token GROWTH, re-priced for a quantized live cache.
