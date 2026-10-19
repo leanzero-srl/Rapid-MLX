@@ -2844,6 +2844,54 @@ class TestCheckpointMetadataFallback:
 
         assert config is None or config.tool_call_parser is None
 
+    # Excerpt of JetBrains/Mellum2.1-12B-A2.5B-Thinking chat_template.jinja.
+    _MELLUM_TEMPLATE = (
+        "For each function call, return a json object with function name and "
+        "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool_call>"
+        "{{- '<tool_call>\\n{\"name\": \"' }}{{- tool_call.name }}"
+        "{{- '\", \"arguments\": ' }}"
+        "{%- if enable_thinking is defined and enable_thinking is false %}"
+        "{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}"
+    )
+
+    def test_mellum_local_snapshot_gets_hermes_and_qwen3(self, monkeypatch):
+        """A local Mellum 2.1 folder (no alias names it) parses its calls and splits reasoning."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "mellum", "num_experts": 64}, self._MELLUM_TEMPLATE
+            ),
+        )
+
+        config = detect_model_config(
+            "/Volumes/AI-workhorse/models/goose/JetBrains/Mellum2.1-12B-A2.5B-Thinking"
+        )
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_moe is True
+        assert config.is_hybrid is False
+
+    def test_mellum_without_think_or_tools_gets_only_its_architecture(self, monkeypatch):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "mellum", "num_experts": 64}, "{{ messages }}"
+            ),
+        )
+
+        config = detect_model_config("/models/mellum-repack")
+
+        assert config is not None
+        assert config.tool_call_parser is None
+        assert config.reasoning_parser is None
+        assert config.is_moe is True
+
     def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
         log = mock.Mock()
         monkeypatch.setattr(

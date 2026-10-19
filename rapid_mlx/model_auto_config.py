@@ -1350,6 +1350,28 @@ def _detect_metadata_config(
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Xing4.0 enable_thinking template")
 
+    # JetBrains Mellum 2 / 2.1 (``mellum``: sparse MoE, 64 experts, 3:1
+    # sliding(1024)/full attention; vendored in rapid_mlx/models/mellum.py for
+    # mlx-lm < 0.32.2). No hub alias names a local folder, so without this a
+    # mounted snapshot got no profile: its Hermes-style
+    # ``<tool_call>\n{"name": .., "arguments": {..}}\n</tool_call>`` calls
+    # would stream as content and its thought as the answer. The Thinking
+    # model opens ``<think>`` itself (the template primes nothing) and the
+    # template renders ``<think>\n\n</think>`` when enable_thinking is off:
+    # qwen3's contract handles both. Sliding layers are RotatingKVCache, which
+    # the checkpoint-config sliding detection routes to the snapshot path; the
+    # model is plain attention, so not hybrid.
+    if "mellum" in model_types:
+        template = metadata.chat_template or ""
+        settings["is_moe"] = bool(config.get("num_experts"))
+        reasons.append("Mellum MoE architecture")
+        if "<tool_call>" in template and '"arguments"' in template:
+            settings["tool_call_parser"] = "hermes"
+            reasons.append("Mellum hermes tool template")
+        if "<think>" in template and "enable_thinking" in template:
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Mellum enable_thinking template")
+
     # IBM Granite. ``granitemoehybrid`` (Granite 4.0-H) is Mamba2 + attention.
     # ``granite`` (GraniteForCausalLM: Granite 3.x and the dense 4.1/4.2) is
     # plain attention, so it is NOT hybrid whatever its name says. Granite

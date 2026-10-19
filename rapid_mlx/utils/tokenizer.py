@@ -831,6 +831,32 @@ def _register_vendored_archs() -> None:
         # (transformers AutoConfig cannot resolve ``xing4_0``).
         _VENDORED_MODEL_TYPES.add("xing4_0")
 
+    if "mlx_lm.models.mellum" not in sys.modules:
+        # JetBrains Mellum 2 / 2.1 (``mellum``): sparse MoE with 3:1
+        # sliding/full attention, vendored from mlx-lm 0.32.2 (see
+        # ``rapid_mlx/models/mellum.py``). The pinned mlx-lm 0.31.3 has no
+        # module; defer to native support once the installed mlx-lm has one.
+        import importlib.util as _importlib_util
+
+        _mellum_native_spec = None
+        try:
+            _mellum_native_spec = _importlib_util.find_spec("mlx_lm.models.mellum")
+        except (ImportError, ValueError):
+            _mellum_native_spec = None
+
+        if _mellum_native_spec is None:
+            try:
+                from ..models import mellum as _mellum
+
+                sys.modules.setdefault("mlx_lm.models.mellum", _mellum)
+            except Exception as e:
+                logger.warning(
+                    "mellum vendored module failed to register — "
+                    "JetBrains/Mellum checkpoints will not load until "
+                    "resolved: %s",
+                    e,
+                )
+
     if "mlx_lm.models.bailing_hybrid" not in sys.modules:
         # inclusionAI Ling 3.0 family (tiny/flash) + Ling 2.6 — vendored
         # KDA+MLA hybrid backbone (see ``rapid_mlx/models/bailing_hybrid.py``
