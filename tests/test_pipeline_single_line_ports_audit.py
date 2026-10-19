@@ -12,18 +12,25 @@ tag but not from HEAD (nor from the upstream release both lines sit on), and
 fails on any that ``pipeline_single_line_ports.json`` does not review.  A
 review names the pipeline commits that carry the fix (each must be in HEAD's
 history), or says why the pipeline server has no such code path.
+
+A ``gap`` is a fix to shared code a qwen4_exp request runs on the split that
+the split does not have yet.  It passes only with a ``reason`` (what is missing,
+on which path) and an ``effect`` (what the split does instead), and it is never
+silent: ``test_gaps_are_listed`` prints every gap and raises one
+``PipelineGap`` warning per gap on every run.
 """
 
 import json
 import re
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 MANIFEST = Path(__file__).with_name("pipeline_single_line_ports.json")
-STATUSES = {"ported", "equivalent", "n/a"}
+STATUSES = {"ported", "equivalent", "n/a", "gap"}
 SINGLE_TAG = re.compile(r"v(\d+)\.(\d+)\.(\d+)-lz\.(\d+)")
 
 
@@ -87,6 +94,13 @@ def test_every_review_is_checkable(history, manifest):
         assert review["status"] in STATUSES, (sha, review["status"])
         assert review.get("reason", "").strip(), f"{sha}: a review says why"
         assert _git("cat-file", "-t", sha) == "commit", sha
+        if review["status"] == "gap":
+            assert review.get("effect", "").strip(), (
+                f"{sha}: a gap says what the split does instead (effect)"
+            )
+            assert not review.get("pipeline"), f"{sha}: a gap names no pipeline commit"
+            continue
+        assert "effect" not in review, f"{sha}: only a gap carries an effect"
         if review["status"] == "n/a":
             assert not review.get("pipeline"), f"{sha}: n/a names no pipeline commit"
             continue
@@ -100,3 +114,24 @@ def test_every_review_is_checkable(history, manifest):
             assert ancestor == 0, (
                 f"{sha} is '{review['status']}' by {carried}, not in HEAD"
             )
+
+
+class PipelineGap(Warning):
+    """A single-line fix the split runs without (status ``gap``).  Not a
+    UserWarning: pytest.ini ignores those, and a gap must show."""
+
+
+def test_gaps_are_listed(history, manifest):
+    gaps = [
+        (sha, review)
+        for sha, review in manifest["commits"].items()
+        if review["status"] == "gap"
+    ]
+    lines = [
+        f"{sha[:9]} {review.get('tag', '?')} {review.get('fixes', '')}: {review['effect']}"
+        for sha, review in gaps
+    ]
+    print(f"\n{len(gaps)} single-line fixes the pipeline split does not have:")
+    for line in lines:
+        print("  " + line)
+        warnings.warn(PipelineGap(line), stacklevel=1)
