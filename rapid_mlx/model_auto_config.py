@@ -71,6 +71,19 @@ ModelConfig = ModelProfile
 # family-named parent dir / org does not steal an unrelated model).
 _MISTRAL_FAMILY_SENTINEL = ModelConfig()
 _R1_DISTILL_FAMILY_SENTINEL = ModelConfig()
+# ``granite[-_]?4`` names two different architectures: the 4.0-H hybrids
+# (``granitemoehybrid``, Mamba2 + attention, hermes JSON calls, no thinking)
+# and the dense 4.1/4.2 checkpoints (``granite``, plain attention, the
+# qwen3-coder XML call wire and a ``<think>`` primed behind enable_thinking).
+# The name cannot tell them apart, so the loop hands the decision to
+# ``_granite_family_config``, which reads the checkpoint's own model_type.
+_GRANITE4_FAMILY_SENTINEL = ModelConfig()
+_GRANITE4_HYBRID_CONFIG = ModelConfig(
+    tool_call_parser="hermes",
+    reasoning_parser=None,
+    is_hybrid=True,
+    supports_spec_decode=False,
+)
 
 # Model family patterns → optimal config.
 # Order matters: first match wins. More specific patterns go first.
@@ -606,14 +619,13 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     # Setting ``reasoning_parser=qwen3`` here would route ALL output
     # into ``reasoning_content`` because the qwen3 parser stays in the
     # reasoning state until it sees a ``</think>`` close tag.
+    #
+    # The dense Granite 4.1/4.2 checkpoints (``model_type=granite``) match
+    # the same name but are a different model: see
+    # ``_GRANITE4_FAMILY_SENTINEL`` and ``_granite_family_config``.
     (
         re.compile(r"granite[-_]?4", re.IGNORECASE),
-        ModelConfig(
-            tool_call_parser="hermes",
-            reasoning_parser=None,
-            is_hybrid=True,
-            supports_spec_decode=False,
-        ),
+        _GRANITE4_FAMILY_SENTINEL,
     ),
     # SmolLM3 (HuggingFace, model_type=smollm3) — pure-attention dense
     # with /think /no_think dual modes. Best-in-class at 3B.
@@ -1314,6 +1326,35 @@ def _detect_metadata_config(
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Xing4.0 enable_thinking template")
 
+    # IBM Granite. ``granitemoehybrid`` (Granite 4.0-H) is Mamba2 + attention.
+    # ``granite`` (GraniteForCausalLM: Granite 3.x and the dense 4.1/4.2) is
+    # plain attention, so it is NOT hybrid whatever its name says. Granite
+    # 4.2's template instructs the qwen3-coder XML wire
+    # (``<tool_call>\n<function=NAME>\n<parameter=P>\nvalue\n</parameter>``;
+    # its tokenizer_config says ``tool_parser_type: qwen3_coder``, and IBM's own
+    # granite-4.2 aliases use qwen3_coder_xml) and primes ``<think>\n`` behind
+    # ``enable_thinking`` (default on), rendering ``<think></think>`` when it is
+    # off: qwen3's implicit-reasoning contract. Without this a local 4.2 folder
+    # took the 4.0-H name profile: hermes, no reasoning parser (the thought
+    # streamed as the answer) and the hybrid scheduler path.
+    if "granitemoehybrid" in model_types:
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("Granite 4.0-H hybrid architecture")
+    elif "granite" in model_types:
+        template = metadata.chat_template or ""
+        settings.update(is_hybrid=False, is_hybrid_explicit=True)
+        reasons.append("dense Granite architecture")
+        if all(m in template for m in ("<tool_call>", "<function=", "<parameter=")):
+            settings["tool_call_parser"] = "qwen3_coder_xml"
+            reasons.append("Granite qwen3-coder XML tool template")
+        if "<think>" in template and "enable_thinking" in template:
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Granite enable_thinking template")
+
     if not settings:
         return None
     profile = ModelConfig(**settings)
@@ -1326,6 +1367,31 @@ def _detect_metadata_config(
             f"is_hybrid={profile.is_hybrid} ({', '.join(reasons)})",
         )
     return profile
+
+
+def _checkpoint_model_types(model_path: str) -> frozenset[str]:
+    """The checkpoint's own model types (top level + text backbone), offline."""
+    metadata = read_model_metadata(model_path)
+    if metadata is None:
+        return frozenset()
+    return _metadata_model_types(metadata.config or {})
+
+
+def _granite_family_config(
+    model_path: str, metadata_config: ModelConfig | None
+) -> ModelConfig:
+    """Resolve a ``granite[-_]?4`` name match from the checkpoint itself.
+
+    A dense ``granite`` checkpoint (Granite 4.1/4.2) takes its metadata
+    profile: not hybrid, the tool parser its template's wire names, qwen3
+    reasoning when the template primes ``<think>``. Anything else (a
+    ``granitemoehybrid`` 4.0-H snapshot, or a hub name with no local
+    metadata) keeps the 4.0-H profile, with the checkpoint's architecture
+    overlaid as for every other family.
+    """
+    if metadata_config is not None and "granite" in _checkpoint_model_types(model_path):
+        return metadata_config
+    return _with_checkpoint_architecture(_GRANITE4_HYBRID_CONFIG, metadata_config)
 
 
 def _with_checkpoint_architecture(
@@ -1512,7 +1578,10 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
                 f"reasoning_parser={mistral_cfg.reasoning_parser}",
             )
             return _with_checkpoint_architecture(mistral_cfg, metadata_cfg)
-        resolved = _with_checkpoint_architecture(config, metadata_cfg)
+        if config is _GRANITE4_FAMILY_SENTINEL:
+            resolved = _granite_family_config(model_path, metadata_cfg)
+        else:
+            resolved = _with_checkpoint_architecture(config, metadata_cfg)
         _log_resolution_once(
             model_path,
             f"Auto-detected model family '{pattern.pattern}' → "

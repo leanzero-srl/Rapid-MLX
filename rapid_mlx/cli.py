@@ -4460,6 +4460,19 @@ def serve_command(args):
             logger.info(
                 f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
             )
+    # An explicit ``--tool-call-parser`` IS the request to parse tool calls,
+    # exactly as an auto-configured one is (above) and as ``server.main``
+    # already treats it ("Implied by --tool-call-parser"). Before this, a bare
+    # ``--tool-call-parser X`` (the documented way to override a wrong
+    # auto-detect) left ``server._tool_call_parser`` None: /v1/models listed
+    # no parser, a STREAMED call reached the client as plain content with
+    # finish_reason stop, and only the non-streaming fallback scan still
+    # found it (Granite 4.2, 2026-10-19).
+    if args.tool_call_parser and not args.enable_auto_tool_choice:
+        args.enable_auto_tool_choice = True
+        logger.info(
+            f"--tool-call-parser {args.tool_call_parser} enables auto tool choice"
+        )
     if _opt_out_tool:
         logger.info(
             "Tool-call parser auto-detection disabled via --no-tool-call-parser"
