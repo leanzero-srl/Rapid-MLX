@@ -2090,13 +2090,65 @@ def _template_drops_think_from_tool_loop_history(
     templates = _chat_template_strings(
         getattr(template_applicator, "chat_template", None), tools=tools
     )
-    return any(
+    if not any(
         _TOOL_LOOP_THINK_LIVE_LITERAL in template
         and "ns.last_query_index" in template
         and "<tool_response>" in template
         and "preserve_thinking" not in template
         for template in templates
-    )
+    ):
+        return False
+    # The literals only say the template COULD drop the block from history.
+    # A template that computes ns.last_query_index but renders the block on
+    # every row (Nex-N2.5-mini, 2026-10-19) must not get a second block: the
+    # doubled history made every request that ends on a user row (goose's
+    # length-cut nudge, its compaction request) diverge from the tool round
+    # at the first tool-loop row, i.e. a full re-prefill.
+    return not _template_keeps_history_think_blocks(template_applicator)
+
+
+_HISTORY_THINK_CACHE: dict[int, bool] = {}
+_PROBE_HISTORY_REASONING = "history reasoning probe"
+
+
+def _template_keeps_history_think_blocks(template_applicator) -> bool:
+    """Does this template render a HISTORY tool-loop row's reasoning itself?
+
+    Measured once per template by rendering a tool round followed by a new
+    user query. Qwen3.5 drops the reasoning there (the retain pass is needed);
+    a template that renders the block unconditionally keeps it. A failed probe
+    keeps the literal-based answer (the pass runs, as before)."""
+    template = getattr(template_applicator, "chat_template", None)
+    key = hash(template if isinstance(template, str) else repr(template))
+    if key in _HISTORY_THINK_CACHE:
+        return _HISTORY_THINK_CACHE[key]
+    probe = [
+        {"role": "user", "content": "Go."},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": _PROBE_HISTORY_REASONING,
+            "tool_calls": [
+                {
+                    "id": "call_history_probe",
+                    "type": "function",
+                    "function": {"name": _PROBE_TOOL, "arguments": {}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_history_probe", "content": "ok"},
+        {"role": "user", "content": "Next."},
+    ]
+    try:
+        rendered = _render_chat_template(
+            template_applicator, probe, tools=None, add_generation_prompt=True
+        )
+        verdict = isinstance(rendered, str) and _PROBE_HISTORY_REASONING in rendered
+    except Exception as e:
+        logger.debug("history think-block probe failed (%s); retain pass stays", e)
+        verdict = False
+    _HISTORY_THINK_CACHE[key] = verdict
+    return verdict
 
 
 def _is_tool_response_message(message) -> bool:
