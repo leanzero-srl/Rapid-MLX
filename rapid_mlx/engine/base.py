@@ -101,6 +101,29 @@ class GenerationOutput:
     # on the terminal output when MTP actually verified at least one draft.
     # Appended last to preserve positional compatibility.
     spec_decode_metrics: dict[str, int | list[int]] | None = None
+    # Why the engine itself ended this request when the wire's
+    # ``finish_reason`` cannot say it: ``"repetition"`` when the exact-loop
+    # guard hard-stopped a runaway loop (``finish_reason`` is remapped to the
+    # spec-valid ``"length"``, which a client otherwise reads as an output
+    # cap). The chat route surfaces it as ``rapid_mlx_stop_reason`` on the
+    # terminal choice. ``None`` for every ordinary stop. Appended last to
+    # preserve positional compatibility.
+    stop_reason: str | None = None
+
+
+def engine_stop_reason(output: Any) -> str | None:
+    """``"repetition"`` for a finished output the exact-loop guard stopped.
+
+    The scheduler marks a repetition hard-stop with ``error_kind="repetition"``
+    and the engine remaps its ``finish_reason`` to ``"length"`` (keeping
+    ``error_kind``); every other finished output has no engine stop reason.
+    """
+    if (
+        getattr(output, "error_kind", None) == "repetition"
+        and getattr(output, "finish_reason", None) == "length"
+    ):
+        return "repetition"
+    return None
 
 
 def _callable_accepts_kwarg(func: Any, name: str, inspect_mod: Any) -> bool:

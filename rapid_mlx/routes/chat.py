@@ -6753,6 +6753,7 @@ async def _create_chat_completion_impl(
                 ),
                 finish_reason=finish_reason,
                 logprobs=choice_logprobs,
+                rapid_mlx_stop_reason=_rapid_mlx_stop_reason(finish_reason, output),
             )
         ],
         usage=_build_usage(output, reasoning_text),
@@ -6843,6 +6844,18 @@ async def _create_chat_completion_impl(
 
     return response
 
+
+
+def _rapid_mlx_stop_reason(finish_reason: str | None, output) -> str | None:
+    """The engine's own stop reason for a terminal choice, or ``None``.
+
+    Only a ``"length"`` finish can hide one: the exact-loop guard's hard stop is
+    remapped to ``"length"`` and carries ``GenerationOutput.stop_reason ==
+    "repetition"``. A reply that ended any other way gets no field.
+    """
+    if finish_reason != "length":
+        return None
+    return getattr(output, "stop_reason", None)
 
 async def stream_chat_completion(
     engine,
@@ -7356,6 +7369,9 @@ async def stream_chat_completion(
                                     tool_calls=_normalized_tcs,
                                 ),
                                 finish_reason=event.finish_reason,
+                                rapid_mlx_stop_reason=_rapid_mlx_stop_reason(
+                                    event.finish_reason, output
+                                ),
                             )
                         ],
                         # Usage placement (OpenAI streaming spec, D-SSE-USAGE):
@@ -8036,6 +8052,13 @@ async def stream_chat_completion(
                             else finish_event.finish_reason
                         ),
                         logprobs=_build_chunk_logprobs(finish_output),
+                        rapid_mlx_stop_reason=(
+                            None
+                            if fallback_tool_calls
+                            else _rapid_mlx_stop_reason(
+                                finish_event.finish_reason, finish_output
+                            )
+                        ),
                     )
                 ],
                 # See "Usage placement" note on the tool_call branch

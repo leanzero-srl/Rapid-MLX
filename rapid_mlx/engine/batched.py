@@ -37,7 +37,7 @@ from ..api.utils import (
 from ..output_router import Channel, OutputRouter
 from ..prompt_host_cache import PromptHostCache
 from ..utils.chat_template import apply_chat_template as shared_apply_chat_template
-from .base import BaseEngine, GenerationOutput
+from .base import BaseEngine, GenerationOutput, engine_stop_reason
 
 ADMISSION_ORPHAN_GRACE_SECONDS = 2.0
 
@@ -2900,6 +2900,7 @@ class BatchedEngine(BaseEngine):
                 # H-03: MLLM non-stream parity — propagate the matched
                 # stop string for the Anthropic adapter.
                 matched_stop=getattr(output, "matched_stop", None),
+                stop_reason=engine_stop_reason(output),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -3025,6 +3026,7 @@ class BatchedEngine(BaseEngine):
             # on the OpenAI surface (it already lumps stop+EOS under
             # ``finish_reason="stop"``).
             matched_stop=getattr(output, "matched_stop", None),
+            stop_reason=engine_stop_reason(output),
             spec_decode_metrics=getattr(output, "spec_decode_metrics", None),
         )
 
@@ -3180,6 +3182,7 @@ class BatchedEngine(BaseEngine):
                     # H-03: MLLM stream parity — propagate the matched
                     # stop string for the Anthropic adapter.
                     matched_stop=getattr(output, "matched_stop", None),
+                    stop_reason=engine_stop_reason(output),
                     spec_decode_metrics=getattr(output, "spec_decode_metrics", None),
                 )
             return
@@ -3284,6 +3287,7 @@ class BatchedEngine(BaseEngine):
                     # H-03: text stream parity — propagate the matched
                     # stop string for the Anthropic adapter.
                     matched_stop=getattr(output, "matched_stop", None),
+                    stop_reason=engine_stop_reason(output),
                     spec_decode_metrics=getattr(output, "spec_decode_metrics", None),
                 )
         finally:
@@ -4211,6 +4215,7 @@ class BatchedEngine(BaseEngine):
             # for /v1/messages stop_sequence surfacing.
             matched_stop=source.matched_stop,
             spec_decode_metrics=source.spec_decode_metrics,
+            stop_reason=source.stop_reason if finished else None,
         )
 
     def _routed_finish_sentinel(self, source: GenerationOutput) -> GenerationOutput:
@@ -4230,6 +4235,7 @@ class BatchedEngine(BaseEngine):
             # streams (harmony / gemma4).
             matched_stop=source.matched_stop,
             spec_decode_metrics=source.spec_decode_metrics,
+            stop_reason=source.stop_reason,
         )
 
     def _finalize_output_router(
@@ -4365,6 +4371,7 @@ class BatchedEngine(BaseEngine):
                         routed_outputs[-1],
                         finished=True,
                         finish_reason=output.finish_reason,
+                        stop_reason=output.stop_reason,
                     )
                 else:
                     routed_outputs.append(finalized)

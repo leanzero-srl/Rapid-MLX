@@ -2216,6 +2216,11 @@ class ChatCompletionChoice(BaseModel):
     message: AssistantMessage
     finish_reason: str | None = "stop"
     logprobs: ChoiceLogProbs | None = None
+    # Non-standard, absent unless the engine ended the reply itself:
+    # ``"repetition"`` = the exact-loop guard stopped a runaway loop (the spec
+    # ``finish_reason`` then reads ``"length"``). Lets a client tell a loop
+    # stop from an output cap. Dumped with ``exclude_none``.
+    rapid_mlx_stop_reason: str | None = None
 
 
 class CompletionTokensDetails(BaseModel):
@@ -3370,6 +3375,9 @@ class ChatCompletionChunkChoice(BaseModel):
     delta: ChatCompletionChunkDelta
     finish_reason: str | None = None
     logprobs: ChoiceLogProbs | None = None
+    # See ``ChatCompletionChoice.rapid_mlx_stop_reason``; set only on the
+    # terminal chunk of a reply the engine stopped itself.
+    rapid_mlx_stop_reason: str | None = None
 
 
 class ChatCompletionChunk(BaseModel):
