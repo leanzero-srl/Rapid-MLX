@@ -1190,6 +1190,115 @@ def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
     )
 
 
+_PROBE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "probe_tool",
+        "description": "probe",
+        "parameters": {
+            "type": "object",
+            "properties": {"probe_arg": {"type": "string"}},
+        },
+    },
+}
+
+
+def _render_probe(template: str, messages: list[dict], **kwargs) -> str:
+    """Render ``template`` offline with Hugging Face's sandboxed compiler."""
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    return _compile_jinja_template(template).render(
+        messages=messages,
+        tools=[_PROBE_TOOL],
+        bos_token="",
+        eos_token="",
+        pad_token="",
+        unk_token="",
+        **kwargs,
+    )
+
+
+def _template_renders_xml_tool_call(template: str) -> bool:
+    """A past tool call RENDERS as the qwen3-coder XML wire.
+
+    Rendered, not scanned: a comment, an uncalled macro, a ``{% set %}``
+    capture or fragments split over exclusive branches never print the probe
+    call, and an instruction's example names another function.
+    """
+    if not isinstance(template, str) or "<function=" not in template:
+        return False
+    messages = [
+        {"role": "user", "content": "probe"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {
+                        "name": "probe_tool",
+                        "arguments": {"probe_arg": "probe_value"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_probe",
+            "name": "probe_tool",
+            "content": "done",
+        },
+        {"role": "user", "content": "again"},
+    ]
+    try:
+        rendered = _render_probe(template, messages, add_generation_prompt=True)
+    except Exception:
+        return False
+    at = 0
+    for marker in (
+        "<tool_call>",
+        "<function=probe_tool>",
+        "<parameter=probe_arg>",
+        "probe_value",
+        "</parameter>",
+        "</function>",
+        "</tool_call>",
+    ):
+        at = rendered.find(marker, at)
+        if at == -1:
+            return False
+        at += len(marker)
+    return True
+
+
+def _template_thinking_priming(template: str) -> str | None:
+    """How the rendered generation prompt opens ``<think>``.
+
+    ``"always"`` when it ends inside an open think block even with
+    ``enable_thinking=False``, ``"switch"`` when only with it on, ``None``
+    when never (or the template cannot be rendered offline).
+    """
+    if not isinstance(template, str) or "<think>" not in template:
+        return None
+
+    def primed(enable_thinking: bool) -> bool:
+        rendered = _render_probe(
+            template,
+            [{"role": "user", "content": "probe"}],
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        return rendered.rfind("<think>") > rendered.rfind("</think>")
+
+    try:
+        if primed(False):
+            return "always"
+        return "switch" if primed(True) else None
+    except Exception:
+        return None
+
+
 def _template_injects_qwen_thinking(template: str | None) -> bool:
     """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
     contract = _template_output_contract(template)
@@ -1395,6 +1504,30 @@ def _detect_metadata_config(
             # content whenever tools auto-disabled thinking.
             settings["reasoning_parser"] = "deepseek_r1_distill"
             reasons.append("LFM unconditional thinking template")
+
+    # Any other checkpoint whose template RENDERS a past tool call as the
+    # qwen3-coder XML wire (RUN-ISSUES I-27, Nex-N2.5-mini, ``qwen3_5_moe``): the structural
+    # detector above reads only template-text literals, and a template written
+    # entirely in ``{{- '...' }}`` print statements has none, so a local folder
+    # with no alias came up with no tool parser and no reasoning parser (calls
+    # and thoughts streamed as content). Same rule as dense Granite above, for
+    # every family no rule above claimed. The reasoning parser follows what the
+    # generation prompt actually renders: primed ``<think>`` behind
+    # ``enable_thinking`` is qwen3's contract; primed whatever ``enable_thinking``
+    # says (Nex keys it on ``reasoning_effort``, so tools auto-disabling thinking
+    # does not stop it) is the distill contract, as for LFM2.5.
+    template = metadata.chat_template or ""
+    if "tool_call_parser" not in settings and _template_renders_xml_tool_call(template):
+        settings["tool_call_parser"] = "qwen3_coder_xml"
+        reasons.append("qwen3-coder XML tool template")
+        if "reasoning_parser" not in settings:
+            priming = _template_thinking_priming(template)
+            if priming == "always":
+                settings["reasoning_parser"] = "deepseek_r1_distill"
+                reasons.append("thinking primed whatever enable_thinking says")
+            elif priming == "switch":
+                settings["reasoning_parser"] = "qwen3"
+                reasons.append("thinking primed behind enable_thinking")
 
     if not settings:
         return None
