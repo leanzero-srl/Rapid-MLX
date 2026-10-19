@@ -801,6 +801,12 @@ def config_declares_linear_attention(config: dict | None) -> bool:
 
     text_config = config.get("text_config")
     language_config = text_config if isinstance(text_config, dict) else config
+    # NVIDIA Nemotron-H Puzzle (Nemotron 3.5 Bolt): Mamba2 recurrent mixers
+    # interleaved with attention, declared per layer in ``block_configs`` /
+    # ``layers_block_type`` rather than ``layer_types`` (port of
+    # raullenchai/Rapid-MLX#4679).
+    if language_config.get("model_type") == "nemotron_h_puzzle":
+        return True
     layer_types = language_config.get("layer_types") or []
     if any(
         isinstance(layer_type, str)
@@ -1287,18 +1293,36 @@ def _detect_metadata_config(
     # reasoning: the template primes "<think>\n" when enable_thinking is on
     # and renders "<think></think>" when it is off, which is qwen3's
     # implicit-reasoning contract.
-    if "nemotron_h" in model_types:
+    #
+    # Nemotron 3.5 Bolt (``nemotron_h_puzzle``, vendored in
+    # rapid_mlx/models/nemotron_h_puzzle.py; port of raullenchai/Rapid-MLX#4679)
+    # is the same family with per-layer heterogeneous latent MoE: its experts
+    # are declared per block in ``block_configs`` (no top-level
+    # ``n_routed_experts``), and it ships the same tool/thinking template, so
+    # the parsers are read from the template exactly as for Nemotron-H.
+    if model_types & {"nemotron_h", "nemotron_h_puzzle"}:
         template = metadata.chat_template or ""
         settings.update(
             is_hybrid=True,
             is_hybrid_explicit=True,
             supports_spec_decode=False,
         )
-        if config.get("n_routed_experts") or (
-            (config.get("text_config") or {}).get("n_routed_experts")
+        text_cfg = config.get("text_config") or config.get("llm_config") or {}
+        blocks = config.get("block_configs") or text_cfg.get("block_configs") or []
+        if (
+            config.get("n_routed_experts")
+            or text_cfg.get("n_routed_experts")
+            or any(
+                isinstance(block, dict) and block.get("block_type") == "moe"
+                for block in blocks
+            )
         ):
             settings["is_moe"] = True
-        reasons.append("Nemotron-H hybrid architecture")
+        reasons.append(
+            "Nemotron-H Puzzle hybrid architecture"
+            if "nemotron_h_puzzle" in model_types
+            else "Nemotron-H hybrid architecture"
+        )
         if all(m in template for m in ("<tool_call>", "<function=", "<parameter=")):
             settings["tool_call_parser"] = "nemotron"
             reasons.append("Nemotron XML tool template")
