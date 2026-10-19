@@ -32,6 +32,17 @@ class RepetitionIntervention:
     blocked_token_id: int
 
 
+# Long exact loops (RUN-ISSUES I-24, 2026-10-19): Gemma 4 12B looped one
+# ~240-token paragraph 38 times (9,250 tokens of a 219,782-token budget) and
+# the short-period rule below, bounded to periods <= 128 in 768 tokens, never
+# saw it. The hard stop also checks periods up to this many tokens, requiring
+# ``LONG_PERIOD_REQUIRED_REPEATS`` exact adjacent copies (more than the short
+# rule's three). ``serve --repetition-guard-max-period`` sets it; 128 (or 0)
+# restores the short rule alone.
+DEFAULT_MAX_LONG_PERIOD_TOKENS = 1024
+LONG_PERIOD_REQUIRED_REPEATS = 4
+
+
 def detect_repeated_token_suffix(
     token_ids: Sequence[int],
     *,
@@ -41,8 +52,14 @@ def detect_repeated_token_suffix(
     min_repeated_tokens: int = 72,
     min_short_period_tokens: int = 256,
     max_window_tokens: int = 768,
+    max_long_period_tokens: int = DEFAULT_MAX_LONG_PERIOD_TOKENS,
+    long_required_repeats: int = LONG_PERIOD_REQUIRED_REPEATS,
 ) -> RepetitionMatch | None:
     """Return an exact periodic-suffix match, or ``None``.
+
+    The short rule (periods up to ``max_period_tokens``) runs first and is
+    unchanged. Only when it finds nothing are longer periods, up to
+    ``max_long_period_tokens``, checked by :func:`detect_long_repeated_token_suffix`.
 
     The defaults require at least three adjacent copies and at least 72 repeated
     tokens.  The effective repeat count is adaptive: a 12-token sentence needs
@@ -80,6 +97,84 @@ def detect_repeated_token_suffix(
             for offset in range(period, repeated_tokens, period)
         ):
             return RepetitionMatch(period_tokens=period, repeats=repeats)
+    return detect_long_repeated_token_suffix(
+        token_ids,
+        min_period_tokens=max(max_period_tokens, min_period_tokens - 1) + 1,
+        max_period_tokens=max_long_period_tokens,
+        required_repeats=long_required_repeats,
+    )
+
+
+def _reversed_suffix_z(tokens: Sequence[int]) -> list[int]:
+    """Z-array of ``tokens`` reversed: ``z[p]`` = how far the suffix repeats
+    itself at distance ``p`` (the suffix of length ``k*p`` has period ``p``
+    iff ``z[p] >= (k - 1) * p``)."""
+    rev = list(tokens)[::-1]
+    n = len(rev)
+    z = [0] * n
+    if n:
+        z[0] = n
+    left = right = 0
+    for i in range(1, n):
+        if i < right:
+            z[i] = min(right - i, z[i - left])
+        while i + z[i] < n and rev[z[i]] == rev[i + z[i]]:
+            z[i] += 1
+        if i + z[i] > right:
+            left, right = i, i + z[i]
+    return z
+
+
+def _smallest_period(pattern: Sequence[int]) -> int:
+    """Smallest ``q`` with ``pattern`` a whole number of copies of its first
+    ``q`` tokens (the prefix function's border rule)."""
+    n = len(pattern)
+    border = [0] * n
+    for i in range(1, n):
+        k = border[i - 1]
+        while k and pattern[i] != pattern[k]:
+            k = border[k - 1]
+        if pattern[i] == pattern[k]:
+            k += 1
+        border[i] = k
+    q = n - border[-1] if n else 0
+    return q if q and n % q == 0 else n
+
+
+def detect_long_repeated_token_suffix(
+    token_ids: Sequence[int],
+    *,
+    min_period_tokens: int = 129,
+    max_period_tokens: int = DEFAULT_MAX_LONG_PERIOD_TOKENS,
+    required_repeats: int = LONG_PERIOD_REQUIRED_REPEATS,
+) -> RepetitionMatch | None:
+    """Exact periodic suffix with a LONG period, in one O(window) pass.
+
+    A paragraph-sized loop (I-24) has a period far past the short rule's 128
+    tokens. This finds the smallest period in ``[min, max]`` whose last
+    ``required_repeats`` copies are exactly equal, scanning only the last
+    ``required_repeats * max_period_tokens`` tokens. A period that is a
+    multiple of a shorter one is never reported here: the loop is judged at
+    its primitive period, where the short rule already had its say.
+    """
+    if required_repeats < 2 or min_period_tokens < 1:
+        raise ValueError("invalid repetition guard thresholds")
+    if max_period_tokens < min_period_tokens:
+        return None
+    if len(token_ids) < min_period_tokens * required_repeats:
+        return None
+    window = list(token_ids[-max_period_tokens * required_repeats :])
+    z = _reversed_suffix_z(window)
+    highest = min(max_period_tokens, len(window) // required_repeats)
+    for period in range(min_period_tokens, highest + 1):
+        if z[period] < period * (required_repeats - 1):
+            continue
+        if _smallest_period(window[-period:]) != period:
+            continue
+        return RepetitionMatch(
+            period_tokens=period,
+            repeats=min(z[period] // period + 1, len(window) // period),
+        )
     return None
 
 

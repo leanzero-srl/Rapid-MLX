@@ -183,6 +183,7 @@ from .prefix_cache import (
 )
 from .prompt_host_cache import PromptHostCache
 from .repetition_guard import (
+    DEFAULT_MAX_LONG_PERIOD_TOKENS,
     AgentRepetitionLogitsProcessor,
     detect_repeated_token_suffix,
 )
@@ -985,10 +986,17 @@ class SchedulerConfig:
     # park happens only when the measured memory holds both. Decode is never
     # interrupted. Appended for positional callers.
     singleton_prefill_order: str = "srpf"
+    # Longest exact loop period (tokens) the repetition guard's hard stop
+    # checks on tool-bearing requests (RUN-ISSUES I-24). Periods past the
+    # short rule's 128 need four exact adjacent copies. 128 or 0 = the short
+    # rule alone. Appended for positional callers.
+    repetition_guard_max_period: int = DEFAULT_MAX_LONG_PERIOD_TOKENS
 
     def __post_init__(self) -> None:
         if self.singleton_prefill_order not in ("srpf", "fifo"):
             raise ValueError("singleton_prefill_order must be 'srpf' or 'fifo'")
+        if self.repetition_guard_max_period < 0:
+            raise ValueError("repetition_guard_max_period must be >= 0")
         if self.mllm_singleton_fastpath not in ("auto", "off"):
             raise ValueError(
                 "mllm_singleton_fastpath must be 'auto' or 'off', "
@@ -14503,7 +14511,8 @@ class Scheduler:
                 and request.num_output_tokens % 8 == 0
             ):
                 repetition_match = detect_repeated_token_suffix(
-                    request.output_token_ids
+                    request.output_token_ids,
+                    max_long_period_tokens=self.config.repetition_guard_max_period,
                 )
                 if repetition_match is not None:
                     finish_reason = "abort"

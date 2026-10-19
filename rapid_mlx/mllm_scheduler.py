@@ -48,7 +48,10 @@ from .mllm_batch_generator import (  # noqa: E402
 )
 from .mllm_cache import MLLMCacheManager  # noqa: E402
 from .multimodal_processor import MultimodalProcessor  # noqa: E402
-from .repetition_guard import detect_repeated_token_suffix  # noqa: E402
+from .repetition_guard import (  # noqa: E402
+    DEFAULT_MAX_LONG_PERIOD_TOKENS,
+    detect_repeated_token_suffix,
+)
 from .request import (  # noqa: E402
     ClientRequestError,
     RequestOutput,
@@ -117,6 +120,8 @@ class MLLMSchedulerConfig:
     # exactly the budget it built before these fields existed.
     cache_memory_mb: int | None = None
     cache_memory_percent: float | None = None
+    # See ``SchedulerConfig.repetition_guard_max_period`` (RUN-ISSUES I-24).
+    repetition_guard_max_period: int = DEFAULT_MAX_LONG_PERIOD_TOKENS
 
     def __post_init__(self) -> None:
         if self.mllm_singleton_fastpath not in ("auto", "off"):
@@ -1123,7 +1128,10 @@ class MLLMScheduler:
                 and not request.sampling_params.ignore_eos
                 and request.num_output_tokens % 8 == 0
             ):
-                repetition_match = detect_repeated_token_suffix(request.output_tokens)
+                repetition_match = detect_repeated_token_suffix(
+                    request.output_tokens,
+                    max_long_period_tokens=self.config.repetition_guard_max_period,
+                )
                 if repetition_match is not None:
                     finish_reason = "abort"
                     repetition_error = (

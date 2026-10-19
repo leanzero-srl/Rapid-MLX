@@ -37,6 +37,7 @@ from ..api.utils import (
 from ..output_router import Channel, OutputRouter
 from ..prompt_host_cache import PromptHostCache
 from ..utils.chat_template import apply_chat_template as shared_apply_chat_template
+from ..repetition_guard import DEFAULT_MAX_LONG_PERIOD_TOKENS
 from .base import BaseEngine, GenerationOutput, engine_stop_reason
 
 ADMISSION_ORPHAN_GRACE_SECONDS = 2.0
@@ -1941,6 +1942,11 @@ class BatchedEngine(BaseEngine):
             ),
             vision_min_pixels=vision_min_pixels,
             vision_max_pixels=vision_max_pixels,
+            repetition_guard_max_period=getattr(
+                self._scheduler_config,
+                "repetition_guard_max_period",
+                DEFAULT_MAX_LONG_PERIOD_TOKENS,
+            ),
         )
 
         # The event loop renders request chat templates while the model worker

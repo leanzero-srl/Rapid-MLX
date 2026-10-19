@@ -218,5 +218,7 @@ def test_guard_only_reads_bounded_suffix_under_large_history():
             return list(range(768))
 
     history = _BoundedSequence(1_000_000)
-    assert detect_repeated_token_suffix(history) is None
+    # The short rule alone; the long-period rule's own bound (4 x 1024) is
+    # pinned in test_repetition_guard_long_period.py.
+    assert detect_repeated_token_suffix(history, max_long_period_tokens=0) is None
     assert history.requested_slice == slice(-768, None, None)

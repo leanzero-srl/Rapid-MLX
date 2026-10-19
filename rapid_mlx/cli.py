@@ -25,6 +25,10 @@ from collections.abc import Callable
 from rapid_mlx._completion import alias_completer
 from rapid_mlx.model_profile import ModelProfile
 
+# ``repetition_guard.DEFAULT_MAX_LONG_PERIOD_TOKENS``, restated so ``--help``
+# never imports MLX (tests/test_repetition_guard.py pins the two equal).
+REPETITION_GUARD_MAX_PERIOD_DEFAULT = 1024
+
 # Project-default mirror for ``RAPID_MLX_MODEL_MIRROR`` (consumed by
 # ``_try_mirror_prefetch``). Public Cloudflare Worker → R2 bucket, with
 # rate-limit + Range-request passthrough. Override with the env var
@@ -5253,6 +5257,9 @@ def serve_command(args):
         scheduling_policy=args.scheduling_policy,
         scheduling_max_deferrals=args.scheduling_max_deferrals,
         singleton_prefill_order=getattr(args, "singleton_prefill_order", "srpf"),
+        repetition_guard_max_period=getattr(
+            args, "repetition_guard_max_period", REPETITION_GUARD_MAX_PERIOD_DEFAULT
+        ),
         enable_prefix_cache=enable_prefix_cache,
         prefix_cache_size=args.prefix_cache_size,
         # R15-P1 (task #303): radix-tree prefix-cache index.
@@ -11976,6 +11983,18 @@ Examples:
             "Prompt-slot admission order (default: fcfs). "
             "shortest_validated_tail favors cache-hot and short prompts while "
             "bounding how often an older compatible request may be deferred."
+        ),
+    )
+    serve_parser.add_argument(
+        "--repetition-guard-max-period",
+        type=int,
+        default=REPETITION_GUARD_MAX_PERIOD_DEFAULT,
+        metavar="TOKENS",
+        help=(
+            "Longest exact loop period, in tokens, the repetition guard stops "
+            "on a tool-bearing request (default %(default)s). Periods over 128 "
+            "need four exact adjacent copies; up to 128 the short rule's "
+            "thresholds apply. 128 or 0 = the short rule alone."
         ),
     )
     serve_parser.add_argument(
