@@ -60,6 +60,7 @@ from .kv_estimation import (  # noqa: E402
     _valid_layer_types,
     estimate_kv_footprint,
     attention_module_kv_bytes,
+    block_pattern_kv_bytes,
     latent_attention_bytes_per_layer,
     rotating_cache_slots,
 )
@@ -11018,6 +11019,17 @@ class Scheduler:
             fixed_baseline = 0
             sliding_slot_bytes = 0
             sliding_window = 0
+        # NVIDIA Nemotron-H / Nemotron-H Puzzle (Nemotron 3.5 Bolt): attention
+        # KV only on the "*" blocks, a fixed Mamba2 state per "M" block, nothing
+        # on MoE/MLP blocks. Their configs carry no ``layer_types``, so the
+        # formula above priced every block as full attention (Bolt 180,224 vs a
+        # real 8,192 B/token). Read from the loaded modules.
+        if latent is None:
+            blocks = self._block_pattern_kv_bytes()
+            if blocks is not None:
+                per_tok, fixed_baseline = blocks
+                sliding_slot_bytes = 0
+                sliding_window = 0
         # Sliding/full hybrids whose full layers have their OWN KV shape (Gemma 4:
         # 1 global KV head x 512 vs the config's 8 x 256 sliding shape): size both
         # terms from the loaded attention modules in the real activation dtype
@@ -11050,6 +11062,19 @@ class Scheduler:
             return None
         try:
             return latent_attention_bytes_per_layer(getattr(self, "model", None), dtype_bytes)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _block_pattern_kv_bytes(self) -> tuple[int, int] | None:
+        """``(growth bytes per token, fixed state bytes)`` of a Nemotron-H block
+        stack (``kv_estimation.block_pattern_kv_bytes``) in the activation dtype
+        the loaded floating parameters carry, else ``None``."""
+        try:
+            dtype_bytes = self._kv_element_bytes(getattr(self.model, "config", None))
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            return block_pattern_kv_bytes(getattr(self, "model", None), int(dtype_bytes))
         except Exception:  # noqa: BLE001
             return None
 
@@ -11141,7 +11166,14 @@ class Scheduler:
         if dims is None:
             return None
         num_layers, kv_heads, head_dim, struct_cfg = dims
-        dtype_bytes = self._infer_kv_dtype_bytes(struct_cfg)
+        # The element size the loaded floating parameters carry, as every other
+        # KV term prices it (``_kv_element_bytes``, RUN-ISSUES I-17). mlx-lm
+        # ``ModelArgs`` drop the HF ``dtype`` key, so the config probe alone fell
+        # back to fp32 here and DOUBLED every mlx-lm model's KV in the memory
+        # guard: Granite 4.2 30B 8-bit was priced 524,288 B/token against a
+        # measured 262,144 and its window cut to 69,888 of 131,072 (RUN-ISSUES
+        # I-29).
+        dtype_bytes = self._kv_element_bytes(struct_cfg)
         uniform_per_token = 2 * num_layers * kv_heads * head_dim * dtype_bytes
         if uniform_per_token <= 0:
             return None

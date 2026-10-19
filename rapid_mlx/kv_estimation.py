@@ -795,3 +795,75 @@ def attention_module_kv_bytes(model: Any, dtype_bytes: int) -> tuple[int, int] |
         else:
             growth += per_layer
     return growth, slot
+
+
+def _int_attr(obj: Any, name: str) -> int:
+    value = getattr(obj, name, None)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
+
+
+def block_pattern_kv_bytes(model: Any, dtype_bytes: int) -> tuple[int, int] | None:
+    """``(growth bytes per token, fixed state bytes per sequence)`` of an NVIDIA
+    Nemotron-H block stack, read from the loaded modules, else ``None``.
+
+    Nemotron-H (mlx-lm ``nemotron_h``: Nemotron 3 / 3.5 Nano, Super, Super VL)
+    and Nemotron-H Puzzle (vendored ``nemotron_h_puzzle``: Nemotron 3.5 Bolt)
+    declare their layers as a ``hybrid_override_pattern`` / ``block_configs``
+    of single-character block codes, not ``layer_types``, so
+    :func:`estimate_kv_footprint` sees a dense model and the scheduler charged
+    EVERY layer full attention KV: Bolt is 88 blocks of which 8 attend (2 KV
+    heads x 128), 40 are Mamba2 mixers with a fixed state and 40 are MoE with
+    no cache at all. The uniform figure (88 x 2 x 2 x 128, plus the fp32 dtype
+    fallback) was 180,224 B/token against a real 8,192.
+
+    What each block caches (mlx-lm ``nemotron_h.Model.make_cache``):
+
+    * ``"*"`` attention: a ``KVCache`` growing ``2 x num_key_value_heads x
+      head_dim x dtype`` bytes per token;
+    * ``"M"`` Mamba2: an ``ArraysCache`` holding the conv ring
+      (``conv_kernel_size - 1`` x ``conv_dim`` in the activation dtype) and the
+      SSM state (``num_heads x head_dim x ssm_state_size``, charged at fp32: the
+      Puzzle mixer computes the recurrence in fp32, and over-charging this small
+      fixed term is the safe direction);
+    * ``"E"`` MoE and ``"-"`` MLP: nothing.
+
+    Recognised only when EVERY layer carries one of those codes as
+    ``block_type`` and every caching mixer exposes the integer dimensions
+    above; anything else returns ``None`` and keeps the existing accounting."""
+    if not isinstance(dtype_bytes, int) or isinstance(dtype_bytes, bool) or dtype_bytes <= 0:
+        return None
+    layers = _model_layers(model)
+    if not layers:
+        return None
+    growth = 0
+    fixed = 0
+    for layer in layers:
+        kind = getattr(layer, "block_type", None)
+        if not isinstance(kind, str):
+            return None
+        mixer = getattr(layer, "mixer", None)
+        if kind == "*":
+            heads = _int_attr(mixer, "num_key_value_heads")
+            dim = _int_attr(mixer, "head_dim")
+            if not (heads and dim):
+                return None
+            growth += 2 * heads * dim * dtype_bytes
+        elif kind == "M":
+            kernel = _int_attr(mixer, "conv_kernel_size")
+            conv_dim = _int_attr(mixer, "conv_dim")
+            heads = _int_attr(mixer, "num_heads")
+            dim = _int_attr(mixer, "head_dim")
+            state = _int_attr(mixer, "ssm_state_size")
+            if not (kernel and conv_dim and heads and dim and state):
+                return None
+            fixed += (kernel - 1) * conv_dim * dtype_bytes
+            fixed += heads * dim * state * _RECURRENT_STATE_BYTES_PER_ELEM
+        elif kind in ("E", "-"):
+            continue
+        else:
+            return None
+    if growth <= 0 and fixed <= 0:
+        return None
+    return growth, fixed
