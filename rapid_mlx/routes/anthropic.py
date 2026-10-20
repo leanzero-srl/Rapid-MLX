@@ -2,6 +2,7 @@
 """Anthropic Messages API endpoints — /v1/messages."""
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -57,9 +58,10 @@ from ..service.helpers import (
     _check_admission_or_503,
     _disconnect_guard,
     _effective_enable_thinking,
-    _prompt_thinking_active_for,
     _finalize_content_and_reasoning,
     _parse_tool_calls_with_parser,
+    _prompt_thinking_active_for,
+    _prompt_thinking_closed_for,
     _raise_lifecycle_cancel_or_reraise,
     _release_admission_unless_committed,
     _release_route_ownership,
@@ -2199,7 +2201,24 @@ async def _stream_anthropic_messages(
                     chat_kwargs.get("enable_thinking"),
                     tools_requested=bool(chat_kwargs.get("tools")),
                     model_name=cfg.model_path or cfg.model_name,
+                    template_kwargs=chat_kwargs.get("chat_template_kwargs"),
                 )
+                if "prompt_thinking_closed" in inspect.signature(
+                    configure_request
+                ).parameters:
+                    configure_kwargs["prompt_thinking_closed"] = (
+                        _prompt_thinking_closed_for(
+                            reasoning_parser,
+                            getattr(
+                                getattr(engine, "tokenizer", None), "chat_template", ""
+                            )
+                            or "",
+                            chat_kwargs.get("enable_thinking"),
+                            tools_requested=bool(chat_kwargs.get("tools")),
+                            model_name=cfg.model_path or cfg.model_name,
+                            template_kwargs=chat_kwargs.get("chat_template_kwargs"),
+                        )
+                    )
             configure_request(**configure_kwargs)
         else:
             reasoning_parser.reset_state()

@@ -887,9 +887,16 @@ def _should_start_in_thinking(
     unconditional: bool = False,
     tools_requested: bool = False,
     rendered: bool = False,
+    template_kwargs: dict | None = None,
 ) -> bool:
     """Shared predicate: does this chat template start the assistant
     response inside an implicit ``<think>`` block?
+
+    ``template_kwargs`` are the request's own ``chat_template_kwargs``: the
+    render must see the variables the engine renders with. Nex-N2.5-mini primes
+    ``<think>`` unless ``reasoning_effort == "none"``, so a probe without it
+    called a closed block open and the whole direct answer streamed as
+    reasoning (RUN-ISSUES I-27 review).
 
     Some thinking-capable chat templates include ``<think>`` in the
     generated assistant prefix instead of emitting it as a normal
@@ -940,39 +947,13 @@ def _should_start_in_thinking(
         ]
         if not present_pairs:
             return False
-        # Use the same sandboxed Jinja compiler as Hugging Face tokenizers.
-        # Rendering, unlike source scanning, honors assignments, macros,
-        # loops, comments, and the active if/elif/else branch.
-        try:
-            from transformers.utils.chat_template_utils import (
-                _compile_jinja_template,
-            )
-
-            tool_probe = {
-                "type": "function",
-                "function": {
-                    "name": "probe",
-                    "description": "probe",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-            # The generation path resolves an omitted flag to enabled for
-            # non-coder models. ``deepseek_r1_distill`` is such a family, so
-            # its unconditional probe must use that same effective value.
-            effective_enable_thinking = (
-                True if enable_thinking is None else enable_thinking
-            )
-            rendered = _compile_jinja_template(chat_template).render(
-                messages=[{"role": "user", "content": "probe"}],
-                tools=[tool_probe] if tools_requested else None,
-                add_generation_prompt=True,
-                enable_thinking=effective_enable_thinking,
-                bos_token="",
-                eos_token="",
-                pad_token="",
-                unk_token="",
-            )
-        except Exception:
+        rendered = _render_generation_prompt_probe(
+            chat_template,
+            enable_thinking,
+            tools_requested=tools_requested,
+            template_kwargs=template_kwargs,
+        )
+        if rendered is None:
             # An unrenderable custom template is indeterminate. Do not claim it
             # primed thinking: a false positive would silently discard a valid
             # public answer. The shipped distill templates render above.
@@ -989,6 +970,147 @@ def _should_start_in_thinking(
     )
 
 
+def _render_generation_prompt_probe(
+    chat_template: str,
+    enable_thinking: bool | None,
+    *,
+    tools_requested: bool,
+    template_kwargs: dict | None,
+) -> str | None:
+    """The template's generation prompt for a one-message probe, rendered with
+    the request's own template variables, or ``None`` when it does not render.
+
+    Uses the same sandboxed Jinja compiler as Hugging Face tokenizers.
+    Rendering, unlike source scanning, honors assignments, macros, loops,
+    comments, and the active if/elif/else branch.
+    """
+    try:
+        from transformers.utils.chat_template_utils import _compile_jinja_template
+
+        tool_probe = {
+            "type": "function",
+            "function": {
+                "name": "probe",
+                "description": "probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        # The generation path resolves an omitted flag to enabled for non-coder
+        # models. ``deepseek_r1_distill`` is such a family, so its
+        # unconditional probe must use that same effective value.
+        effective_enable_thinking = True if enable_thinking is None else enable_thinking
+        # The request's own template variables (``reasoning_effort`` and
+        # friends); the keys this probe fixes itself always win.
+        request_vars = {
+            key: value
+            for key, value in (template_kwargs or {}).items()
+            if isinstance(key, str) and key not in _PRIMING_PROBE_FIXED_KEYS
+        }
+        return _compile_jinja_template(chat_template).render(
+            **request_vars,
+            messages=[{"role": "user", "content": "probe"}],
+            tools=[tool_probe] if tools_requested else None,
+            add_generation_prompt=True,
+            enable_thinking=effective_enable_thinking,
+            bos_token="",
+            eos_token="",
+            pad_token="",
+            unk_token="",
+        )
+    except Exception:
+        return None
+
+
+def _prompt_ends_think_closed(
+    chat_template,
+    enable_thinking: bool | None,
+    *,
+    tools_requested: bool = False,
+    template_kwargs: dict | None = None,
+) -> bool:
+    """Does the rendered generation prompt END with a closed think block?
+
+    Then the model's first token is already the answer: Nex-N2.5-mini with
+    ``reasoning_effort: "none"`` renders ``<think>\n\n</think>\n\n``, and
+    a parser that treated untagged output as maybe-reasoning sent the first
+    63 of 138 answer characters to ``reasoning_content`` (RUN-ISSUES I-27
+    review). A template with no think block at all is NOT closed: a lenient
+    R1 model may still open reasoning without a tag there.
+    """
+    if isinstance(chat_template, dict):
+        if tools_requested and "tool_use" in chat_template:
+            chat_template = chat_template["tool_use"]
+        elif tools_requested and "tools" in chat_template:
+            chat_template = chat_template["tools"]
+        elif "default" in chat_template:
+            chat_template = chat_template["default"]
+        elif len(chat_template) == 1:
+            chat_template = next(iter(chat_template.values()))
+        else:
+            chat_template = ""
+    if not isinstance(chat_template, str):
+        return False
+    present_pairs = [
+        pair for pair in _IMPLICIT_THINK_MARKER_PAIRS if pair[0] in chat_template
+    ]
+    if not present_pairs:
+        return False
+    rendered = _render_generation_prompt_probe(
+        chat_template,
+        enable_thinking,
+        tools_requested=tools_requested,
+        template_kwargs=template_kwargs,
+    )
+    if rendered is None:
+        return False
+    tail = rendered.rstrip()
+    return any(
+        tail.endswith(closer) and rendered.rfind(closer) > rendered.rfind(opener)
+        for opener, closer in present_pairs
+    )
+
+
+def _prompt_thinking_closed_for(
+    parser,
+    chat_template,
+    enable_thinking: bool | None,
+    *,
+    tools_requested: bool,
+    model_name: str | None,
+    template_kwargs: dict | None = None,
+) -> bool:
+    """The ``prompt_thinking_closed`` a parser's ``configure_request`` takes,
+    with the same enable_thinking resolution as ``_prompt_thinking_active_for``."""
+    implicit = bool(getattr(parser, "implicit_reasoning_until_close", False))
+    rendered = bool(getattr(parser, "prompt_priming_rendered", False))
+    if rendered and not implicit:
+        enable_thinking = _effective_enable_thinking(
+            enable_thinking, model_name if isinstance(model_name, str) else None
+        )
+    return _prompt_ends_think_closed(
+        chat_template,
+        enable_thinking,
+        tools_requested=tools_requested,
+        template_kwargs=template_kwargs,
+    )
+
+
+#: Variables the priming probe sets itself; a request's ``chat_template_kwargs``
+#: never overrides them (``enable_thinking`` is resolved by the caller).
+_PRIMING_PROBE_FIXED_KEYS = frozenset(
+    {
+        "messages",
+        "tools",
+        "add_generation_prompt",
+        "enable_thinking",
+        "bos_token",
+        "eos_token",
+        "pad_token",
+        "unk_token",
+    }
+)
+
+
 def _prompt_thinking_active_for(
     parser,
     chat_template,
@@ -996,6 +1118,7 @@ def _prompt_thinking_active_for(
     *,
     tools_requested: bool,
     model_name: str | None,
+    template_kwargs: dict | None = None,
 ) -> bool:
     """The ``prompt_thinking_active`` a reasoning parser's ``configure_request``
     takes, decided the way that parser asks for it.
@@ -1022,6 +1145,7 @@ def _prompt_thinking_active_for(
         unconditional=implicit,
         tools_requested=tools_requested,
         rendered=rendered,
+        template_kwargs=template_kwargs,
     )
 
 

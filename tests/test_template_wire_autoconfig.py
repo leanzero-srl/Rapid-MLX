@@ -242,3 +242,81 @@ def test_the_detected_parsers_split_a_nex_reply(chat_template_kwargs):
     assert content.strip() == "Creating it."
     assert [c["name"] for c in calls.values()] == ["write"]
     assert json.loads(calls[0]["arguments"]) == {"path": "a.txt", "content": "hi"}
+
+
+# Review of I-27 (2026-10-20): Nex closes its think block when the request sets
+# ``chat_template_kwargs.reasoning_effort = "none"``. The priming probe rendered
+# without the request's own template variables (called it primed: every answer
+# character was reasoning), and the parser, told only "not primed", still held
+# the first 63 of 138 answer characters as maybe-reasoning.
+DIRECT_ANSWER = (
+    "The capital of France is Paris. It has been the capital for centuries "
+    "and is known for its museums."
+)
+
+
+def _stream_split(text: str, extra: dict) -> tuple[str, str]:
+    cfg = reset_config()
+    cfg.engine = _Engine(text)
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    cfg.enable_auto_tool_choice = True
+    cfg.tool_call_parser = "qwen3_coder_xml"
+    cfg.reasoning_parser_name = "deepseek_r1_distill"
+    app = FastAPI()
+    app.include_router(chat_router)
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "go"}],
+        **extra,
+    }
+    resp = TestClient(app).post("/v1/chat/completions", json=body)
+    assert resp.status_code == 200, resp.text
+    content = reasoning = ""
+    for line in resp.text.splitlines():
+        if not line.startswith("data:") or "[DONE]" in line:
+            continue
+        for choice in json.loads(line[5:]).get("choices", []):
+            delta = choice.get("delta") or {}
+            content += delta.get("content") or ""
+            reasoning += delta.get("reasoning_content") or ""
+    return content, reasoning
+
+
+def test_a_prompt_that_closed_the_think_block_streams_the_answer_as_content():
+    content, reasoning = _stream_split(
+        DIRECT_ANSWER, {"chat_template_kwargs": {"reasoning_effort": "none"}}
+    )
+    assert reasoning == ""
+    assert content == DIRECT_ANSWER
+
+
+def test_a_primed_prompt_still_splits_the_thought():
+    content, reasoning = _stream_split(
+        "Plan the answer first.</think>\n\n" + DIRECT_ANSWER, {}
+    )
+    assert reasoning.strip() == "Plan the answer first."
+    assert content.strip() == DIRECT_ANSWER
+
+
+def test_the_closed_prompt_probe_reads_the_requests_template_variables():
+    from rapid_mlx.service.helpers import _prompt_ends_think_closed
+
+    closed = {"reasoning_effort": "none"}
+    assert _prompt_ends_think_closed(NEX_TEMPLATE, None, template_kwargs=closed)
+    assert not _prompt_ends_think_closed(NEX_TEMPLATE, None)
+    # A template with no think block is not "closed": a lenient R1 model may
+    # still open reasoning without a tag there.
+    assert not _prompt_ends_think_closed(WIRE_TOOLS + HISTORY, None)
+
+
+def test_a_closed_prompt_makes_the_r1_parser_start_in_content():
+    from rapid_mlx.reasoning.deepseek_r1_parser import DeepSeekR1DistillReasoningParser
+
+    parser = DeepSeekR1DistillReasoningParser()
+    parser.configure_request(prompt_thinking_active=False, prompt_thinking_closed=True)
+    first = parser.extract_reasoning_streaming("", "The capital", "The capital")
+    assert first is not None and first.content == "The capital"
+    assert not first.reasoning

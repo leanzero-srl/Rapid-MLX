@@ -37,8 +37,11 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         *,
         enable_thinking: bool | None = None,
         prompt_thinking_active: bool | None = None,
+        prompt_thinking_closed: bool | None = None,
     ) -> None:
-        """Start a request knowing whether the prompt already opened ``<think>``.
+        """Start a request knowing whether the prompt already opened ``<think>``,
+        or already CLOSED it (``prompt_thinking_closed``: the first token is the
+        answer, so untagged output is content from the first character).
 
         Qwen3.5/3.6/3.8 templates end the generation prompt with ``<think>\n``
         whenever thinking is on, so the model's output starts INSIDE the
@@ -51,6 +54,9 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         del enable_thinking
         self.reset_state()
         self._prompt_primed_thinking = prompt_thinking_active is True
+        self._prompt_closed_thinking = (
+            prompt_thinking_closed is True and prompt_thinking_active is not True
+        )
 
     @property
     def start_token(self) -> str:
@@ -153,6 +159,10 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         # threshold-crossing content delta so no buffered bytes
         # are stranded and a split opener reassembles correctly.
         if not has_tags and not self._saw_any_tag:
+            if getattr(self, "_prompt_closed_thinking", False):
+                # The prompt closed the think block: no untagged reasoning can
+                # follow, so nothing is held back as maybe-reasoning.
+                return self._apply_tool_call_promotion(DeltaMessage(content=delta_text))
             if getattr(self, "_prompt_primed_thinking", False):
                 return self._apply_tool_call_promotion(
                     super()._extract_reasoning_streaming_inner(

@@ -101,11 +101,12 @@ from ..service.helpers import (
     _consume_guided_lifecycle_cancel,
     _disconnect_guard,
     _effective_enable_thinking,
-    _prompt_thinking_active_for,
     _extract_thinking_from_request,
     _finalize_content_and_reasoning,
     _is_structured_output_requested,
     _parse_tool_calls_with_parser,
+    _prompt_thinking_active_for,
+    _prompt_thinking_closed_for,
     _raise_lifecycle_cancel_or_reraise,
     _release_admission_unless_committed,
     _release_route_ownership,
@@ -3146,11 +3147,26 @@ async def _stream_responses(
                             chat_kwargs.get("enable_thinking"),
                             tools_requested=bool(chat_kwargs.get("tools")),
                             model_name=cfg.model_path or cfg.model_name,
+                            template_kwargs=chat_kwargs.get("chat_template_kwargs"),
                         )
                     )
                 configure_parameters: Mapping[str, inspect.Parameter] = (
                     inspect.signature(configure_request).parameters
                 )
+                if "prompt_thinking_closed" in configure_parameters:
+                    configure_kwargs["prompt_thinking_closed"] = (
+                        _prompt_thinking_closed_for(
+                            reasoning_parser,
+                            getattr(
+                                getattr(engine, "tokenizer", None), "chat_template", ""
+                            )
+                            or "",
+                            chat_kwargs.get("enable_thinking"),
+                            tools_requested=bool(chat_kwargs.get("tools")),
+                            model_name=cfg.model_path or cfg.model_name,
+                            template_kwargs=chat_kwargs.get("chat_template_kwargs"),
+                        )
+                    )
                 if "json_mode" in configure_parameters:
                     configure_kwargs["json_mode"] = _is_structured_output_requested(
                         getattr(openai_request, "response_format", None)

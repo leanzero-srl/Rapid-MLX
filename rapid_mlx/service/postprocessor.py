@@ -263,6 +263,14 @@ class StreamingPostProcessor:
                 )
         self.tools_requested = tools_requested
         self.json_mode = json_mode
+        # The request's ``chat_template_kwargs``: the parser's priming probe
+        # renders with them (a ``reasoning_effort`` that closes the think block).
+        request_ctk = (
+            request.get("chat_template_kwargs")
+            if isinstance(request, dict)
+            else getattr(request, "chat_template_kwargs", None)
+        )
+        self.template_kwargs = request_ctk if isinstance(request_ctk, dict) else None
         # LINE① (#558, codex r4 #4): when the reasoning-gated forced tool grammar is
         # engaged for THIS request, the real call is guaranteed to land AFTER
         # ``</think>`` (already on the content channel). The MiniMax tool-markup
@@ -394,6 +402,23 @@ class StreamingPostProcessor:
                             tools_requested=self.tools_requested,
                             model_name=getattr(cfg, "model_path", None)
                             or getattr(cfg, "model_name", None),
+                            template_kwargs=self.template_kwargs,
+                        )
+                    )
+                if "prompt_thinking_closed" in configure_parameters:
+                    from .helpers import _prompt_thinking_closed_for
+
+                    tokenizer = getattr(cfg.engine, "tokenizer", None)
+                    template = getattr(tokenizer, "chat_template", "") or ""
+                    configure_kwargs["prompt_thinking_closed"] = (
+                        _prompt_thinking_closed_for(
+                            self.reasoning_parser,
+                            template,
+                            enable_thinking,
+                            tools_requested=self.tools_requested,
+                            model_name=getattr(cfg, "model_path", None)
+                            or getattr(cfg, "model_name", None),
+                            template_kwargs=self.template_kwargs,
                         )
                     )
                 if "json_mode" in configure_parameters:
@@ -2556,6 +2581,23 @@ class StreamingPostProcessor:
                             tools_requested=self.tools_requested,
                             model_name=getattr(self.cfg, "model_path", None)
                             or getattr(self.cfg, "model_name", None),
+                            template_kwargs=self.template_kwargs,
+                        )
+                    )
+                if "prompt_thinking_closed" in configure_parameters:
+                    from .helpers import _prompt_thinking_closed_for
+
+                    tokenizer = getattr(self.cfg.engine, "tokenizer", None)
+                    template = getattr(tokenizer, "chat_template", "") or ""
+                    configure_kwargs["prompt_thinking_closed"] = (
+                        _prompt_thinking_closed_for(
+                            self.reasoning_parser,
+                            template,
+                            self.enable_thinking,
+                            tools_requested=self.tools_requested,
+                            model_name=getattr(self.cfg, "model_path", None)
+                            or getattr(self.cfg, "model_name", None),
+                            template_kwargs=self.template_kwargs,
                         )
                     )
                 if "json_mode" in configure_parameters:
