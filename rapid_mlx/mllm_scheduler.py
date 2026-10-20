@@ -196,6 +196,10 @@ class MLLMRequest:
     prefix_boundary: int = 0
     lifecycle_admission_token: str | None = None
     logits_processors: list[Callable] = field(default_factory=list)
+    # Tool definitions were sent. The long-period repetition stop (RUN-ISSUES I-24)
+    # is for agent loops only, as on the text lane; the short rule stays on every
+    # request here (it guards the Metal-handle exhaustion of a sustained short loop).
+    has_tools: bool = False
 
 
 def _find_stop_match_in_new_window(
@@ -721,6 +725,7 @@ class MLLMScheduler:
             lifecycle_admission_token=kwargs.pop("lifecycle_admission_token", None),
             logits_processors=logits_processors,
             prefix_boundary=int(kwargs.pop("prefix_boundary", 0) or 0),
+            has_tools=bool(kwargs.pop("has_tools", False)),
         )
 
         # D-M01-2X (0.8.2 dogfood, codex r10 BLOCKING follow-up):
@@ -1130,7 +1135,11 @@ class MLLMScheduler:
             ):
                 repetition_match = detect_repeated_token_suffix(
                     request.output_tokens,
-                    max_long_period_tokens=self.config.repetition_guard_max_period,
+                    max_long_period_tokens=(
+                        self.config.repetition_guard_max_period
+                        if request.has_tools
+                        else 0
+                    ),
                 )
                 if repetition_match is not None:
                     finish_reason = "abort"

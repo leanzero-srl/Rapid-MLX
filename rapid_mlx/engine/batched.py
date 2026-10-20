@@ -2885,6 +2885,7 @@ class BatchedEngine(BaseEngine):
                     on_request_committed=request_committed,
                     logits_processors=_mllm_logits_processors,
                     prefix_boundary=prefix_boundary,
+                    has_tools=bool(kwargs.get("has_tools", False)),
                     **_mllm_sampling_kwargs,
                 )
             except BaseException:
@@ -3145,6 +3146,7 @@ class BatchedEngine(BaseEngine):
                     on_request_committed=commit_admission,
                     logits_processors=_mllm_logits_processors,
                     prefix_boundary=prefix_boundary,
+                    has_tools=bool(kwargs.get("has_tools", False)),
                     **_mllm_sampling_kwargs,
                 )
             except BaseException:
