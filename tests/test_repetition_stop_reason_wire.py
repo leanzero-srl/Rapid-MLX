@@ -199,3 +199,81 @@ def test_the_output_router_keeps_the_reason_on_its_terminal_outputs():
     assert finished.stop_reason == "repetition"
     midway = BatchedEngine._make_routed_output(None, source, _Event())
     assert midway.stop_reason is None
+
+
+# A loop inside a tool call's arguments (review of I-24/I-28, 2026-10-20): the guard
+# cuts the call mid-argument and the parser closes it, so before this the client got
+# ``shell`` with ``{}`` and ``finish_reason: "tool_calls"`` - a finished call to run.
+CALL_LOOP = "<tool_call>\n<function=shell>\n<parameter=command>\necho " + "loop " * 60
+CALL_DONE = (
+    "<tool_call>\n<function=shell>\n<parameter=command>\nls\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
+
+
+class _CallEngine(_Engine):
+    def __init__(self, text: str, finish_reason: str, stop_reason: str | None):
+        super().__init__(finish_reason, stop_reason)
+        self.text = text
+
+    async def stream_chat(self, messages, **kwargs):
+        pieces = [self.text[i : i + 11] for i in range(0, len(self.text), 11)]
+        text = ""
+        for i, piece in enumerate(pieces):
+            text += piece
+            last = i == len(pieces) - 1
+            yield GenerationOutput(
+                text=text,
+                new_text=piece,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+                finished=last,
+                finish_reason=self.finish_reason if last else None,
+                **self._reason(last),
+            )
+
+    async def chat(self, messages, **kwargs):
+        return GenerationOutput(
+            text=self.text,
+            prompt_tokens=4,
+            completion_tokens=40,
+            finish_reason=self.finish_reason,
+            **self._reason(True),
+        )
+
+
+def _call_client(text: str, finish_reason: str, stop_reason: str | None) -> TestClient:
+    client = _client(finish_reason, stop_reason)
+    from rapid_mlx.config import get_config
+
+    get_config().engine = _CallEngine(text, finish_reason, stop_reason)
+    return client
+
+
+def test_a_loop_stop_inside_a_tool_call_names_itself_streamed():
+    choices = _streamed_choices(_call_client(CALL_LOOP, "length", "repetition"))
+    terminal = [c for c in choices if c.get("finish_reason")]
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["finish_reason"] == "length"
+    assert terminal[0]["rapid_mlx_stop_reason"] == "repetition"
+
+
+def test_a_loop_stop_inside_a_tool_call_names_itself_whole():
+    resp = _post(_call_client(CALL_LOOP, "length", "repetition"), stream=False)
+    assert resp.status_code == 200, resp.text
+    choice = resp.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["rapid_mlx_stop_reason"] == "repetition"
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_finished_tool_call_stays_tool_calls(stream):
+    client = _call_client(CALL_DONE, "stop", None)
+    if stream:
+        terminal = [c for c in _streamed_choices(client) if c.get("finish_reason")]
+    else:
+        resp = _post(client, stream=False)
+        assert resp.status_code == 200, resp.text
+        terminal = resp.json()["choices"]
+    assert [c["finish_reason"] for c in terminal] == ["tool_calls"]
+    assert all("rapid_mlx_stop_reason" not in c for c in terminal)

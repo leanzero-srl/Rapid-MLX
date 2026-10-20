@@ -6607,7 +6607,9 @@ async def _create_chat_completion_impl(
             logger.warning(f"JSON output parsing failed: {e}")
 
     # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    finish_reason, engine_stop = _terminal_finish(
+        "tool_calls" if tool_calls else output.finish_reason, output
+    )
     if is_cancellation_finish_reason(finish_reason):
         return Response(status_code=499)
 
@@ -6753,7 +6755,7 @@ async def _create_chat_completion_impl(
                 ),
                 finish_reason=finish_reason,
                 logprobs=choice_logprobs,
-                rapid_mlx_stop_reason=_rapid_mlx_stop_reason(finish_reason, output),
+                rapid_mlx_stop_reason=engine_stop,
             )
         ],
         usage=_build_usage(output, reasoning_text),
@@ -6845,6 +6847,24 @@ async def _create_chat_completion_impl(
     return response
 
 
+def _terminal_finish(
+    finish_reason: str | None, output
+) -> tuple[str | None, str | None]:
+    """``(finish_reason, rapid_mlx_stop_reason)`` for a terminal choice.
+
+    A repetition-guard stop stays a ``"length"`` stop that names itself even
+    when the loop was inside a tool call and the cut call is emitted: the
+    parser would otherwise report ``"tool_calls"`` for a call whose arguments
+    the guard cut (measured: ``shell`` with ``{}``), and the client would run it
+    as a finished call (RUN-ISSUES I-24/I-28 review).
+    """
+    if (
+        finish_reason is not None
+        and getattr(output, "stop_reason", None) == "repetition"
+    ):
+        return "length", "repetition"
+    return finish_reason, _rapid_mlx_stop_reason(finish_reason, output)
+
 
 def _rapid_mlx_stop_reason(finish_reason: str | None, output) -> str | None:
     """The engine's own stop reason for a terminal choice, or ``None``.
@@ -6856,6 +6876,7 @@ def _rapid_mlx_stop_reason(finish_reason: str | None, output) -> str | None:
     if finish_reason != "length":
         return None
     return getattr(output, "stop_reason", None)
+
 
 async def stream_chat_completion(
     engine,
@@ -7368,10 +7389,12 @@ async def stream_chat_completion(
                                 delta=ChatCompletionChunkDelta(
                                     tool_calls=_normalized_tcs,
                                 ),
-                                finish_reason=event.finish_reason,
-                                rapid_mlx_stop_reason=_rapid_mlx_stop_reason(
+                                finish_reason=_terminal_finish(
                                     event.finish_reason, output
-                                ),
+                                )[0],
+                                rapid_mlx_stop_reason=_terminal_finish(
+                                    event.finish_reason, output
+                                )[1],
                             )
                         ],
                         # Usage placement (OpenAI streaming spec, D-SSE-USAGE):
@@ -8046,19 +8069,23 @@ async def stream_chat_completion(
                                 fallback_tool_calls if fallback_tool_calls else None
                             ),
                         ),
-                        finish_reason=(
-                            "tool_calls"
-                            if fallback_tool_calls
-                            else finish_event.finish_reason
-                        ),
+                        finish_reason=_terminal_finish(
+                            (
+                                "tool_calls"
+                                if fallback_tool_calls
+                                else finish_event.finish_reason
+                            ),
+                            finish_output,
+                        )[0],
                         logprobs=_build_chunk_logprobs(finish_output),
-                        rapid_mlx_stop_reason=(
-                            None
-                            if fallback_tool_calls
-                            else _rapid_mlx_stop_reason(
-                                finish_event.finish_reason, finish_output
-                            )
-                        ),
+                        rapid_mlx_stop_reason=_terminal_finish(
+                            (
+                                "tool_calls"
+                                if fallback_tool_calls
+                                else finish_event.finish_reason
+                            ),
+                            finish_output,
+                        )[1],
                     )
                 ],
                 # See "Usage placement" note on the tool_call branch
