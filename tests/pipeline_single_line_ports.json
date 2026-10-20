@@ -1,7 +1,7 @@
 {
   "_what": "Every single-engine commit (tags v*-lz.*) this pipeline line does not contain by ancestry, reviewed: ported (the pipeline commits that carry it), equivalent (the pipeline already did it its own way) or n/a (the code path does not exist in the pipeline server), or gap (the fix changes shared code a qwen4_exp request runs on the split and the split does not have it: reason says what is missing on which path, effect what the split does instead). Gaps are recorded, not silent: the audit test lists every one on each run. tests/test_pipeline_single_line_ports_audit.py fails on any commit missing here. goose Q-144: this line branched at v0.14.3-lz.2 and silently missed lz.6 until Q-143.",
   "upstream_base": "v0.14.3",
-  "reviewed_through": "v0.14.3-lz.12",
+  "reviewed_through": "v0.14.3-lz.13",
   "commits": {
     "999d43ea656bd2f2dfd7834bf4e3dca7e2ad5a14": {
       "tag": "v0.14.3-lz.3",
@@ -910,6 +910,50 @@
       "fixes": "auto-config: a local LFM2/LFM2.5 snapshot gets the lfm tool parser and the distill reasoning parser",
       "status": "n/a",
       "reason": "the cherry-pick of lz.11's c56728690 onto the release engine (reviewed n/a above): model_auto_config's metadata fallback for lfm2* checkpoints; the split serves qwen4_exp only and reads its parsers from the template (_template_parsers)"
+    },
+    "067f61bb5982f2b097d3245552bb27239e8ad671": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "chat: a repetition-guard stop says so on the wire (rapid_mlx_stop_reason) beside finish_reason=length",
+      "status": "gap",
+      "reason": "the single engine's repetition guard (scheduler.py) and routes/chat.py terminal choices gain rapid_mlx_stop_reason; the split has no single-engine scheduler and its own repeat stop (pipeline_stream.StreamRelay, pipeline_qwen4_serve finish \"length\") sends no such field",
+      "effect": "a split answer its StreamRelay ends as repeating reaches goose as a plain finish_reason=length, so goose reads it as an output-limit cut (the pre-I-28 behaviour), not as a loop; last_engine_stop on /v1/status still names it"
+    },
+    "f9352b05f2ec913e9787f5192aa101908d9ee827": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "repetition guard: stop a long exact loop too (periods up to 1024 tokens, four copies)",
+      "status": "n/a",
+      "reason": "repetition_guard.py is called by the single engine's scheduler.py and mllm_scheduler.py, and cli.py gains a single-engine serve flag; rapid_mlx/distributed/*.py builds neither scheduler (the split runs pipeline_qwen4_serve._Scheduler and its own StreamRelay repeat stop)"
+    },
+    "81cbb5d7c06730b23e739c52d11e8331c6e8aa19": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "auto-config: a local folder whose template renders the qwen3-coder XML wire gets its parsers",
+      "status": "n/a",
+      "reason": "model_auto_config's metadata fallback for families no rule claims; the split serves qwen4_exp only and reads its parsers from the template (_template_parsers)"
+    },
+    "b76c193da8f0541f68a7c83bcc1e9bc1f0622bb6": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "mllm: the long-period repetition stop is for tool-bearing requests, as on the text lane",
+      "status": "n/a",
+      "reason": "mllm_scheduler.py and engine/batched.py's multimodal branches are the single engine's vision lane; the split never builds them"
+    },
+    "255f90fa60c638ee21447d4dc5a00aa69e69e141": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "chat: a loop stop inside a tool call stays a length stop that names itself",
+      "status": "n/a",
+      "reason": "the split serves /v1/chat/completions from pipeline_qwen4_serve._build_app and never runs routes/chat.py; the split's tool-call terminal chunks come from pipeline_stream.StreamRelay"
+    },
+    "afeec251b6faf686fe260edb30c6619a3a793367": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "reasoning: a prompt that already closed the think block streams the answer as content",
+      "status": "gap",
+      "reason": "service/helpers._should_start_in_thinking now renders with the request's chat_template_kwargs and deepseek_r1_parser starts in content when the rendered prompt closed the think block (prompt_thinking_closed); the split calls _should_start_in_thinking(template, enable_thinking, tools_requested) itself (pipeline_qwen4_serve ~2251) and sets only _prompt_primed_thinking, never the closed signal",
+      "effect": "on the split a request whose prompt closed the think block (thinking off, or chat_template_kwargs reasoning_effort none) can route up to the first 63 characters of the answer to reasoning under the R1 parser's 64-character no-tag rule, as before lz.13"
+    },
+    "c58790b11e0a3c35ca5827b7819602301ca8d553": {
+      "tag": "v0.14.3-lz.13",
+      "fixes": "errors: the D-METAL-CAP refusal names the prompt room beside max_tokens, not a context window",
+      "status": "n/a",
+      "reason": "scheduler.py _metal_cap_context_refusal is the single engine's admission; the split refuses from its own plan (pipeline_qwen4 plan / _Engine admission) and never builds ContextExceedsDeviceMemoryError"
     }
   }
 }
