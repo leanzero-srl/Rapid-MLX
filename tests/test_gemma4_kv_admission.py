@@ -291,3 +291,37 @@ def test_a_waiting_prompt_is_tokenized_once_across_admissions():
     first = sched._estimate_request_kv_bytes(request)
     assert sched._estimate_request_kv_bytes(request) == first
     assert calls == [len("tok " * 3000)]
+
+
+def test_the_metal_cap_refusal_names_the_prompt_room_not_a_context_window():
+    """Review of goose I-9 (2026-10-20): this refusal's number is the largest
+    PROMPT that fits beside the request's own max_tokens reservation. Worded as
+    "the maximum context here is N tokens", a client sized its whole session's
+    window to it. The memory guard's refusal (a real window) keeps that wording."""
+    sched = _cap_sched(active=20_000_000_000, cap=22_000_000_000)
+    with pytest.raises(BackpressureError) as raised:
+        sched._enforce_metal_cap_at_admission(_request(tokens=200_000, max_tokens=4096))
+    body = raised.value.error_object
+    n_ctx = body["n_ctx"]
+    assert body["max_tokens_reserved"] == 4096
+    assert body["code"] == "context_length_exceeded"
+    assert body["lz_reason"] == "metal_cap_exceeds_device"
+    assert "maximum context" not in body["message"]
+    assert body["message"].startswith(
+        "This prompt (200000 tokens) plus this request's max_tokens reservation of "
+        "4096 tokens needs "
+    )
+    assert body["message"].endswith(
+        f"; the largest prompt that fits beside that reservation is {n_ctx} tokens."
+    )
+
+    from rapid_mlx.errors import ContextExceedsDeviceMemoryError
+
+    guard = ContextExceedsDeviceMemoryError(
+        prompt_tokens=82_684,
+        needed_bytes=131_800_000_000,
+        available_bytes=75_100_000_000,
+        max_context=35_328,
+    )
+    assert guard.message.endswith("the maximum context here is 35328 tokens.")
+    assert "max_tokens_reserved" not in guard.error_object()

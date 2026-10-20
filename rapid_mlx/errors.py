@@ -71,11 +71,20 @@ class ContextExceedsDeviceMemoryError(Exception):
         needed_bytes: int,
         available_bytes: int,
         max_context: int,
+        max_tokens_reserved: int | None = None,
     ) -> None:
         self.prompt_tokens = int(prompt_tokens)
         self.needed_bytes = int(needed_bytes)
         self.available_bytes = int(available_bytes)
         self.max_context = max(0, int(max_context))
+        # Set by the D-METAL-CAP admission refusal: ``max_context`` is then the
+        # largest PROMPT that fits beside this request's own ``max_tokens``
+        # reservation, not the device's context window, and the message says
+        # so. A client that read "the maximum context here is N tokens" from it
+        # sized its whole session to N (goose I-9 review: ~6k on Gemma numbers).
+        self.max_tokens_reserved = (
+            None if max_tokens_reserved is None else max(0, int(max_tokens_reserved))
+        )
         super().__init__(self.message)
 
     @property
@@ -90,6 +99,14 @@ class ContextExceedsDeviceMemoryError(Exception):
         short = ""
         if digits > 1:
             short = f" ({max(0, self.needed_bytes - self.available_bytes) / 1e6:.0f} MB short)"
+        if self.max_tokens_reserved is not None:
+            return (
+                f"This prompt ({self.prompt_tokens} tokens) plus this request's "
+                f"max_tokens reservation of {self.max_tokens_reserved} tokens needs "
+                f"{need:.{digits}f} GB but this Mac can hold "
+                f"{have:.{digits}f} GB{short}; the largest prompt that fits beside "
+                f"that reservation is {self.max_context} tokens."
+            )
         return (
             f"This prompt ({self.prompt_tokens} tokens) needs "
             f"{need:.{digits}f} GB but this Mac can hold "
@@ -98,7 +115,7 @@ class ContextExceedsDeviceMemoryError(Exception):
         )
 
     def error_object(self) -> dict:
-        return {
+        body = {
             "message": self.message,
             "type": "invalid_request_error",
             "code": "context_length_exceeded",
@@ -106,3 +123,6 @@ class ContextExceedsDeviceMemoryError(Exception):
             "n_ctx": self.max_context,
             "lz_reason": DEVICE_MEMORY_ERROR_KIND,
         }
+        if self.max_tokens_reserved is not None:
+            body["max_tokens_reserved"] = self.max_tokens_reserved
+        return body

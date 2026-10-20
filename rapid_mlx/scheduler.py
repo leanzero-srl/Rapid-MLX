@@ -11811,6 +11811,7 @@ class Scheduler:
                 needed_bytes=base + projected_kv,
                 available_bytes=cap,
                 max_context=lo,
+                max_tokens_reserved=max_tokens,
             )
             body = refusal.error_object()
             body["lz_reason"] = "metal_cap_exceeds_device"
