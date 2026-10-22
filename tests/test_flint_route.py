@@ -254,3 +254,43 @@ def test_plain_chat_without_tools(stream):
     assert out["content"].strip() == "Hello!" and out["reasoning"].strip() == "short", (
         out
     )
+
+
+LONG_THOUGHT = "".join(
+    f"Step {i}: check the next constraint carefully. " for i in range(1200)
+)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_medium_effort_does_not_cut_the_thought_into_content(stream):
+    """Flint has no effort control. Before ``graded_effort_cap = False`` a
+    graded ``reasoning_effort`` became a 2,048-token post-hoc cap on tool
+    requests, and the rest of the thought arrived as visible content (live
+    smoke on RecursiveSI/flint-int4, 2026-10-22: 8,192 reasoning chars, then
+    "heck for a valid number. Hmm, ..." as the answer)."""
+    text = f"<think>\n{LONG_THOUGHT}\n</think>" + WRITE
+    out = (
+        _streamed(text, 50, effort="medium", tools=True)
+        if stream
+        else _whole(text, effort="medium", tools=True)
+    )
+    assert out["reasoning"].strip() == LONG_THOUGHT.strip()
+    assert out["content"].strip() == ""
+    assert [c["name"] for c in out["calls"]] == ["write"]
+
+
+def test_effort_is_still_a_cap_for_parsers_that_take_one():
+    from types import SimpleNamespace
+
+    from rapid_mlx.service.helpers import maybe_apply_reasoning_effort
+
+    for parser, want in ((get_parser("flint")(), None), (get_parser("qwen3")(), 2048)):
+        req = SimpleNamespace(
+            reasoning_effort="medium",
+            reasoning_max_tokens=None,
+            chat_template_kwargs=None,
+            tools=None,
+            enable_thinking=None,
+        )
+        maybe_apply_reasoning_effort(req, chat_template=None, reasoning_parser=parser)
+        assert req.reasoning_max_tokens == want

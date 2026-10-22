@@ -127,6 +127,14 @@ MATRIX_EXEMPT: dict[str, str] = {
     ),
     "xing4_0": "alias of xing4",
     "xing": "alias of xing4",
+    "flint": (
+        "TODO: add RecursiveSI/flint-int4 (22.6 GB) to golden_models when the "
+        "matrix has a 32 GB+ slot; parser unit, hostile-value fidelity, "
+        "route-level SSE and streaming-parity coverage live in "
+        "tests/test_flint_parsers.py, tests/test_flint_route.py, "
+        "tests/test_tool_call_value_fidelity.py and "
+        "tests/test_tool_call_streaming_parity.py"
+    ),
     "k2_horizon": (
         "TODO: add K2 Horizon to golden_models when a correctness-grade "
         "8-bit checkpoint is available; the current public 4-bit checkpoint "

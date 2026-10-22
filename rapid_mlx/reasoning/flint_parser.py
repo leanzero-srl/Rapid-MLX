@@ -31,6 +31,11 @@ from .deepseek_r1_parser import DeepSeekR1ReasoningParser
 class FlintReasoningParser(DeepSeekR1ReasoningParser):
     """``<think>...</think>`` only where Flint writes it."""
 
+    # No effort control exists (no switch, no budget in the template; the card
+    # budgets with ``max_tokens``), so a graded ``reasoning_effort`` is not
+    # turned into a reasoning-token cap (``maybe_apply_reasoning_effort``).
+    graded_effort_cap = False
+
     # Untagged output never starts inside reasoning, whatever the request
     # asked for: no rendered-priming probe is needed to say so.
     prompt_priming_rendered = False

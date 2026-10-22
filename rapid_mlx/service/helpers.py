@@ -2345,7 +2345,9 @@ def served_chat_template(engine):
     return getattr(tokenizer, "chat_template", None)
 
 
-def maybe_apply_reasoning_effort(request, *, chat_template=None) -> bool:
+def maybe_apply_reasoning_effort(
+    request, *, chat_template=None, reasoning_parser=None
+) -> bool:
     """Translate the OpenAI ``reasoning_effort`` knob into rapid-mlx's
     native reasoning controls at the route layer (issue #448, #3043).
 
@@ -2454,6 +2456,16 @@ def maybe_apply_reasoning_effort(request, *, chat_template=None) -> bool:
             merged_ctk["reasoning_effort"] = native
             request.chat_template_kwargs = merged_ctk
             return True
+
+    # A model with NO effort control at all (``graded_effort_cap = False`` on
+    # its reasoning parser: Recursive Flint decides per turn whether and how
+    # long to reason, its template has no switch and its card says to budget
+    # with ``max_tokens``) gets no graded cap: on a tool request the cap is
+    # post-hoc, and Flint's medium-effort agent turns then shipped the thought
+    # past 2,048 tokens as visible CONTENT (live smoke, 2026-10-22). An
+    # explicit ``reasoning_max_tokens`` from the client still applies.
+    if getattr(reasoning_parser, "graded_effort_cap", True) is False:
+        return False
 
     # Graded effort (minimal/low/medium/high/xhigh) → ``reasoning_max_tokens``
     # tier (a subtractive cap on how long the model may think), unless the

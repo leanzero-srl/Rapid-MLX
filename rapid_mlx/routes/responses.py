@@ -1274,7 +1274,9 @@ async def create_response(request: Request):
         # no-ops on it) and a graded value lands its reasoning_max_tokens
         # cap from one source. Explicit client knobs always win.
         if maybe_apply_reasoning_effort(
-            openai_request, chat_template=served_chat_template(engine)
+            openai_request,
+            chat_template=served_chat_template(engine),
+            reasoning_parser=get_config().reasoning_parser,
         ):
             logger.info(
                 "#448/#3043 reasoning_effort=%s translated on /v1/responses "

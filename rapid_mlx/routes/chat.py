@@ -4656,7 +4656,9 @@ async def _create_chat_completion_impl(
     # preference first (the tool auto-disable then no-ops on it) and a
     # graded value lands its ``reasoning_max_tokens`` cap from one source.
     if maybe_apply_reasoning_effort(
-        request, chat_template=served_chat_template(engine)
+        request,
+        chat_template=served_chat_template(engine),
+        reasoning_parser=get_config().reasoning_parser,
     ):
         logger.info(
             "#448/#3043 reasoning_effort=%s translated on /v1/chat/completions "
