@@ -37,6 +37,10 @@ class FlintToolParser(Xing4ToolParser):
     _PARSER_LABEL = "flint"
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("flint_arg_tool_call",)
+    # The route's default tool-use system suffix ("Do NOT think out loud ...")
+    # fights Flint's protocol: with it, Flint wrote write calls with no
+    # content argument. See ``routes.chat._auto_tool_use_suffix``.
+    AUTO_TOOL_USE_SUFFIX = False
     _CALL_HEADER = re.compile(r"<tool_call>\s*([^\n<]+?)\s*(?:<arg_key>|</tool_call>)")
 
     def extract_tool_calls(self, model_output, request=None):

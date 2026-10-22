@@ -3720,6 +3720,31 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _release_primary_request_unless_committed(engine, _commit_state[0])
 
 
+def _auto_tool_use_suffix(tool_call_parser: str | None) -> str | None:
+    """The default (``tool_choice`` auto) tool-use system suffix, or ``None``
+    when the configured tool parser's model must not get it.
+
+    The suffix tells the model "Do NOT think out loud or show your reasoning
+    process" and "Do NOT explain what you will do". A parser sets
+    ``AUTO_TOOL_USE_SUFFIX = False`` when its model was trained on a protocol
+    that the suffix contradicts: Recursive Flint reasons in ``<think>`` on the
+    turns it chooses, and with the suffix as its system message it wrote
+    ``write`` calls with no ``content`` argument (RecursiveSI/flint-int4,
+    2026-10-22, the route's exact 361-token prompt: 5 of 21 samples; without
+    the suffix 0 of 16). ``required`` / named choices keep their stricter
+    suffixes: those are contracts about what must be called.
+    """
+    from ..tool_parsers import ToolParserManager
+
+    try:
+        parser_cls = ToolParserManager.get_tool_parser(tool_call_parser)
+    except Exception:
+        parser_cls = None
+    if getattr(parser_cls, "AUTO_TOOL_USE_SUFFIX", True) is False:
+        return None
+    return _TOOL_USE_SYSTEM_SUFFIX
+
+
 def _effective_posthoc_reasoning_cap(sampling_kwargs: dict, request) -> int | None:
     """Return the post-hoc reasoning-token cap for the postprocessor, or
     ``None`` when the generation-time thinking-budget processor owns this
@@ -4586,9 +4611,9 @@ async def _create_chat_completion_impl(
             if _named:
                 _inject_suffix = _tool_use_required_named_suffix(_named)
             else:
-                _inject_suffix = _TOOL_USE_SYSTEM_SUFFIX
+                _inject_suffix = _auto_tool_use_suffix(cfg.tool_call_parser)
         else:
-            _inject_suffix = _TOOL_USE_SYSTEM_SUFFIX
+            _inject_suffix = _auto_tool_use_suffix(cfg.tool_call_parser)
     elif cfg.reasoning_parser_name == "minimax":
         _inject_suffix = (
             "\n\nDo NOT think out loud or show your reasoning process. "

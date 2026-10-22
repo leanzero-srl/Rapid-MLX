@@ -71,6 +71,9 @@ def _deltas(text: str, size: int) -> list[str]:
     return out
 
 
+_SEEN: list = []
+
+
 class _Tok:
     chat_template = TEMPLATE
 
@@ -89,6 +92,7 @@ class _Engine:
         return "PROMPT"
 
     async def stream_chat(self, messages, **kwargs):
+        _SEEN.append(messages)
         text = ""
         for i, delta in enumerate(self._deltas):
             text += delta
@@ -104,6 +108,7 @@ class _Engine:
             )
 
     async def chat(self, messages, **kwargs):
+        _SEEN.append(messages)
         return GenerationOutput(
             text=self._text,
             new_text=self._text,
@@ -294,3 +299,28 @@ def test_effort_is_still_a_cap_for_parsers_that_take_one():
         )
         maybe_apply_reasoning_effort(req, chat_template=None, reasoning_parser=parser)
         assert req.reasoning_max_tokens == want
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_no_tool_use_suffix_reaches_flint(stream):
+    """The route's default tool-use suffix ("Do NOT think out loud ...") made
+    Flint write ``write`` calls with no ``content`` (5 of 21 live samples)."""
+    from rapid_mlx.service.helpers import _TOOL_USE_SYSTEM_SUFFIX
+
+    _SEEN.clear()
+    if stream:
+        _streamed("ok", 5, effort=None, tools=True)
+    else:
+        _whole("ok", effort=None, tools=True)
+    flat = json.dumps(_SEEN[-1], default=str)
+    assert "think out loud" not in flat
+    assert _TOOL_USE_SYSTEM_SUFFIX.strip()[:40] not in flat
+
+
+def test_other_parsers_keep_the_suffix():
+    from rapid_mlx.routes.chat import _auto_tool_use_suffix
+    from rapid_mlx.service.helpers import _TOOL_USE_SYSTEM_SUFFIX
+
+    assert _auto_tool_use_suffix("flint") is None
+    for name in ("qwen3_coder_xml", "xing4", "glm47", "hermes", None, "no-such"):
+        assert _auto_tool_use_suffix(name) == _TOOL_USE_SYSTEM_SUFFIX
