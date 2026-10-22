@@ -25,7 +25,9 @@ from rapid_mlx.engine.base import GenerationOutput
 from rapid_mlx.reasoning import get_parser
 from rapid_mlx.routes.chat import router as chat_router
 
-TEMPLATE = (Path(__file__).parent / "fixtures" / "flint" / "chat_template.jinja").read_text()
+TEMPLATE = (
+    Path(__file__).parent / "fixtures" / "flint" / "chat_template.jinja"
+).read_text()
 
 TOOLS = [
     {
@@ -198,7 +200,12 @@ CASES = {
         "Write it, then test.",
         ["write", "shell"],
     ),
-    "narration then a call": ("Writing the file now.\n" + WRITE, "Writing the file now.", "", ["write"]),
+    "narration then a call": (
+        "Writing the file now.\n" + WRITE,
+        "Writing the file now.",
+        "",
+        ["write"],
+    ),
 }
 
 
@@ -230,11 +237,20 @@ def test_whole_turns(case, effort):
     assert out["reasoning"].strip() == reasoning, out
     assert [c["name"] for c in out["calls"]] == calls, out
     if calls:
-        assert json.loads(out["calls"][0]["arguments"]) == {"path": "src/x.ts", "content": FILE}
+        assert json.loads(out["calls"][0]["arguments"]) == {
+            "path": "src/x.ts",
+            "content": FILE,
+        }
 
 
 @pytest.mark.parametrize("stream", [True, False])
 def test_plain_chat_without_tools(stream):
     text = "<think>\nshort\n</think>Hello!"
-    out = _streamed(text, 3, effort=None, tools=False) if stream else _whole(text, effort=None, tools=False)
-    assert out["content"].strip() == "Hello!" and out["reasoning"].strip() == "short", out
+    out = (
+        _streamed(text, 3, effort=None, tools=False)
+        if stream
+        else _whole(text, effort=None, tools=False)
+    )
+    assert out["content"].strip() == "Hello!" and out["reasoning"].strip() == "short", (
+        out
+    )

@@ -41,7 +41,7 @@ Differences from the PR, each matching the checkpoint's reference:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -76,13 +76,13 @@ class ModelArgs(BaseModelArgs):
     shared_expert_intermediate_size: int
     vocab_size: int
     rms_norm_eps: float = 1e-6
-    mlp_only_layers: Optional[List[int]] = None
-    layer_types: Optional[List[str]] = None
-    no_rope_layer_indices: Optional[List[int]] = None
-    sliding_window: Optional[int] = 513
+    mlp_only_layers: list[int] | None = None
+    layer_types: list[str] | None = None
+    no_rope_layer_indices: list[int] | None = None
+    sliding_window: int | None = 513
     use_sliding_window: bool = True
     rope_theta: float = 10000.0
-    rope_parameters: Optional[Dict[str, Any]] = None
+    rope_parameters: dict[str, Any] | None = None
     norm_topk_prob: bool = True
     router_score_function: str = "sigmoid"
     softmax_type: str = "learnable"
@@ -144,8 +144,8 @@ class Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -246,8 +246,8 @@ class DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
     ) -> mx.array:
         h = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return h + self.mlp(self.post_attention_layernorm(h))
@@ -261,14 +261,16 @@ class FlintModel(nn.Module):
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         types = args.layer_types
-        self.fa_idx = types.index("full_attention") if "full_attention" in types else None
+        self.fa_idx = (
+            types.index("full_attention") if "full_attention" in types else None
+        )
         self.swa_idx = types.index(_SLIDING) if _SLIDING in types else None
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
+        input_embeddings: mx.array | None = None,
     ) -> mx.array:
         if input_embeddings is not None:
             h = input_embeddings
@@ -306,7 +308,7 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        input_embeddings: Optional[mx.array] = None,
+        input_embeddings: mx.array | None = None,
     ) -> mx.array:
         out = self.model(inputs, cache, input_embeddings)
         # The reference serves with an fp32 output projection.
@@ -332,10 +334,10 @@ class Model(nn.Module):
                 and v.shape[-1] % 4 == 0
             ):
                 weights[k] = v.view(mx.uint32)
-        for l in range(self.args.num_hidden_layers):
-            if l in self.args.mlp_only_layers:
+        for layer_idx in range(self.args.num_hidden_layers):
+            if layer_idx in self.args.mlp_only_layers:
                 continue
-            prefix = f"model.layers.{l}.mlp"
+            prefix = f"model.layers.{layer_idx}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 for suffix in ("weight", "scales", "biases"):
                     if f"{prefix}.experts.0.{n}.{suffix}" in weights:
@@ -347,7 +349,10 @@ class Model(nn.Module):
             for alias in ("gate.e_score_correction_bias", "gate.expert_bias"):
                 if f"{prefix}.{alias}" in weights:
                     weights[f"{prefix}.expert_bias"] = weights.pop(f"{prefix}.{alias}")
-            if f"{prefix}.gate.weight" in weights and f"{prefix}.expert_bias" not in weights:
+            if (
+                f"{prefix}.gate.weight" in weights
+                and f"{prefix}.expert_bias" not in weights
+            ):
                 weights[f"{prefix}.expert_bias"] = mx.zeros((self.args.num_experts,))
         return weights
 

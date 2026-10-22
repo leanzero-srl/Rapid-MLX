@@ -82,7 +82,10 @@ def test_the_template_renders_the_wire_the_parser_reads():
     )
     r = _parse(text)
     assert r.tools_called and r.content is None
-    assert json.loads(r.tool_calls[0]["arguments"]) == {"command": "ls -la", "timeout": 30}
+    assert json.loads(r.tool_calls[0]["arguments"]) == {
+        "command": "ls -la",
+        "timeout": 30,
+    }
 
 
 @pytest.mark.parametrize(
@@ -108,7 +111,10 @@ def test_string_values_round_trip_byte_identical(content):
 
 
 def test_typed_values_round_trip():
-    args = {"path": "a.py", "edits": [{"old": "a", "new": "b\n"}, {"old": "c", "new": ""}]}
+    args = {
+        "path": "a.py",
+        "edits": [{"old": "a", "new": "b\n"}, {"old": "c", "new": ""}],
+    }
     r = _parse(_render_calls(("edit", args)))
     assert json.loads(r.tool_calls[0]["arguments"]) == args
 
@@ -127,19 +133,27 @@ def test_narration_then_a_call():
 
 
 def test_no_arguments_prose_and_unclosed():
-    assert json.loads(_parse("<tool_call>tree</tool_call>").tool_calls[0]["arguments"]) == {}
+    assert (
+        json.loads(_parse("<tool_call>tree</tool_call>").tool_calls[0]["arguments"])
+        == {}
+    )
     r = _parse("Nothing to call here.")
     assert not r.tools_called and r.content == "Nothing to call here."
-    assert not _parse("<tool_call>write<arg_key>path</arg_key><arg_value>a.py").tools_called
+    assert not _parse(
+        "<tool_call>write<arg_key>path</arg_key><arg_value>a.py"
+    ).tools_called
 
 
 def test_the_glm47_parser_would_corrupt_these_values():
     """Why Flint does not alias glm47: it strips and json-decodes values."""
     glm = ToolParserManager.get_tool_parser("glm47")(None)
     text = _render_calls(("write", {"path": "a", "content": "42\n"}))
-    assert json.loads(glm.extract_tool_calls(text, REQUEST).tool_calls[0]["arguments"])[
-        "content"
-    ] == 42
+    assert (
+        json.loads(glm.extract_tool_calls(text, REQUEST).tool_calls[0]["arguments"])[
+            "content"
+        ]
+        == 42
+    )
     assert json.loads(_parse(text).tool_calls[0]["arguments"])["content"] == "42\n"
 
 
@@ -200,7 +214,9 @@ def test_xing_still_reads_its_own_wire():
     )
     assert r.tools_called and json.loads(r.tool_calls[0]["arguments"]) == {"path": "."}
     # ...and not Flint's.
-    assert not xing.extract_tool_calls(_render_calls(("tree", {"path": "."})), REQUEST).tools_called
+    assert not xing.extract_tool_calls(
+        _render_calls(("tree", {"path": "."})), REQUEST
+    ).tools_called
 
 
 # ---------------------------------------------------------------- reasoning
@@ -223,7 +239,9 @@ def test_untagged_output_is_content(enable_thinking):
 
 def test_a_tagged_turn_splits():
     p = _rparser()
-    reasoning, content = p.extract_reasoning("<think>\n2+2 is 4\n</think>The answer is 4.")
+    reasoning, content = p.extract_reasoning(
+        "<think>\n2+2 is 4\n</think>The answer is 4."
+    )
     assert reasoning == "2+2 is 4" and content == "The answer is 4."
 
 
@@ -263,7 +281,9 @@ def test_streaming_think_then_answer():
 
 def test_streaming_think_then_tool_call_reaches_content():
     call = _render_calls(("tree", {"path": "."}))
-    reasoning, content, _ = _rstream(_rparser(), _pieces("<think>\nlook first\n</think>" + call, 4))
+    reasoning, content, _ = _rstream(
+        _rparser(), _pieces("<think>\nlook first\n</think>" + call, 4)
+    )
     assert reasoning.strip() == "look first"
     assert content == call
 

@@ -52,7 +52,9 @@ CONFIG = {
     "shared_expert_intermediate_size": 32,
     "mlp_only_layers": [0],
     "layer_types": LAYER_TYPES,
-    "no_rope_layer_indices": [i for i, t in enumerate(LAYER_TYPES) if t == "full_attention"],
+    "no_rope_layer_indices": [
+        i for i, t in enumerate(LAYER_TYPES) if t == "full_attention"
+    ],
     "sliding_window": 5,
     "use_sliding_window": True,
     "rms_norm_eps": 1e-6,
@@ -69,7 +71,11 @@ CONFIG = {
 def _hf_state(cfg, seed=0, expert_bias=False):
     rng = np.random.default_rng(seed)
     H, V = cfg["hidden_size"], cfg["vocab_size"]
-    nh, nkv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
+    nh, nkv, hd = (
+        cfg["num_attention_heads"],
+        cfg["num_key_value_heads"],
+        cfg["head_dim"],
+    )
     E = cfg["num_experts"]
 
     def w(*shape, scale=0.2):
@@ -94,22 +100,26 @@ def _hf_state(cfg, seed=0, expert_bias=False):
         s[f"{p}.self_attn.q_norm.weight"] = norm(hd)
         s[f"{p}.self_attn.k_norm.weight"] = norm(hd)
         # Large sinks so a sink error cannot hide under the tolerance.
-        s[f"{p}.self_attn.softmax_offset"] = (rng.standard_normal(nh) * 2.0).astype(np.float32)
+        s[f"{p}.self_attn.softmax_offset"] = (rng.standard_normal(nh) * 2.0).astype(
+            np.float32
+        )
         if i in cfg["mlp_only_layers"]:
-            I = cfg["intermediate_size"]
-            s[f"{p}.mlp.gate_proj.weight"] = w(I, H)
-            s[f"{p}.mlp.up_proj.weight"] = w(I, H)
-            s[f"{p}.mlp.down_proj.weight"] = w(H, I)
+            inter = cfg["intermediate_size"]
+            s[f"{p}.mlp.gate_proj.weight"] = w(inter, H)
+            s[f"{p}.mlp.up_proj.weight"] = w(inter, H)
+            s[f"{p}.mlp.down_proj.weight"] = w(H, inter)
         else:
-            I = cfg["moe_intermediate_size"]
+            inter = cfg["moe_intermediate_size"]
             S = cfg["shared_expert_intermediate_size"]
             s[f"{p}.mlp.gate.weight"] = w(E, H, scale=0.5)
             if expert_bias:
-                s[f"{p}.mlp.gate.expert_bias"] = (rng.standard_normal(E) * 0.3).astype(np.float32)
+                s[f"{p}.mlp.gate.expert_bias"] = (rng.standard_normal(E) * 0.3).astype(
+                    np.float32
+                )
             for e in range(E):
-                s[f"{p}.mlp.experts.{e}.gate_proj.weight"] = w(I, H)
-                s[f"{p}.mlp.experts.{e}.up_proj.weight"] = w(I, H)
-                s[f"{p}.mlp.experts.{e}.down_proj.weight"] = w(H, I)
+                s[f"{p}.mlp.experts.{e}.gate_proj.weight"] = w(inter, H)
+                s[f"{p}.mlp.experts.{e}.up_proj.weight"] = w(inter, H)
+                s[f"{p}.mlp.experts.{e}.down_proj.weight"] = w(H, inter)
             s[f"{p}.mlp.shared_expert.gate_proj.weight"] = w(S, H)
             s[f"{p}.mlp.shared_expert.up_proj.weight"] = w(S, H)
             s[f"{p}.mlp.shared_expert.down_proj.weight"] = w(H, S)
@@ -140,16 +150,32 @@ def _rope(x, pos, theta):
 def reference_logits(state, cfg, tokens):
     st = {k: v.astype(np.float64) for k, v in state.items()}
     eps = cfg["rms_norm_eps"]
-    nh, nkv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
+    nh, nkv, hd = (
+        cfg["num_attention_heads"],
+        cfg["num_key_value_heads"],
+        cfg["head_dim"],
+    )
     T = len(tokens)
     pos = np.arange(T, dtype=np.float64)
     x = st["model.embed_tokens.weight"][np.array(tokens)]
     for i, kind in enumerate(cfg["layer_types"]):
         p = f"model.layers.{i}"
         h = _rms(x, st[f"{p}.input_layernorm.weight"], eps)
-        q = (h @ st[f"{p}.self_attn.q_proj.weight"].T).reshape(T, nh, hd).transpose(1, 0, 2)
-        k = (h @ st[f"{p}.self_attn.k_proj.weight"].T).reshape(T, nkv, hd).transpose(1, 0, 2)
-        v = (h @ st[f"{p}.self_attn.v_proj.weight"].T).reshape(T, nkv, hd).transpose(1, 0, 2)
+        q = (
+            (h @ st[f"{p}.self_attn.q_proj.weight"].T)
+            .reshape(T, nh, hd)
+            .transpose(1, 0, 2)
+        )
+        k = (
+            (h @ st[f"{p}.self_attn.k_proj.weight"].T)
+            .reshape(T, nkv, hd)
+            .transpose(1, 0, 2)
+        )
+        v = (
+            (h @ st[f"{p}.self_attn.v_proj.weight"].T)
+            .reshape(T, nkv, hd)
+            .transpose(1, 0, 2)
+        )
         q = _rms(q, st[f"{p}.self_attn.q_norm.weight"], eps)
         k = _rms(k, st[f"{p}.self_attn.k_norm.weight"], eps)
         if i not in cfg["no_rope_layer_indices"]:
@@ -160,18 +186,26 @@ def reference_logits(state, cfg, tokens):
         for head in range(nh):
             kv = head // (nh // nkv)
             for t in range(T):
-                lo = 0 if kind == "full_attention" else max(0, t - cfg["sliding_window"] + 1)
+                lo = (
+                    0
+                    if kind == "full_attention"
+                    else max(0, t - cfg["sliding_window"] + 1)
+                )
                 sc = q[head, t] @ k[kv, lo : t + 1].T * hd**-0.5
                 m = max(sc.max(), sink[head])
                 e = np.exp(sc - m)
                 den = e.sum() + np.exp(sink[head] - m)
                 out[head, t] = (e / den) @ v[kv, lo : t + 1]
-        attn = out.transpose(1, 0, 2).reshape(T, nh * hd) @ st[f"{p}.self_attn.o_proj.weight"].T
+        attn = (
+            out.transpose(1, 0, 2).reshape(T, nh * hd)
+            @ st[f"{p}.self_attn.o_proj.weight"].T
+        )
         x = x + attn
         h = _rms(x, st[f"{p}.post_attention_layernorm.weight"], eps)
         if i in cfg["mlp_only_layers"]:
             y = (
-                _silu(h @ st[f"{p}.mlp.gate_proj.weight"].T) * (h @ st[f"{p}.mlp.up_proj.weight"].T)
+                _silu(h @ st[f"{p}.mlp.gate_proj.weight"].T)
+                * (h @ st[f"{p}.mlp.up_proj.weight"].T)
             ) @ st[f"{p}.mlp.down_proj.weight"].T
         else:
             scores = 1.0 / (1.0 + np.exp(-(h @ st[f"{p}.mlp.gate.weight"].T)))
@@ -191,7 +225,8 @@ def reference_logits(state, cfg, tokens):
                     )
             sp = f"{p}.mlp.shared_expert"
             y += (
-                _silu(h @ st[f"{sp}.gate_proj.weight"].T) * (h @ st[f"{sp}.up_proj.weight"].T)
+                _silu(h @ st[f"{sp}.gate_proj.weight"].T)
+                * (h @ st[f"{sp}.up_proj.weight"].T)
             ) @ st[f"{sp}.down_proj.weight"].T
         x = x + y
     x = _rms(x, st["model.norm.weight"], eps)
@@ -209,7 +244,9 @@ def _model(state, cfg=CONFIG):
     return model
 
 
-TOKENS = [int(t) for t in np.random.default_rng(7).integers(0, CONFIG["vocab_size"], 40)]
+TOKENS = [
+    int(t) for t in np.random.default_rng(7).integers(0, CONFIG["vocab_size"], 40)
+]
 
 
 @pytest.mark.parametrize("expert_bias", [False, True])
@@ -229,9 +266,14 @@ def test_the_reference_is_sensitive_to_each_rule():
     state = _hf_state(CONFIG, seed=1)
     base = reference_logits(state, CONFIG, TOKENS)
     variants = {
-        "no sinks": dict(state, **{
-            k: np.full_like(v, -1e9) for k, v in state.items() if k.endswith("softmax_offset")
-        }),
+        "no sinks": dict(
+            state,
+            **{
+                k: np.full_like(v, -1e9)
+                for k, v in state.items()
+                if k.endswith("softmax_offset")
+            },
+        ),
     }
     for name, st in variants.items():
         assert np.abs(reference_logits(st, CONFIG, TOKENS) - base).max() > 1e-3, name
@@ -281,7 +323,10 @@ def test_cache_layout_and_kv_attributes():
 
     for kind, c, layer in zip(LAYER_TYPES, caches, model.layers):
         if kind == "sliding_attention":
-            assert isinstance(c, RotatingKVCache) and c.max_size == CONFIG["sliding_window"]
+            assert (
+                isinstance(c, RotatingKVCache)
+                and c.max_size == CONFIG["sliding_window"]
+            )
             assert layer.self_attn.is_sliding is True
         else:
             assert type(c) is KVCache
@@ -333,7 +378,10 @@ def test_recursive_int4_layout_loads(tmp_path):
     engine's override and matches the same quantized model built in memory."""
     from mlx_lm.utils import load_model
 
-    from rapid_mlx.utils.tokenizer import _flint_quantization_override, _register_vendored_archs
+    from rapid_mlx.utils.tokenizer import (
+        _flint_quantization_override,
+        _register_vendored_archs,
+    )
 
     _register_vendored_archs()
     qcfg = dict(CONFIG, moe_intermediate_size=32)  # every input dim % 32 == 0
@@ -360,7 +408,10 @@ def test_recursive_int4_layout_loads(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(cfg))
 
     overlay = _flint_quantization_override(tmp_path)
-    assert overlay["quantization"]["model.embed_tokens"] == {"group_size": 32, "bits": 8}
+    assert overlay["quantization"]["model.embed_tokens"] == {
+        "group_size": 32,
+        "bits": 8,
+    }
     assert "lm_head" not in overlay["quantization"]  # 4-bit = the default
 
     loaded, _ = load_model(tmp_path, model_config=overlay)
@@ -373,15 +424,27 @@ def test_override_leaves_other_models_alone(tmp_path):
     from rapid_mlx.utils.tokenizer import _flint_quantization_override
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "qwen3", "quantization": {"bits": 4, "group_size": 64}})
+        json.dumps(
+            {"model_type": "qwen3", "quantization": {"bits": 4, "group_size": 64}}
+        )
     )
     header = json.dumps(
         {
-            "model.embed_tokens.weight": {"dtype": "U8", "shape": [10, 64], "data_offsets": [0, 640]},
-            "model.embed_tokens.scales": {"dtype": "BF16", "shape": [10, 1], "data_offsets": [640, 660]},
+            "model.embed_tokens.weight": {
+                "dtype": "U8",
+                "shape": [10, 64],
+                "data_offsets": [0, 640],
+            },
+            "model.embed_tokens.scales": {
+                "dtype": "BF16",
+                "shape": [10, 1],
+                "data_offsets": [640, 660],
+            },
         }
     ).encode()
-    (tmp_path / "m.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + b"\0" * 660)
+    (tmp_path / "m.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\0" * 660
+    )
     assert _flint_quantization_override(tmp_path) is None
 
 
