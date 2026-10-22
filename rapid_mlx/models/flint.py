@@ -81,6 +81,10 @@ class ModelArgs(BaseModelArgs):
     no_rope_layer_indices: list[int] | None = None
     sliding_window: int | None = 513
     use_sliding_window: bool = True
+    # Read by the engine's context window (``get_model_max_context``) and the
+    # memory guard's native bound (``_memguard_native_context``). Without it
+    # a 128 GB Mac advertised a 768,512-token window for a 262,144-token model.
+    max_position_embeddings: int = 262144
     rope_theta: float = 10000.0
     rope_parameters: dict[str, Any] | None = None
     norm_topk_prob: bool = True

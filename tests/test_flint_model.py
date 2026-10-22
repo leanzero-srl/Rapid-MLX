@@ -461,3 +461,20 @@ def test_registered_as_the_mlx_lm_flint_module():
     assert sys.modules["mlx_lm.models.flint"] is flint
     assert "flint" in _VENDORED_MODEL_TYPES
     assert "flint" in _RAPID_OWNED_RUNTIME_MODEL_TYPES
+
+
+def test_the_trained_context_bounds_the_served_window():
+    """Without ``max_position_embeddings`` in ModelArgs the engine knew no
+    native window: /v1/models said context_window null and the guard
+    published 768,512 on a 128 GB Mac (live, 2026-10-22)."""
+    from types import SimpleNamespace
+
+    from rapid_mlx.service.helpers import get_model_max_context
+
+    real = json.loads(
+        (Path(__file__).parent / "fixtures" / "flint" / "config.json").read_text()
+    )
+    args = flint.ModelArgs.from_dict(real)
+    assert args.max_position_embeddings == 262144
+    model = SimpleNamespace(args=args)
+    assert get_model_max_context(SimpleNamespace(_model=model, model=model)) == 262144
