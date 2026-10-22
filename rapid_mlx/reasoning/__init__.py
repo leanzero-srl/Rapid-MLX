@@ -87,6 +87,7 @@ def _register_builtin_parsers():
         VibeThinkerReasoningParser,
     )
     from .deepseek_v4_parser import DeepSeekV4ReasoningParser
+    from .flint_parser import FlintReasoningParser
     from .gemma4_parser import Gemma4ReasoningParser
     from .glm4_parser import Glm4ReasoningParser
     from .glm5_parser import Glm5ReasoningParser
@@ -109,6 +110,9 @@ def _register_builtin_parsers():
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("deepseek_r1_distill", DeepSeekR1DistillReasoningParser)
     register_parser("deepseek_v4", DeepSeekV4ReasoningParser)
+    # ``flint`` — Recursive Flint: ``<think>`` only where the model writes it
+    # (no thinking switch, never primed); untagged output is content.
+    register_parser("flint", FlintReasoningParser)
     # ``vibethinker`` — DeepSeek-R1 variant with a 1024-char no-tag
     # threshold (vs. 64) to accommodate VibeThinker's preamble-before-
     # ``<think>`` shape. See ``VibeThinkerReasoningParser`` docstring

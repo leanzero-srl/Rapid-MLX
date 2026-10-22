@@ -643,7 +643,7 @@ _VENDORED_MODEL_TYPES: set[str] = {"deepseek_v4"}
 # Keep this separate from ``_VENDORED_MODEL_TYPES``: several older adapters
 # still rely on checkpoint-specific loading behavior and must not inherit the
 # stricter "weights/tokenizer only" trust boundary implicitly.
-_RAPID_OWNED_RUNTIME_MODEL_TYPES: frozenset[str] = frozenset({"k2_horizon"})
+_RAPID_OWNED_RUNTIME_MODEL_TYPES: frozenset[str] = frozenset({"k2_horizon", "flint"})
 
 
 def _register_vendored_archs() -> None:
@@ -830,6 +830,32 @@ def _register_vendored_archs() -> None:
         # Same reason as g9v3: the tokenizer must take the fallback path
         # (transformers AutoConfig cannot resolve ``xing4_0``).
         _VENDORED_MODEL_TYPES.add("xing4_0")
+
+    if sys.modules.get("mlx_lm.models.flint") is None or not getattr(
+        sys.modules.get("mlx_lm.models.flint"), "_RAPID_FLINT", False
+    ):
+        # Recursive Flint (``flint``): vendored from mlx-lm PR #1998 (see
+        # ``rapid_mlx/models/flint.py``). Unlike the archs above this does NOT
+        # defer to a future native module: Rapid owns the Flint runtime
+        # (``_RAPID_OWNED_RUNTIME_MODEL_TYPES``) because the vendored copy also
+        # reads Recursive's uint8-packed INT4 export and keeps the reference's
+        # fp32 output projection and fp32 routing. Installed over any native
+        # copy; transformers cannot resolve ``flint`` either, so the tokenizer
+        # takes the fallback path.
+        try:
+            from ..models import flint as _flint
+
+            sys.modules["mlx_lm.models.flint"] = _flint
+        except Exception as e:
+            logger.warning(
+                "flint vendored module failed to register — RecursiveSI/flint "
+                "checkpoints will not load until resolved: %s",
+                e,
+            )
+        else:
+            _VENDORED_MODEL_TYPES.add("flint")
+    else:
+        _VENDORED_MODEL_TYPES.add("flint")
 
     if "mlx_lm.models.bailing_hybrid" not in sys.modules:
         # inclusionAI Ling 3.0 family (tiny/flash) + Ling 2.6 — vendored
@@ -2172,7 +2198,7 @@ def _load_with_tokenizer_fallback(
     _register_vendored_archs()
     detected_model_config = _deepseek_v4_quantization_override(
         model_path, enable_dspark=enable_dspark
-    )
+    ) or _flint_quantization_override(model_path)
     model_config = {**(detected_model_config or {}), **(model_config or {})}
     if _uses_rapid_owned_runtime(str(model_path)):
         # A vendored architecture is an explicit trust boundary: weights and
@@ -2292,6 +2318,87 @@ def _xing4_0_sentencepiece_checkpoint(model_path: Path) -> bool:
             return json.load(f).get("model_type") == "xing4_0"
     except (OSError, ValueError):
         return False
+
+
+def _safetensors_headers(model_path: Path) -> dict[str, dict]:
+    """``{tensor name: {"dtype", "shape"}}`` from every shard's header.
+
+    Reads only the JSON headers (8-byte length + JSON), never tensor data."""
+    import struct
+
+    tensors: dict[str, dict] = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        try:
+            with open(shard, "rb") as f:
+                (length,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(length))
+        except (OSError, ValueError, struct.error):
+            continue
+        header.pop("__metadata__", None)
+        tensors.update(header)
+    return tensors
+
+
+_SAFETENSORS_ITEMSIZE = {"U8": 1, "I8": 1, "U16": 2, "U32": 4, "I32": 4}
+
+
+def _flint_quantization_override(model_path: Path) -> dict | None:
+    """Per-layer quantization entries a Flint checkpoint's config leaves out.
+
+    Recursive's MLX INT4 export (RecursiveSI/flint-int4) declares only
+    ``{"bits": 4, "group_size": 64}`` but stores ``model.embed_tokens`` at
+    8 bits, so mlx-lm built a 4-bit embedding and refused the 8-bit tensor's
+    shape. Each quantized tensor's real width follows from its header: packed
+    bits per row = last dim x itemsize x 8, values per row = scales' last dim
+    x group size. Only entries that disagree with the global default are
+    added; the config's own entries win. ``None`` for any other model type or
+    when nothing disagrees.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if config.get("model_type") != "flint":
+        return None
+    quantization = config.get("quantization")
+    if not isinstance(quantization, dict):
+        return None
+    if quantization.get("mode", "affine") != "affine":
+        return None
+    group = quantization.get("group_size")
+    default_bits = quantization.get("bits")
+    if not isinstance(group, int) or not isinstance(default_bits, int):
+        return None
+    headers = _safetensors_headers(Path(model_path))
+    added: dict[str, dict] = {}
+    for name, meta in headers.items():
+        if not name.endswith(".scales"):
+            continue
+        module = name[: -len(".scales")]
+        weight = headers.get(f"{module}.weight")
+        if weight is None or module in quantization:
+            continue
+        itemsize = _SAFETENSORS_ITEMSIZE.get(weight.get("dtype"))
+        w_shape, s_shape = weight.get("shape") or [], meta.get("shape") or []
+        if not itemsize or not w_shape or not s_shape:
+            continue
+        packed_bits = w_shape[-1] * itemsize * 8
+        values = s_shape[-1] * group
+        if values <= 0 or packed_bits % values:
+            continue
+        bits = packed_bits // values
+        if bits != default_bits and bits in (2, 3, 4, 5, 6, 8):
+            added[module] = {"group_size": group, "bits": bits}
+    if not added:
+        return None
+    logger.info(
+        "flint: %d quantized tensor(s) differ from the default %d-bit width "
+        "(e.g. %s); using the widths their shards store",
+        len(added),
+        default_bits,
+        next(iter(added)),
+    )
+    return {"quantization": {**quantization, **added}}
 
 
 def _deepseek_v4_quantization_override(

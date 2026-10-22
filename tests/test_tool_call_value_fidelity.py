@@ -135,6 +135,14 @@ def _render_xing_param(name: str, key: str, value: str) -> str:
     )
 
 
+def _render_flint_arg(name: str, key: str, value: str) -> str:
+    # Recursive Flint template: GLM-4.7's tags, string values written raw.
+    return (
+        f"<tool_call>{name}<arg_key>{key}</arg_key>"
+        f"<arg_value>{value}</arg_value></tool_call>"
+    )
+
+
 RENDERERS = {
     "json_body": _render_json_body,
     "raw_json": _render_raw_json,
@@ -143,6 +151,7 @@ RENDERERS = {
     "minicpm_native": _render_minicpm,
     "muse_atem": _render_muse_atem,
     "xing_param": _render_xing_param,
+    "flint_arg": _render_flint_arg,
 }
 
 # (parser_name, wire_format) pairs this file exercises. Parser names are the
@@ -169,6 +178,7 @@ COVERED: list[tuple[str, str]] = [
     ("xing4", "xing_param"),
     ("xing4_0", "xing_param"),
     ("xing", "xing_param"),
+    ("flint", "flint_arg"),
 ]
 
 # Formats whose escaping rules this file does not model yet. Each entry is a
@@ -281,6 +291,12 @@ _SCANNER_BLIND: dict[tuple[str, str], str] = {
         "xing4 parser from model_auto_config"
         for name in ("xing4", "xing4_0", "xing")
     },
+    (
+        "flint",
+        "flint_arg",
+    ): "parse_tool_calls does not recognise Flint's <arg_key>/<arg_value> "
+    "markup; flint checkpoints always get the flint parser from "
+    "model_auto_config",
 }
 
 _KEY = "body"

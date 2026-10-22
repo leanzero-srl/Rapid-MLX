@@ -1459,6 +1459,29 @@ def _detect_metadata_config(
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Xing4.0 enable_thinking template")
 
+    # Recursive Flint (``flint``: 256-expert sigmoid-routed MoE, sliding and
+    # full attention with learned sinks; vendored in rapid_mlx/models/flint.py).
+    # No hub alias names a local folder, so without this a mounted snapshot got
+    # no profile and its calls streamed as content. The template writes calls
+    # in GLM-4.7's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V``
+    # wire with string values RAW (``flint`` parser: byte-identical strings).
+    # It never primes ``<think>`` and has no thinking switch: the model writes
+    # ``<think>..</think>`` only on the turns it chooses to reason (``flint``
+    # reasoning parser). Sliding-window layers are rotating KV caches, not
+    # recurrent state, so not hybrid (as Gemma 4 / GPT-OSS).
+    if "flint" in model_types:
+        template = metadata.chat_template or ""
+        settings["is_moe"] = bool(config.get("num_experts"))
+        reasons.append("Flint MoE architecture")
+        if all(m in template for m in ("<tool_call>", "<arg_key>", "<arg_value>")):
+            settings["tool_call_parser"] = "flint"
+            reasons.append("Flint arg_key tool template")
+        if "<think>" in template:
+            settings["reasoning_parser"] = "flint"
+            reasons.append("Flint optional <think> template")
+        settings.setdefault("is_hybrid", False)
+        settings.setdefault("is_hybrid_explicit", True)
+
     # IBM Granite. ``granitemoehybrid`` (Granite 4.0-H) is Mamba2 + attention.
     # ``granite`` (GraniteForCausalLM: Granite 3.x and the dense 4.1/4.2) is
     # plain attention, so it is NOT hybrid whatever its name says. Granite

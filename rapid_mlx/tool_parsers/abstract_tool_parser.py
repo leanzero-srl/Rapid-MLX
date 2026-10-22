@@ -191,6 +191,9 @@ def settle_cut_call(
 #   xing_param_tool_call  — <tool_call>NAME<param_key>K</param_key>
 #                           <param_value>V</param_value></tool_call>
 #                           (XingChen-AGI Xing4.0; raw string values)
+#   flint_arg_tool_call   — <tool_call>NAME<arg_key>K</arg_key>
+#                           <arg_value>V</arg_value></tool_call>
+#                           (Recursive Flint; raw string values)
 WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
     {
         "tool_call_json",
@@ -220,6 +223,7 @@ WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
         "muse_atem",
         "k2_ifm",
         "xing_param_tool_call",
+        "flint_arg_tool_call",
     }
 )
 

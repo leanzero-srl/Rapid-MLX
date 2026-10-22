@@ -42,19 +42,44 @@ _STRING_TYPES = frozenset({"string", "str", "text", "varchar", "char", "enum"})
 
 _OPEN = "<tool_call>"
 _CLOSE = "</tool_call>"
-_KEY_OPEN = "<param_key>"
-_KEY_CLOSE = "</param_key>"
-_VAL_OPEN = "<param_value>"
-_VAL_CLOSE = "</param_value>"
-# A value's real end: its close followed by the next key or the call's close.
-_VALUE_END = re.compile(r"</param_value>\s*(?=<param_key>|</tool_call>)")
 
 
-def _scan_call(text: str, start: int) -> tuple[str, list[tuple[str, str]], int] | None:
+class _Wire:
+    """The key/value tag names of one ``<tool_call>NAME<k>..</k><v>..</v>`` wire.
+
+    Xing4.0 writes ``<param_key>``/``<param_value>``; Recursive Flint (and
+    GLM-4.7) ``<arg_key>``/``<arg_value>``. The reading rules are the same.
+    """
+
+    def __init__(self, key: str, value: str):
+        self.key_open = f"<{key}>"
+        self.key_close = f"</{key}>"
+        self.val_open = f"<{value}>"
+        self.val_close = f"</{value}>"
+        # A value's real end: its close followed by the next key or the
+        # call's close.
+        self.value_end = re.compile(
+            re.escape(self.val_close)
+            + r"\s*(?="
+            + re.escape(self.key_open)
+            + "|"
+            + re.escape(_CLOSE)
+            + ")"
+        )
+
+
+_XING_WIRE = _Wire("param_key", "param_value")
+
+
+def _scan_call(
+    text: str, start: int, wire: _Wire = _XING_WIRE
+) -> tuple[str, list[tuple[str, str]], int] | None:
     """Read one call that opens at ``start``; None when it is not complete.
 
     Returns (name, [(key, raw value)], end index after ``</tool_call>``).
     """
+    _KEY_OPEN, _KEY_CLOSE = wire.key_open, wire.key_close
+    _VAL_OPEN, _VALUE_END = wire.val_open, wire.value_end
     pos = start + len(_OPEN)
     k = text.find(_KEY_OPEN, pos)
     c = text.find(_CLOSE, pos)
@@ -96,6 +121,8 @@ def _scan_call(text: str, start: int) -> tuple[str, list[tuple[str, str]], int] 
 class Xing4ToolParser(Glm47ToolParser):
     """Tool call parser for XingChen-AGI Xing4.0 (``<param_key>`` pairs)."""
 
+    _WIRE = _XING_WIRE
+    _PARSER_LABEL = "xing4"
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("xing_param_tool_call",)
     _CALL_HEADER = re.compile(
@@ -126,7 +153,7 @@ class Xing4ToolParser(Glm47ToolParser):
             start = cleaned_text.find(_OPEN, pos)
             if start < 0:
                 break
-            found = _scan_call(cleaned_text, start)
+            found = _scan_call(cleaned_text, start, self._WIRE)
             if found is None:
                 pos = start + len(_OPEN)
                 continue
@@ -135,7 +162,7 @@ class Xing4ToolParser(Glm47ToolParser):
             if valid_names and name not in valid_names:
                 if not surface_undeclared or inside_code(cleaned_text, start):
                     continue
-                warn_undeclared_call(name, valid_names, "xing4")
+                warn_undeclared_call(name, valid_names, self._PARSER_LABEL)
             arguments = {}
             for key, raw in params:
                 if key:
