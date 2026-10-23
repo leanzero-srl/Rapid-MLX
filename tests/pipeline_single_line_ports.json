@@ -1,7 +1,7 @@
 {
   "_what": "Every single-engine commit (tags v*-lz.*) this pipeline line does not contain by ancestry, reviewed: ported (the pipeline commits that carry it), equivalent (the pipeline already did it its own way) or n/a (the code path does not exist in the pipeline server), or gap (the fix changes shared code a qwen4_exp request runs on the split and the split does not have it: reason says what is missing on which path, effect what the split does instead). Gaps are recorded, not silent: the audit test lists every one on each run. tests/test_pipeline_single_line_ports_audit.py fails on any commit missing here. goose Q-144: this line branched at v0.14.3-lz.2 and silently missed lz.6 until Q-143.",
   "upstream_base": "v0.14.3",
-  "reviewed_through": "v0.14.3-lz.13",
+  "reviewed_through": "v0.14.3-lz.14",
   "commits": {
     "999d43ea656bd2f2dfd7834bf4e3dca7e2ad5a14": {
       "tag": "v0.14.3-lz.3",
@@ -954,6 +954,48 @@
       "fixes": "errors: the D-METAL-CAP refusal names the prompt room beside max_tokens, not a context window",
       "status": "n/a",
       "reason": "scheduler.py _metal_cap_context_refusal is the single engine's admission; the split refuses from its own plan (pipeline_qwen4 plan / _Engine admission) and never builds ContextExceedsDeviceMemoryError"
+    },
+    "a3e6ef98a3e7c9870d1f8167dad85494c303b7b6": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "kv dtype: a cold request joining a batch no longer turns the session float32",
+      "status": "n/a",
+      "reason": "the guard (_mlx_compat.install_batch_kv_dtype_guard) wraps mlx-lm BatchKVCache/BatchRotatingKVCache.extend and is installed by the single engine scheduler.py, whose prefix-cache fetch also drops float32 entries; rapid_mlx/distributed/*.py never calls BatchKVCache.extend (a split row prefills alone in its own cache and joins by merge: pipeline_qwen4_serve ~1035, qwen4_exp_cache Qwen4ExpStateCache.extend = extract + merge) and builds no single-engine Scheduler"
+    },
+    "edd279eb6cb82267d86e5419dcd145b85f9e7089": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "kv dtype: install the cold-join guard on the multimodal lane too",
+      "status": "n/a",
+      "reason": "installs the same guard from mllm_scheduler.py, the single engine's multimodal lane; the split never builds it"
+    },
+    "b5094d4ca51bc2abb02a33b4d5ccf46660635370": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "flint: serve Recursive Flint (vendored mlx-lm PR #1998 model, int4 loader, flint tool + reasoning parsers, auto-config)",
+      "status": "n/a",
+      "reason": "Recursive Flint (model_type flint) support: the vendored model, its loader, the flint tool and reasoning parsers and their auto-config; the split serves qwen4_exp only, reads its parsers from the template (_template_parsers) and never loads a flint checkpoint; ToolParserManager gains a flint registration the split never selects"
+    },
+    "cf7d65168ef639001d36fbe025f777838b422b27": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "flint: lint (E741 names, ruff format on the new files)",
+      "status": "n/a",
+      "reason": "lint and formatting of the Flint files only (models/flint.py and its tests)"
+    },
+    "b7a28073012a5cff0ec61ba77575cb3902f06034": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "flint: no graded reasoning-effort cap; parity fixture + matrix exemption",
+      "status": "n/a",
+      "reason": "maybe_apply_reasoning_effort (service/helpers.py) skips the graded cap when the reasoning parser sets graded_effort_cap = False (only flint does); it is called from routes/chat.py and routes/responses.py only. The split serves /v1/chat/completions from pipeline_qwen4_serve._build_app, never calls maybe_apply_reasoning_effort and has no flint parser"
+    },
+    "a56874d8d299453e2eb04b054201575c472cd202": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "flint: no default tool-use system suffix for the flint parser",
+      "status": "n/a",
+      "reason": "routes/chat.py _auto_tool_use_suffix leaves out the tool-use system suffix for a tool parser with AUTO_TOOL_USE_SUFFIX = False (only flint); the split never runs routes/chat.py"
+    },
+    "ff88eb79cdbdb12c3b5c59f34951b79ebd251d40": {
+      "tag": "v0.14.3-lz.14",
+      "fixes": "flint: ModelArgs carries max_position_embeddings (the served window)",
+      "status": "n/a",
+      "reason": "models/flint.py ModelArgs gains max_position_embeddings; Flint only, the split serves qwen4_exp"
     }
   }
 }
