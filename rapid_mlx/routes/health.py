@@ -464,6 +464,10 @@ async def status():
         # Memory guard (LeanZero fork): ceiling, margin, peak-model
         # coefficients, action counts, refusals and backstop firings.
         "memory_guard": stats.get("memory_guard", {"enabled": False}),
+        # KV dtype guard (LeanZero fork): the model's compute dtype, cold rows
+        # that joined a batch without promoting it to float32, extends that
+        # met two dtypes (should stay 0) and promoted entries dropped.
+        "kv_dtype": stats.get("kv_dtype"),
         # Text-only image notice (LeanZero fork): how many image parts a
         # text-only engine swapped for a text notice instead of a 400.
         "text_only_images_replaced": _text_only_image_stats()["images_replaced"],

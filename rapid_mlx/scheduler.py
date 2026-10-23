@@ -43,6 +43,11 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer  # noqa: E402
 # slot that mlx-lm later iterates, killing the engine loop and 503-ing every
 # in-flight request (#1525).
 _mlx_compat.install_batch_slot_guard()
+# ...and keep a batch's KV in the model's dtype when a cold request joins a
+# row that already holds KV: mlx-lm pads the empty side with a FLOAT32
+# ``mx.array([])`` and the whole session decodes in float32 from then on
+# (4.0 tok/s instead of ~20 on a dense 27B at 47k, laptop 2026-10-23).
+_mlx_compat.install_batch_kv_dtype_guard()
 
 from ._sampler_fast_path import (  # noqa: E402
     is_fused_top_p_eligible,
@@ -12572,6 +12577,15 @@ class Scheduler:
             self._memguard_line_activity(request)
         _fetch_t0 = _time.monotonic()
         cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+        if cache and self._kv_dtype_promoted(cache):
+            # An entry promoted to float32 before the KV dtype guard (still in
+            # memory, or persisted at shutdown and loaded at boot) would put
+            # the session back on float32 at every resume. Drop every such
+            # entry and look again: one re-prefill instead of a slow session.
+            self._drop_promoted_entries()
+            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+            if cache and self._kv_dtype_promoted(cache):
+                cache, remaining = None, request.prompt_token_ids
         _fetch_dt = _time.monotonic() - _fetch_t0
         request.cache_hit_type = self.memory_aware_cache._last_match_type
         if cache:
@@ -12597,6 +12611,91 @@ class Scheduler:
                 f"prompt_tokens={len(request.prompt_token_ids)} "
                 f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
             )
+
+    def _model_activation_dtype(self):
+        """The dtype the model computes in: the half-precision floating dtype
+        that most of its floating parameters carry (norms, quantization
+        scales), else float32; None when the model has no parameters to read.
+        A GatedDeltaNet ``A_log`` kept in float32 does not make a bf16 model
+        a float32 one. Cached: the weights do not change dtype while serving."""
+        cached = getattr(self, "_kv_dtype_model_dtype", False)
+        if cached is not False:
+            return cached
+        result = None
+        params = getattr(getattr(self, "model", None), "parameters", None)
+        if callable(params):
+            try:
+                from mlx.utils import tree_flatten
+
+                counts: dict = {}
+                for _name, value in tree_flatten(params()):
+                    dtype = getattr(value, "dtype", None)
+                    if dtype in (mx.bfloat16, mx.float16, mx.float32):
+                        counts[dtype] = counts.get(dtype, 0) + int(value.size)
+                half = {d: n for d, n in counts.items() if d != mx.float32}
+                if half:
+                    result = max(half, key=half.get)
+                elif counts:
+                    result = mx.float32
+            except Exception:  # noqa: BLE001
+                result = None
+        self._kv_dtype_model_dtype = result
+        return result
+
+    def _kv_dtype_promoted(self, cache) -> bool:
+        """True when ``cache`` holds float32 attention KV for a model that
+        computes in half precision: an entry the pre-guard ``extend`` promoted
+        (see ``_mlx_compat.install_batch_kv_dtype_guard``)."""
+        model_dtype = self._model_activation_dtype()
+        if model_dtype is None or model_dtype == mx.float32:
+            return False
+        for layer in cache or ():
+            keys = getattr(layer, "keys", None)
+            if keys is None or isinstance(keys, (list, tuple)):
+                continue  # empty, or quantized triples (never promoted)
+            if getattr(keys, "dtype", None) == mx.float32:
+                return True
+        return False
+
+    def _drop_promoted_entries(self) -> int:
+        """Remove every prefix entry whose attention KV was promoted to
+        float32 on a half-precision model. Returns how many went."""
+        mac = getattr(self, "memory_aware_cache", None)
+        entries = getattr(mac, "_entries", None)
+        if entries is None:
+            return 0
+        promoted = [
+            key for key, entry in list(entries.items())
+            if self._kv_dtype_promoted(getattr(entry, "cache", None))
+        ]
+        dropped = sum(1 for key in promoted if mac.remove(list(key)))
+        self._kv_dtype_entries_dropped = (
+            int(getattr(self, "_kv_dtype_entries_dropped", 0)) + dropped
+        )
+        if dropped:
+            logger.warning(
+                "[kv_dtype] dropped %d prefix entr%s holding float32 KV for a "
+                "%s model (promoted before the KV dtype guard); the prompt is "
+                "read again once instead of the session decoding in float32",
+                dropped,
+                "y" if dropped == 1 else "ies",
+                self._model_activation_dtype(),
+            )
+        return dropped
+
+    def kv_dtype_stats(self) -> dict:
+        """``/v1/status`` ``kv_dtype``: the model's compute dtype, how many
+        cold rows joined a batch without promoting it, how many extends met
+        two dtypes (should stay 0) and how many promoted entries were
+        dropped."""
+        model_dtype = self._model_activation_dtype()
+        guard = getattr(_mlx_compat, "KV_DTYPE_GUARD_STATS", {})
+        return {
+            "model_dtype": str(model_dtype).replace("mlx.core.", "") if model_dtype is not None else None,
+            "cold_rows_padded": int(guard.get("cold_rows_padded", 0)),
+            "mixed_dtype_extends": int(guard.get("mixed_dtype_extends", 0)),
+            "promoted_entries_dropped": int(getattr(self, "_kv_dtype_entries_dropped", 0)),
+        }
 
     def _commit_request(self, request: Request) -> None:
         """Atomically publish a request to lifecycle truth and the run queue."""
@@ -16155,6 +16254,10 @@ class Scheduler:
                 "enabled": guard_enabled(),
                 "initialized": False,
             }
+        try:
+            stats["kv_dtype"] = self.kv_dtype_stats()
+        except Exception:  # noqa: BLE001 - a status read never fails on this
+            pass
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

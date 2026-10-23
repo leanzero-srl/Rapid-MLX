@@ -38,6 +38,9 @@ import mlx.core as mx
 from . import _mlx_compat as _mlx_compat
 
 _mlx_compat.install()
+# The multimodal lane batches mlx-lm's BatchKVCache too: a cold row joining
+# it must not promote the batch to float32 (see install_batch_kv_dtype_guard).
+_mlx_compat.install_batch_kv_dtype_guard()
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer  # noqa: E402
 

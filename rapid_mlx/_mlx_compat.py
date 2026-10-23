@@ -231,3 +231,89 @@ def install_batch_slot_guard() -> None:
     batch_cls.extend = extend
     batch_cls._rapid_mlx_slot_guard = True
     logger.debug("MLX compat shim installed (#1525 logits_processors slot guard).")
+
+
+# Counters for the KV dtype guard below, read by ``Scheduler.kv_dtype_stats``
+# (``/v1/status`` -> ``kv_dtype``).
+KV_DTYPE_GUARD_STATS = {"cold_rows_padded": 0, "mixed_dtype_extends": 0}
+
+
+def install_batch_kv_dtype_guard() -> None:
+    """Keep a batch's KV in its own dtype when a cold row joins it.
+
+    mlx-lm 0.31.3 ``BatchKVCache.extend`` (and ``BatchRotatingKVCache.extend``)
+    pads a side that holds no KV yet with::
+
+        k = mx.array([]).reshape(Bc, H, 0, D)
+
+    ``mx.array([])`` is FLOAT32, so the ``mx.concatenate`` that follows
+    promotes the whole batch's KV to float32. That happens every time a
+    request whose prompt is read cold joins a row that already holds KV -- a
+    goose agent's second request arriving while the first is mid-prefill.
+    From then on the attention output, the residual stream and every later
+    layer run in float32; ``merge`` keeps the first row's dtype for every
+    restore and each stored prefix entry hands float32 to the next turn, so
+    the session never comes back. Measured on the laptop (M4 Max, dense
+    Qwen3.5 27B 4-bit, 2026-10-23): KV 131,072 B/token instead of 65,536 and
+    4.0 tok/s at 47k context where bfloat16 decodes at ~4-5x that. The
+    tensor split fixed the same upstream line as goose Q-447.
+
+    The empty side now gets zero-length KV in the filled side's dtype: the
+    same shapes, padding and values as upstream, without the promotion. Two
+    filled sides of different dtypes still meet in upstream's concatenate;
+    that is counted and logged (it should never happen).
+    """
+    try:
+        from mlx_lm.models import cache as _cache
+    except ImportError:
+        return  # Linux CI / no MLX
+    import mlx.core as mx
+
+    for name in ("BatchKVCache", "BatchRotatingKVCache"):
+        cls = getattr(_cache, name, None)
+        original = getattr(cls, "extend", None)
+        if original is None:
+            logger.warning(
+                "rapid-mlx compat: mlx_lm.models.cache has no %s.extend to "
+                "guard -- the KV dtype guard is NOT installed for it. A cold "
+                "request joining a running batch may turn the batch float32.",
+                name,
+            )
+            continue
+        if getattr(cls, "_rapid_mlx_kv_dtype_guard", False):
+            continue
+
+        def extend(self, other, _original=original, _name=name):
+            sides = (self, other)
+            filled = [c for c in sides if getattr(c, "keys", None) is not None]
+            if len(filled) == 1:
+                ref = filled[0]
+                for cold in sides:
+                    if getattr(cold, "keys", None) is not None:
+                        continue
+                    rows = cold.offset.shape[0]
+                    cold.keys = mx.zeros(
+                        (rows, ref.keys.shape[1], 0, ref.keys.shape[3]),
+                        dtype=ref.keys.dtype,
+                    )
+                    cold.values = mx.zeros(
+                        (rows, ref.values.shape[1], 0, ref.values.shape[3]),
+                        dtype=ref.values.dtype,
+                    )
+                    KV_DTYPE_GUARD_STATS["cold_rows_padded"] += 1
+            elif len(filled) == 2 and self.keys.dtype != other.keys.dtype:
+                KV_DTYPE_GUARD_STATS["mixed_dtype_extends"] += 1
+                logger.warning(
+                    "[kv_dtype] %s.extend joined KV of two dtypes (%s + %s); "
+                    "upstream promotes the batch",
+                    _name,
+                    self.keys.dtype,
+                    other.keys.dtype,
+                )
+            return _original(self, other)
+
+        extend.__doc__ = original.__doc__
+        extend.__name__ = original.__name__
+        cls.extend = extend
+        cls._rapid_mlx_kv_dtype_guard = True
+    logger.debug("MLX compat shim installed (batch KV dtype guard).")
