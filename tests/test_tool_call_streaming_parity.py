@@ -280,6 +280,23 @@ PARITY_FIXTURES: list = [
             ("read_file", {"path": "/etc/hostname"}),
         ],
     ),
+    # Recursive Flint — GLM-4.7's <arg_key>/<arg_value> tags, one line, raw
+    # string values (non-strings as JSON), Xing4.0's reading rules.
+    (
+        "flint",
+        "flint_arg_tool_call",
+        (
+            "<tool_call>get_current_weather<arg_key>location</arg_key>"
+            "<arg_value>Paris</arg_value><arg_key>days</arg_key>"
+            "<arg_value>3</arg_value></tool_call>"
+            "<tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>/etc/hostname</arg_value></tool_call>"
+        ),
+        [
+            ("get_current_weather", {"location": "Paris", "days": 3}),
+            ("read_file", {"path": "/etc/hostname"}),
+        ],
+    ),
 ]
 
 
