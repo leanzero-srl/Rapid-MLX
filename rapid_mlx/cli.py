@@ -3908,6 +3908,13 @@ def _add_qwen4_offload_args(parser) -> None:
         default=None,
         help="Write per-layer expert routing counts (.npy) here while serving.",
     )
+    group.add_argument(
+        "--qwen4-expert-async",
+        action="store_true",
+        default=False,
+        help="Submit each offloaded MoE block to the GPU right after its router sync "
+        "(overlaps expert compute with graph building; bit-identical).",
+    )
 
 
 def _apply_qwen4_offload_env(args) -> None:
@@ -3922,6 +3929,7 @@ def _apply_qwen4_offload_env(args) -> None:
         "RAPID_MLX_QWEN4_EXPERT_RESERVE_GB": getattr(args, "qwen4_expert_reserve_gb", None),
         "RAPID_MLX_QWEN4_EXPERT_STATS_IN": getattr(args, "qwen4_expert_stats_in", None),
         "RAPID_MLX_QWEN4_EXPERT_STATS_OUT": getattr(args, "qwen4_expert_stats_out", None),
+        "RAPID_MLX_QWEN4_EXPERT_ASYNC": "1" if getattr(args, "qwen4_expert_async", False) else None,
     }
     active = {k: str(v) for k, v in env.items() if v is not None}
     if not active:
