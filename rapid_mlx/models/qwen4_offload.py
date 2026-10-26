@@ -229,7 +229,7 @@ class PLEOffloadStore:
             out_b[sel] = self.b[sh][rows]
 
         used = [sh for sh in range(self.parts) if bounds[sh + 1] > bounds[sh]]
-        if self._pool is not None and n > 64 and len(used) > 1:
+        if self._pool is not None and len(used) > 1:
             list(self._pool.map(work, used))
         else:
             for sh in used:
