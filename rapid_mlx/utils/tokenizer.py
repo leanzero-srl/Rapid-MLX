@@ -955,6 +955,21 @@ def _register_vendored_archs() -> None:
     elif sys.modules.get("mlx_lm.models.k2_horizon") is not None:
         _VENDORED_MODEL_TYPES.add("k2_horizon")
 
+    # mlx-lm architectures vendored verbatim from open upstream PRs (mimo_v2:
+    # ml-explore/mlx-lm#1219). They use mlx-lm's own load/tokenizer path, so
+    # they are registered only and NOT added to ``_VENDORED_MODEL_TYPES``.
+    # ``register()`` defers to a native mlx-lm module when one is installed.
+    try:
+        from rapid_mlx import mlx_lm_models as _mlx_lm_models
+
+        _mlx_lm_models.register()
+    except Exception as e:
+        logger.warning(
+            "rapid_mlx.mlx_lm_models failed to register (mimo_v2 checkpoints "
+            "will not load until resolved): %s",
+            e,
+        )
+
 
 def _is_vendored_arch_model(model_name: str) -> bool:
     """Return True if model's config.json declares a model_type we vendor."""
