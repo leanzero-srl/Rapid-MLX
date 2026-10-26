@@ -395,6 +395,22 @@ class SparseMoeBlock(nn.Module):
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
+        offload = getattr(self, "_offload", None)
+        if offload is not None:
+            # Routed-expert offload: expert ids -> resident slots (see qwen4_offload).
+            routed = offload.routed(
+                self, self._offload_layer, x, indices, target_verify
+            )
+        else:
+            routed = self._routed(x, indices, target_verify=target_verify)
+        routed = (routed * scores[..., None]).sum(axis=-2)
+        shared = self.shared_expert(x)
+        shared = mx.sigmoid(self.shared_expert_gate(x)) * shared
+        return routed + shared
+
+    def _routed(
+        self, x: mx.array, indices: mx.array, *, target_verify: bool = False
+    ) -> mx.array:
         if target_verify and x.ndim == 3 and x.shape[1] > 1:
             batch, steps, width = x.shape
             experts_per_token = indices.shape[-1]
@@ -418,10 +434,7 @@ class SparseMoeBlock(nn.Module):
             routed = routed.squeeze(-2).reshape(batch, steps, experts_per_token, -1)
         else:
             routed = self.switch_mlp(x, indices)
-        routed = (routed * scores[..., None]).sum(axis=-2)
-        shared = self.shared_expert(x)
-        shared = mx.sigmoid(self.shared_expert_gate(x)) * shared
-        return routed + shared
+        return routed
 
 
 class GatedDeltaNet(nn.Module):
@@ -1911,6 +1924,10 @@ class Qwen4ExpTextModel(nn.Module):
             for layer_index in range(args.num_hidden_layers)
         ]
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
+        # Default-off PLE / routed-expert offload (env-driven, see qwen4_offload).
+        from .qwen4_offload import install_into_text_model
+
+        install_into_text_model(self, args)
 
     def __call__(
         self,
@@ -2018,6 +2035,9 @@ class TextModel(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        from .qwen4_offload import sanitize_weights
+
+        weights = sanitize_weights(weights)
         weights = {
             key: value
             for key, value in weights.items()

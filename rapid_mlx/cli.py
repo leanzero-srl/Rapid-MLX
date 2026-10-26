@@ -3857,6 +3857,92 @@ def _validate_v41_product_spec_flags(args, *, owns_runtime: bool) -> None:
         raise SystemExit(2)
 
 
+def _add_qwen4_offload_args(parser) -> None:
+    """Qwen3.8 Flash-Next (qwen4_exp) memory offload levers, all default OFF."""
+    group = parser.add_argument_group("qwen4_exp offload (Qwen3.8 Flash-Next)")
+    group.add_argument(
+        "--qwen4-ple-offload",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep the 32 GB PLE n-gram embedding tables on disk: rows are "
+            "gathered from memory-mapped checkpoint shards per step and "
+            "dequantized on the GPU (bit-identical). qwen4_exp only."
+        ),
+    )
+    group.add_argument(
+        "--qwen4-expert-budget-gb",
+        type=positive_finite_float,
+        default=None,
+        help=(
+            "Total resident budget (decimal GB, MLX active memory) for "
+            "qwen4_exp: routed experts beyond it stay on disk and are read "
+            "into per-layer slot stacks on demand. Unset = all resident."
+        ),
+    )
+    group.add_argument(
+        "--qwen4-expert-slots",
+        type=int,
+        default=None,
+        help="Explicit resident experts per layer (overrides the budget).",
+    )
+    group.add_argument(
+        "--qwen4-expert-policy",
+        choices=["lru", "lfu"],
+        default=None,
+        help="Eviction policy for offloaded experts (default lru).",
+    )
+    group.add_argument(
+        "--qwen4-expert-reserve-gb",
+        type=positive_finite_float,
+        default=None,
+        help="Headroom inside the budget kept for KV/activations (default 2).",
+    )
+    group.add_argument(
+        "--qwen4-expert-stats-in",
+        default=None,
+        help="Routing-count .npy (from --qwen4-expert-stats-out) used to seed the resident experts.",
+    )
+    group.add_argument(
+        "--qwen4-expert-stats-out",
+        default=None,
+        help="Write per-layer expert routing counts (.npy) here while serving.",
+    )
+
+
+def _apply_qwen4_offload_env(args) -> None:
+    """Translate the qwen4 offload flags into the env the model module reads."""
+    import os
+
+    env = {
+        "RAPID_MLX_QWEN4_PLE_OFFLOAD": "1" if getattr(args, "qwen4_ple_offload", False) else None,
+        "RAPID_MLX_QWEN4_EXPERT_BUDGET_GB": getattr(args, "qwen4_expert_budget_gb", None),
+        "RAPID_MLX_QWEN4_EXPERT_SLOTS": getattr(args, "qwen4_expert_slots", None),
+        "RAPID_MLX_QWEN4_EXPERT_POLICY": getattr(args, "qwen4_expert_policy", None),
+        "RAPID_MLX_QWEN4_EXPERT_RESERVE_GB": getattr(args, "qwen4_expert_reserve_gb", None),
+        "RAPID_MLX_QWEN4_EXPERT_STATS_IN": getattr(args, "qwen4_expert_stats_in", None),
+        "RAPID_MLX_QWEN4_EXPERT_STATS_OUT": getattr(args, "qwen4_expert_stats_out", None),
+    }
+    active = {k: str(v) for k, v in env.items() if v is not None}
+    if not active:
+        return
+    os.environ.update(active)
+    if not os.environ.get("RAPID_MLX_QWEN4_OFFLOAD_DIR"):
+        model = getattr(args, "model", None)
+        path = None
+        if model and os.path.isdir(model):
+            path = os.path.abspath(model)
+        elif model:
+            try:
+                from .utils.tokenizer import _resolve_model_path
+
+                path = str(_resolve_model_path(model))
+            except Exception:  # noqa: BLE001
+                path = None
+        if path:
+            os.environ["RAPID_MLX_QWEN4_OFFLOAD_DIR"] = path
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -3864,6 +3950,7 @@ def serve_command(args):
     import sys
 
     _validate_primary_lifecycle_args(args)
+    _apply_qwen4_offload_env(args)
 
     if bounds_error := _vision_pixel_bounds_error(
         getattr(args, "vision_min_pixels", 0),
@@ -11878,6 +11965,7 @@ Examples:
             "are supported; an unregistered model_type fails at load time."
         ),
     )
+    _add_qwen4_offload_args(serve_parser)
     serve_parser.add_argument(
         "--disk-stream-cache-gb",
         type=positive_finite_float,
