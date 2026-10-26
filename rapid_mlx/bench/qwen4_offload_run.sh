@@ -20,7 +20,7 @@ PYTHONPATH=$WT $PY -m rapid_mlx.cli serve $MODEL --port $PORT --text-only \
 spid=$!
 trap 'kill $spid 2>/dev/null; wait $spid 2>/dev/null' EXIT
 for i in {1..900}; do
-  curl -sf http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break
+  curl -sf http://127.0.0.1:$PORT/health/ready >/dev/null 2>&1 && break
   kill -0 $spid 2>/dev/null || { echo "$label SERVER DIED"; tail -5 $outdir/$label.server.log; exit 1; }
   sleep 2
 done
