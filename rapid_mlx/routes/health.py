@@ -398,6 +398,18 @@ def _text_only_image_policy() -> str:
     return text_only_image_policy()
 
 
+def _qwen4_offload_status():
+    import sys
+
+    module = sys.modules.get("rapid_mlx.models.qwen4_offload")
+    if module is None:
+        return None
+    try:
+        return module.status()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @router.get("/v1/status")
 async def status():
     """Real-time status with per-request details."""
@@ -468,6 +480,8 @@ async def status():
         # that joined a batch without promoting it to float32, extends that
         # met two dtypes (should stay 0) and promoted entries dropped.
         "kv_dtype": stats.get("kv_dtype"),
+        # qwen4_exp PLE / routed-expert offload counters (None when off).
+        "qwen4_offload": _qwen4_offload_status(),
         # Text-only image notice (LeanZero fork): how many image parts a
         # text-only engine swapped for a text notice instead of a 400.
         "text_only_images_replaced": _text_only_image_stats()["images_replaced"],

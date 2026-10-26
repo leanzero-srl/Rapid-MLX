@@ -17,6 +17,55 @@ from the local internal SSD. Full model does NOT fit today (148 GB process peak 
   Check: `~/Projects/machine-sync/bin/node-jobs status workhorse-20261026-192939-54e9` / `log ... -n 5`.
   98 GiB over the Thunderbolt NFS mount. MUST be deleted when the work is done (report it).
 
+## STATE after agent 2 (2026-10-26 ~20:00) - CODE BUILT, UNIT-TESTED, NOT YET RUN ON THE REAL MODEL
+Agent 2 also hit the 160k guard (the system prompt alone is ~100k: keep EVERY tool output tiny).
+- Commits on lz/qwen4-expert-offload: fe3a3494d (module + CLI + tests) and the next one (status endpoint +
+  this file). Pushed. Workmule worktree exists: ~/Projects/Rapid-MLX-wt-offload (git pull there).
+- rapid_mlx/models/qwen4_offload.py (env-driven, default off):
+  * PLE: OffloadedShardedEmbedding replaces layer-1 ngram_embedding; np.memmap of the 128x3 shard tensors,
+    unique ids -> threaded fancy-index gather -> mx.dequantize(gs32,b4) on GPU -> take(inverse). Bit-exact
+    vs QuantizedEmbedding (unit test). sanitize drops `...ngram_embedding.shard_*` keys.
+  * Experts: install_into_text_model() (called in Qwen4ExpTextModel.__init__, main model only, NOT the MTP
+    head) swaps each layer's switch_mlp for SwitchGLU(...,1); sanitize stubs main-model expert tensors to
+    zeros [1,...]. On first MoE call ExpertOffloadManager.setup() picks C slots/layer from
+    budget - mx.get_active_memory() - reserve (2 GB default), allocates [C,...] u32/u16 stacks (bf16 via
+    .view, shares buffer), fills them by os.preadv straight into the Metal buffer (np.asarray(memoryview(arr))
+    is writable; gather_qmm sees CPU writes - verified on workmule). Works with fused gate_up (moe_fusion)
+    and split layout. SparseMoeBlock.__call__ now: offload.routed(...) or self._routed(...) (refactor only).
+    Per layer: np.asarray(indices) sync -> ensure() loads misses (LRU or decayed-LFU victims, never evicting
+    experts needed by the same call) -> slot ids -> unmodified SwitchGLU/gather_qmm. >C distinct experts in
+    one call (prefill) -> grouped passes, mx.where row select, mx.eval between groups (exact).
+  * Stats: hits/misses/hit_rate/grouped_calls/load_seconds, counts [48,512] -> STATS_OUT .npy (every 4096
+    calls), STATS_IN seeds top-C per layer. /v1/status has "qwen4_offload".
+- Env: RAPID_MLX_QWEN4_{PLE_OFFLOAD=1, EXPERT_BUDGET_GB, EXPERT_SLOTS, EXPERT_POLICY=lru|lfu,
+  EXPERT_RESERVE_GB, EXPERT_STATS_IN, EXPERT_STATS_OUT, IO_THREADS=8, OFFLOAD_DIR=<ckpt dir>}.
+  CLI (serve only): --qwen4-ple-offload --qwen4-expert-budget-gb --qwen4-expert-slots --qwen4-expert-policy
+  --qwen4-expert-reserve-gb --qwen4-expert-stats-in/out (cli.py _add_qwen4_offload_args /
+  _apply_qwen4_offload_env, sets OFFLOAD_DIR from the model dir).
+- Tests: tests/test_qwen4_offload.py, 8 pass (run: PYTHONPATH=$PWD ~/Projects/Rapid-MLX/.venv/bin/python
+  -m pytest -q tests/test_qwen4_offload.py -p no:cacheprovider).
+- Workmule python with mlx 0.32.4 / mlx_lm 0.31.3 / lz.14 deps: ~/.cache/uv/archive-v0/7bolWjpGXF64QzWe/bin/python
+  (run fork code with PYTHONPATH=~/Projects/Rapid-MLX-wt-offload).
+- Model copy on workmule was at 54/98 GiB at 19:58 (job workhorse-20261026-192939-54e9).
+
+## NEXT (in order)
+1. After the copy finishes: smoke on workmule via node-run (--host workmule --heavy): serve with
+   `--qwen4-ple-offload` only on port 8197 (NOT 8090), the app argv from "Correctness references" + MTP
+   spec config, OFFLOAD_DIR auto. Check load works (strict load_weights with stubs), /v1/status memory.
+   Known risks to watch: the loader may eval/convert weights before sanitize (then stubs don't save
+   load-time memory); the `.tolist()`/np sync inside MoE is fine unless a compiled path wraps the forward.
+2. Reference greedy runs (temperature 0, fixed max_tokens, 5 prompts: code, prose, JSON, Chinese, ~8k
+   long) with PLE offload only (all experts resident ~72-74 GB) -> sha256 of each output. Also a full
+   resident baseline if memory allows (148 GB peak upstream -> likely NOT on 128 GB; skip).
+3. Expert budgets 60/66/70/73 GB (+PLE offload): same prompts, compare SHA, record tok/s (decode + prefill),
+   /v1/status active/peak + hit_rate. LRU vs LFU; stats-seeded run (collect STATS_OUT on a calibration
+   run first). RAPID_MLX_MTP_PROMPT_LOOKUP=0/1 on a copy-heavy prompt under offload.
+4. Optional: next-layer prefetch (not built). Perf doc docs/engineering/performance/2026-10-xx-qwen4-ple-
+   expert-offload.md, goose notes worktree (see BUILD), push. Delete workmule ~/models-local copy at end.
+Write a small bench script (scratch or rapid_mlx/bench/) that starts the server, waits /health, sends the
+prompts via /v1/chat/completions (stream for TTFT/decode tok/s), dumps JSON {sha, tok/s, status} - keep
+its stdout to one line per prompt.
+
 ## Measured facts (safetensors headers, 2026-10-26)
 - Model dir (SSD): /Volumes/AI-workhorse/models/goose/rapid-mlx/Qwen3.8-Flash-Next-4bit, 98 GiB, 28 shards.
 - 48 layers, hidden 2560, 512 routed experts top-10, moe_intermediate 640, shared expert 640, 12 full-attn

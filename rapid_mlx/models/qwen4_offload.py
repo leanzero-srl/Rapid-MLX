@@ -632,3 +632,17 @@ def sanitize_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
             value = mx.zeros((1, *value.shape[1:]), dtype=value.dtype)
         out[key] = value
     return out
+
+
+def status() -> dict[str, Any] | None:
+    """Counters for /v1/status (None when both levers are off)."""
+    cfg = offload_config()
+    if not cfg.any:
+        return None
+    out: dict[str, Any] = {"ple": cfg.ple, "experts": cfg.experts, "policy": cfg.policy}
+    if _MANAGER is not None:
+        out["expert"] = _MANAGER.stats()
+    if _PLE_STORE is not None:
+        out["ple_rows_gathered"] = _PLE_STORE.rows_gathered
+        out["ple_gather_seconds"] = round(_PLE_STORE.gather_seconds, 3)
+    return out
