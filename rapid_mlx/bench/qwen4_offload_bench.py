@@ -140,6 +140,9 @@ def run_one(port: int, model: str, name: str, max_tokens: int) -> tuple[dict, st
         res["hits"], res["misses"] = h, m
         res["hit_rate"] = round(h / (h + m), 4) if h + m else None
         res["load_s"] = round((after.get("load_seconds") or 0) - (before.get("load_seconds") or 0), 2)
+        for k in ("sync_seconds", "cpu_seconds", "calls"):
+            if k in after:
+                res[k.replace("_seconds", "_s")] = round(after[k] - before.get(k, 0), 3)
         if "ple_rows_gathered" in after:
             res["ple_rows"] = after["ple_rows_gathered"] - before.get("ple_rows_gathered", 0)
             res["ple_s"] = round(after["ple_gather_seconds"] - before.get("ple_gather_seconds", 0), 3)
@@ -167,7 +170,7 @@ def main() -> None:
             results.append(res)
             texts[f"{name}.{rep}"] = txt
             keys = ("prompt", "rep", "sha", "completion_tokens", "ttft_s", "prefill_tok_s",
-                    "decode_tok_s", "hit_rate", "ple_rows", "ple_s", "load_s", "active_gb", "peak_gb")
+                    "decode_tok_s", "hit_rate", "ple_rows", "ple_s", "load_s", "sync_s", "cpu_s", "calls", "active_gb", "peak_gb")
             print(a.label, " ".join(f"{k}={res.get(k)}" for k in keys), flush=True)
     status = _offload(a.port)
     Path(a.out).write_text(json.dumps(

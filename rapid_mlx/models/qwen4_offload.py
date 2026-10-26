@@ -423,6 +423,9 @@ class ExpertOffloadManager:
         self._calls_since_dump = 0
         self.slots = 0
         self._verified = False
+        self.calls = 0
+        self.sync_seconds = 0.0
+        self.cpu_seconds = 0.0
 
     def register(self, layer: int, moe_block: Any) -> None:
         self.modules[layer] = moe_block
@@ -547,14 +550,17 @@ class ExpertOffloadManager:
             "hit_rate": (self.hits / total) if total else None,
             "grouped_calls": self.grouped_calls,
             "load_seconds": round(self.load_seconds, 3),
+            "calls": self.calls,
+            "sync_seconds": round(self.sync_seconds, 3),
+            "cpu_seconds": round(self.cpu_seconds, 3),
             "resident_expert_gb": round(
                 sum(ls.resident_bytes for ls in self.layers.values()) / 1e9, 3
             ),
         }
 
     def reset_counters(self) -> None:
-        self.hits = self.misses = self.grouped_calls = 0
-        self.load_seconds = 0.0
+        self.hits = self.misses = self.grouped_calls = self.calls = 0
+        self.load_seconds = self.sync_seconds = self.cpu_seconds = 0.0
 
     # -- forward -----------------------------------------------------------
     def routed(self, block: Any, layer: int, x: mx.array, indices: mx.array, target_verify: bool) -> mx.array:
@@ -566,13 +572,19 @@ class ExpertOffloadManager:
             for other in self.layers.values():
                 other.check_bound()
             self._verified = True
-        idx = np.asarray(indices).astype(np.int64)
+        t0 = time.perf_counter()
+        idx = np.asarray(indices).astype(np.int64)  # GPU sync: router of this layer
+        t1 = time.perf_counter()
+        self.sync_seconds += t1 - t0
+        self.calls += 1
         flat = idx.reshape(-1)
         self.record(layer, flat)
         need = np.unique(flat)
         if need.size <= ls.slots:
+            load0 = self.load_seconds
             self.ensure(layer, need)
             slot_idx = mx.array(ls.slot_of[idx].astype(np.uint32))
+            self.cpu_seconds += time.perf_counter() - t1 - (self.load_seconds - load0)
             return block._routed(x, slot_idx, target_verify=target_verify)
         # More distinct experts than slots: compute in groups, each (token, k)
         # row taken from the group that holds its expert.
