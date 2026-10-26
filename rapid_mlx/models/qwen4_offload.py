@@ -381,6 +381,20 @@ class LayerSlots:
                 )
             setattr(owner, attr, value)
         self.resident_bytes = self.expert_bytes * slots
+        # Identity of one bound stack: anything that swaps the module's arrays
+        # after setup (e.g. a later gate+up fusion concatenating copies) would
+        # leave misses loading into dead buffers -> silently wrong outputs.
+        self.down_weight = switch_mlp.down_proj.weight
+        self.switch_mlp = switch_mlp
+
+    def check_bound(self) -> None:
+        if self.switch_mlp.down_proj.weight is not self.down_weight or self.fused != (
+            getattr(self.switch_mlp, "gate_up_proj", None) is not None
+        ):
+            raise RuntimeError(
+                f"[qwen4-offload] layer {self.layer}: expert slot stacks were replaced after "
+                "setup (a post-load transform copied them); misses would load into dead buffers"
+            )
 
     def load(self, expert: int, slot: int) -> None:
         for fd, base, per_expert, views in self.reads:
@@ -408,6 +422,7 @@ class ExpertOffloadManager:
         self._pool = ThreadPoolExecutor(max_workers=cfg.io_threads)
         self._calls_since_dump = 0
         self.slots = 0
+        self._verified = False
 
     def register(self, layer: int, moe_block: Any) -> None:
         self.modules[layer] = moe_block
@@ -547,6 +562,10 @@ class ExpertOffloadManager:
         if not self.ready:
             self.setup()
         ls = self.layers[layer]
+        if not self._verified:
+            for other in self.layers.values():
+                other.check_bound()
+            self._verified = True
         idx = np.asarray(indices).astype(np.int64)
         flat = idx.reshape(-1)
         self.record(layer, flat)

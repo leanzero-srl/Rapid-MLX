@@ -1124,6 +1124,14 @@ def _qwen4_offload_post_load(model) -> None:
         return
     import mlx.core as mx
 
+    # The engine fuses MoE gate+up AFTER load (engine/batched.py); fusion
+    # concatenates COPIES of gate_proj/up_proj, so fusing after the slot fill
+    # would duplicate ~2/3 of the slot stacks (+42 GB at a 66 GB budget) and
+    # strand the loader on the dead split buffers. Fuse the (stub-sized)
+    # expert modules first; the later engine call is idempotent.
+    from ..moe_fusion import fuse_gate_up
+
+    fuse_gate_up(model)
     mx.eval(model.parameters())
     manager.setup()
 
