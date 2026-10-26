@@ -21,9 +21,10 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 
 
-def _long_context() -> str:
+def _long_context(part: int = 0) -> str:
+    # part 1/2 = different text -> mostly unseen PLE n-gram rows (cold page cache)
     src = (_REPO / "rapid_mlx" / "models" / "qwen4_exp.py").read_text()
-    return src[:30000]
+    return src[part * 30000 : (part + 1) * 30000]
 
 
 def _copy_source() -> str:
@@ -44,13 +45,19 @@ PROMPTS = {
     + _long_context()
     + "\n```\n\nSummarize what this module implements, listing the main classes and "
     "what each one is responsible for.",
+    **{
+        f"long{part}": "Here is a source file:\n\n```python\n"
+        + _long_context(part)
+        + "\n```\n\nSummarize what this module implements."
+        for part in (1, 2)
+    },
     "copy": "Rewrite the following Python code exactly, but rename the class "
     "`ExpertOffloadManager` to `ExpertCache` everywhere. Output only the code.\n\n```python\n"
     + _copy_source()
     + "\n```",
 }
 
-MAX_TOKENS = {"long": 256, "copy": 768}
+MAX_TOKENS = {"long": 256, "long1": 32, "long2": 32, "copy": 768}
 
 
 def _get(url: str) -> dict:
@@ -132,6 +139,9 @@ def run_one(port: int, model: str, name: str, max_tokens: int) -> tuple[dict, st
         res["hits"], res["misses"] = h, m
         res["hit_rate"] = round(h / (h + m), 4) if h + m else None
         res["load_s"] = round((after.get("load_seconds") or 0) - (before.get("load_seconds") or 0), 2)
+        if "ple_rows_gathered" in after:
+            res["ple_rows"] = after["ple_rows_gathered"] - before.get("ple_rows_gathered", 0)
+            res["ple_s"] = round(after["ple_gather_seconds"] - before.get("ple_gather_seconds", 0), 3)
         res["active_gb"] = after.get("active_memory_gb")
         res["peak_gb"] = after.get("peak_memory_gb")
     return res, out_text
@@ -156,7 +166,7 @@ def main() -> None:
             results.append(res)
             texts[f"{name}.{rep}"] = txt
             keys = ("prompt", "rep", "sha", "completion_tokens", "ttft_s", "prefill_tok_s",
-                    "decode_tok_s", "hit_rate", "load_s", "active_gb", "peak_gb")
+                    "decode_tok_s", "hit_rate", "ple_rows", "ple_s", "load_s", "active_gb", "peak_gb")
             print(a.label, " ".join(f"{k}={res.get(k)}" for k in keys), flush=True)
     status = _offload(a.port)
     Path(a.out).write_text(json.dumps(
