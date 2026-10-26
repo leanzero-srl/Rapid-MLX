@@ -70,10 +70,6 @@ class OffloadConfig:
     stats_in: str | None
     stats_out: str | None
     io_threads: int
-    # Submit each MoE block's output to the GPU (mx.async_eval) right after
-    # the router sync, so the GPU computes the experts while Python builds the
-    # next layer's graph instead of idling until the next sync. 0 = off.
-    async_submit: bool = False
 
     @property
     def experts(self) -> bool:
@@ -100,7 +96,6 @@ def offload_config() -> OffloadConfig:
         stats_in=_env("EXPERT_STATS_IN"),
         stats_out=_env("EXPERT_STATS_OUT"),
         io_threads=max(1, int(_env("IO_THREADS", "8") or 8)),
-        async_submit=_env("EXPERT_ASYNC", "0") in ("1", "true", "on", "yes"),
     )
 
 

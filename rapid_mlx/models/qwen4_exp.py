@@ -401,12 +401,6 @@ class SparseMoeBlock(nn.Module):
             routed = offload.routed(
                 self, self._offload_layer, x, indices, target_verify
             )
-            if offload.cfg.async_submit:
-                routed = (routed * scores[..., None]).sum(axis=-2)
-                shared = self.shared_expert(x)
-                out = routed + mx.sigmoid(self.shared_expert_gate(x)) * shared
-                mx.async_eval(out)
-                return out
         else:
             routed = self._routed(x, indices, target_verify=target_verify)
         routed = (routed * scores[..., None]).sum(axis=-2)
