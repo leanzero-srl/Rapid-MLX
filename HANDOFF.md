@@ -1,5 +1,17 @@
 # HANDOFF: Qwen3.8-Flash-Next-4bit memory offload (branch lz/qwen4-expert-offload)
 
+## FINAL STATE (agent 4, 2026-10-26 ~20:55) - EXPERT OFFLOAD UNFINISHED, STOPPED BY OWNER DECISION
+- Expert offload code stays on the branch, default OFF, UNFINISHED. Do not resume without a new owner ask.
+- e9c76e8e5 was tested: it was not enough. The engine's gate+up fusion ran after the fill, copied the slot
+  stacks (+42 GB idle, 105.8 GB at a 66 GB budget) and misses loaded into dead buffers. Fixed in 3c8421965
+  (fuse before the fill + bound-stack guard). After it: 66 GB budget -> 65.22 GB idle with MTP, no refusals.
+- Parity MTP off: ref/e73/e70/e66/e60 x 6 prompts x 2 reps = 60 outputs, all shas identical.
+- Speed: see docs/engineering/performance/2026-10-26-qwen4-ple-expert-offload.md. MTP on, e66: 75-90% of
+  PLE-only; the floor is the per-layer router sync (all-resident e73 is already -15-25%).
+- --qwen4-expert-async tried and reverted (slower, not bit-identical). LRU vs LFU, prompt lookup off/on and
+  prefetch were NOT run.
+- Workmule cleanup done: ~/models-local/Qwen3.8-Flash-Next-4bit, ~/q4bench, the prefix_cache dir deleted.
+
 Written 2026-10-26 ~19:30 by the first agent. It hit the 182k context guard right after loading the
 `goose-mlx-inference` + `node-dispatch` skills (their text alone is ~150k tokens). NO CODE WRITTEN YET.
 Next agent: do NOT load those two skills whole again; the facts you need from them are below.

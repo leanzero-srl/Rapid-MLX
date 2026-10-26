@@ -2,7 +2,10 @@
 
 Date: 2026-10-26. Branch `lz/qwen4-expert-offload` (base `v0.14.3-lz.14`).
 
-Status: PLE offload qualified (opt-in): -32 GB at resident decode speed, bit-exact.
+Status: PLE offload qualified (opt-in). ROUTED-EXPERT OFFLOAD IS UNFINISHED:
+work stopped by owner decision on 2026-10-26 ~20:50; the code stays on the
+branch, default OFF; LRU vs LFU and prompt-lookup off/on were never run.
+PLE offload: -32 GB at resident decode speed, bit-exact.
 Routed-expert offload works and is bit-exact at every budget tested, but costs
 about a third of decode speed, mostly from the per-layer router sync, not from
 disk reads. Both are off by default.
@@ -84,15 +87,35 @@ long-prompt output changed (7fbeae49 vs 93572ea0). Reverted (`18e0f6369`).
 
 ## MTP on (k=2, as served): decode tok/s and hit rates
 
-MTP_ON_TABLE
+Better of two reps; hit rate from the warm rep. Same chain, same noise.
+
+| config | idle active GB | code | prose | json | zh | long | copy | hit rate (long) |
+|---|---|---|---|---|---|---|---|---|
+| PLE only (ref) | 72.25 | 63.3 | 51.7 | 73.7 | 55.9 | 51.1 | 119.6 | - |
+| e73 (512 slots) | 72.25 | 53.5 | 43.0 | 52.7 | 46.5 | 41.5 | 106.3 | 1.000 |
+| e70 (490) | 69.33 | 48.7 | 41.4 | 49.3 | 44.9 | 43.0 | 104.9 | 0.996-0.999 (0.993) |
+| e66 (459) | 65.22 | 46.6 | 39.1 | 50.5 | 43.0 | 41.3 | 96.8 | 0.988-0.992 (0.978) |
+| e60 (414) | 59.24 | 39.5 | 32.8 | 42.9 | 29.3 | 35.0 | 82.1 | 0.974-0.977 (0.944) |
+
+The MTP head (1.47 GB) loads after the slot fill and lands inside the 2 GB
+reserve (66 GB budget -> 65.22 GB idle). LRU vs LFU at 66 GB: NOT RUN (stopped).
 
 ## Prompt lookup off vs on (e66, copy prompt)
 
-LOOKUP_TABLE
+NOT RUN (stopped by owner decision). Resident reference with lookup on: copy 119.6 tok/s.
 
 ## Verdict
 
-VERDICT
+- PLE offload: use it. -32 GB (104 -> 72 GB) at resident decode speed, exact.
+- Expert offload (UNFINISHED): exact at 60-73 GB, but decode drops to ~75-90% of
+  the PLE-only reference at 66 GB with MTP on (code 46.6 vs 63.3, prose 39.1 vs
+  51.7), ~65-70% with MTP off. The floor is the per-layer router sync (all experts
+  resident still loses ~15-25%), so a bigger cache cannot recover it; removing the
+  sync needs a different design (e.g. speculative routing with a per-step miss
+  check and re-run, viable only at much higher per-step hit rates). Next-layer
+  prefetch was not tried: miss loads are only ~5-15% of decode time.
+- The full model fits a 128 GB Mac resident (104 GB active), so the offload is
+  only needed for long contexts on 128 GB or for smaller Macs.
 
 ## Prior art
 
