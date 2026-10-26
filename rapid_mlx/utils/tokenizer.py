@@ -1115,6 +1115,19 @@ def _rapid_owned_model_config(model_name: str) -> dict | None:
     return {"model_file": None, "auto_map": None}
 
 
+def _qwen4_offload_post_load(model) -> None:
+    import sys
+
+    module = sys.modules.get("rapid_mlx.models.qwen4_offload")
+    manager = module.expert_manager() if module is not None else None
+    if manager is None:
+        return
+    import mlx.core as mx
+
+    mx.eval(model.parameters())
+    manager.setup()
+
+
 def _post_load_ubc_evict(model_name: str) -> None:
     """Defect 4: evict the UBC mirror of safetensors shards on Darwin.
 
@@ -1564,6 +1577,11 @@ def load_model_with_fallback(
         # and run to max_tokens instead, the same checkpoint stopping
         # correctly without the flag.
         _try_inject_mtp_post_load(model, model_name)
+        # qwen4_exp routed-expert offload: allocate + fill the expert slot
+        # stacks NOW (weights and MTP head resident), not on the first MoE
+        # call -- the memory guard's warmup would otherwise book the ~60 GB
+        # slot allocation as a per-step transient and refuse every prompt.
+        _qwen4_offload_post_load(model)
         if not getattr(tokenizer, "chat_template", None):
             mp = _resolve_model_path(model_name)
             if mp is not None:
