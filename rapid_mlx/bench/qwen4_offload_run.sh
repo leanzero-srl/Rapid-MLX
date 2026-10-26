@@ -11,7 +11,7 @@ PORT=${PORT:-8197}
 mkdir -p $outdir
 spec=()
 if [[ ${MTP:-1} == 1 ]]; then
-  spec=(--speculative-config "{\"method\":\"mtp\",\"model\":\"$MODEL\",\"num_speculative_tokens\":3}")
+  spec=(--speculative-config "{\"method\":\"mtp\",\"model\":\"$MODEL\",\"num_speculative_tokens\":${MTP_K:-2}}")
 fi
 t0=$(date +%s)
 PYTHONPATH=$WT $PY -m rapid_mlx.cli serve $MODEL --port $PORT --text-only \
