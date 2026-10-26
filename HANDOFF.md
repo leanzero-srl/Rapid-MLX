@@ -48,23 +48,58 @@ Agent 2 also hit the 160k guard (the system prompt alone is ~100k: keep EVERY to
   (run fork code with PYTHONPATH=~/Projects/Rapid-MLX-wt-offload).
 - Model copy on workmule was at 54/98 GiB at 19:58 (job workhorse-20261026-192939-54e9).
 
+## STATE after agent 3 (2026-10-26 ~20:10 EET) - REAL-MODEL RUNS STARTED
+Model copy on workmule ~/models-local/Qwen3.8-Flash-Next-4bit DONE and VERIFIED (all weight/config SHA256 match
+SHA256SUMS.txt; README.md differs from the sums file but equals the SSD source = edited after sums). DELETE at end.
+Commits: 6286abc86 bench client, run script (+/health/ready, MTP k=2), 0f.. gather threading fix, bench cold
+prompts, slot-fill-at-load hook (tokenizer.py, both load paths: e9c76e8e5 is the one qwen4_exp uses).
+
+### Tools (in repo)
+- rapid_mlx/bench/qwen4_offload_run.sh <label> <outdir> <prompts> [serve args]: starts OUR server on 8197
+  (app argv + MTP k=2), waits /health/ready, runs the client, kills its own pid. env MTP=0, REPEAT=N, MTP_K.
+- rapid_mlx/bench/qwen4_offload_bench.py: prompts code,prose,json,zh,long(7840 tok),long1,long2 (cold PLE),
+  copy (768 tok copy-heavy). One line per prompt: sha, ttft, prefill/decode tok/s, hit_rate, ple rows/s, active GB.
+- Launch (copy exactly; single quotes keep $HOME remote; ~ in double quotes expands LOCALLY = trap):
+  R='$HOME/Projects/Rapid-MLX-wt-offload/rapid_mlx/bench/qwen4_offload_run.sh'
+  ~/Projects/machine-sync/bin/node-run --host workmule --heavy --need-mem 80 --max-rss-pct 92 --no-wait \
+    --timeout 2400 -- "$R e66 ~/q4bench code,prose,json,zh,long,copy --qwen4-ple-offload --disable-prefix-cache --qwen4-expert-budget-gb 66"
+  Results: workmule ~/q4bench/<label>.json + <label>.server.log. Wait loop: node-jobs status <id> | awk '/ status /'.
+  TRAPS: node-run default kills a job at 50% RAM RSS (64 GB) -> always --max-rss-pct 92; --need-mem >~93 queues
+  forever (use --no-wait); git pull on workmule after every push (ssh workmule 'cd ~/Projects/Rapid-MLX-wt-offload && git pull -q').
+
+### Measured (workmule M5 Max 128 GB, MTP k=2 on, --disable-prefix-cache unless noted)
+| config | idle active GB | decode tok/s code/prose/json/zh/long/copy | long prefill (7840 tok) |
+| fully resident (no offload) | 104.25 (peak 108.1 w/ 8k ctx) | 65.7/52.3/75.7/54.0/51.7/114.2 | 7.18 s |
+| PLE offload only (ref) | 72.25 | 64.3/51.2/63.2/55.9/50.7/118.8 | 6.95 s (PLE gather 2.0 s cold, 0.23 s warm) |
+- FULL MODEL FITS a 128 GB Mac today (104 GB active, peak 108 GB, Metal ceiling 103.9 GB per guard is the
+  limit for context!). The "148 GB peak" premise in this file is NOT reproduced on lz.14 + workmule.
+- PLE offload: -32 GB, decode ~= resident AFTER the gather-threading fix (before it: 36 tok/s, -35%, cold page
+  faults serial for decode-size gathers). 32 IO threads no better than 8 (cold 2.3 s vs 2.0 s) -> keep 8.
+- MTP k=3 is rejected by the engine for Flash-Next ("supports 1-2"); goose would pass 3 but only when
+  mtp.safetensors exists, which this checkpoint lacks (MTP is in the shards) -> goose serves it WITHOUT MTP. Report.
+- DETERMINISM: MTP OFF greedy is run-to-run deterministic (prose/json/zh rep0==rep1). MTP ON is NOT (prose,
+  json, zh differ between reps of the same server and between fresh servers; code/long/copy stable) - pre-
+  existing engine behaviour, independent of offload. PLE offload vs resident: identical shas wherever the
+  reference itself is stable (code 634481b917e88300, copy e241cf727b736e1b; det runs prose/long matched exactly).
+  => exact parity must be tested with MTP=0 (bench env MTP=0); MTP-on runs report match-rate only.
+  Persistent prefix cache (~/.cache/rapid-mlx/prefix_cache/--Users--workmule--models-local--Qwen3.8...) makes
+  fresh servers "prefill" 8k in 0.25 s: always --disable-prefix-cache for benches; delete that dir at the end.
+- Expert offload 66 GB: setup OK (448/512 slots/layer, 59.45 GB experts, filled 6.4 s, active 63.75 GB, warmup
+  hit rate 0.887) BUT every request was refused by the memory guard (step=59.54 GB learned during warmup,
+  because slots were allocated on the first MoE call). Fixed in e9c76e8e5 (fill at load). NOT YET RE-RUN.
+  Check the server log: "[qwen4-offload] experts:" must come BEFORE "Hybrid model: running full request warmup";
+  if MTP head is injected later than the hook, budget overshoots by ~1.5 GB (reserve 2 GB covers it) - check.
+- RSS of an expert-offload server is ~60 GB (CPU-written slot pages count as RSS) - fine with --max-rss-pct 92.
+
 ## NEXT (in order)
-1. After the copy finishes: smoke on workmule via node-run (--host workmule --heavy): serve with
-   `--qwen4-ple-offload` only on port 8197 (NOT 8090), the app argv from "Correctness references" + MTP
-   spec config, OFFLOAD_DIR auto. Check load works (strict load_weights with stubs), /v1/status memory.
-   Known risks to watch: the loader may eval/convert weights before sanitize (then stubs don't save
-   load-time memory); the `.tolist()`/np sync inside MoE is fine unless a compiled path wraps the forward.
-2. Reference greedy runs (temperature 0, fixed max_tokens, 5 prompts: code, prose, JSON, Chinese, ~8k
-   long) with PLE offload only (all experts resident ~72-74 GB) -> sha256 of each output. Also a full
-   resident baseline if memory allows (148 GB peak upstream -> likely NOT on 128 GB; skip).
-3. Expert budgets 60/66/70/73 GB (+PLE offload): same prompts, compare SHA, record tok/s (decode + prefill),
-   /v1/status active/peak + hit_rate. LRU vs LFU; stats-seeded run (collect STATS_OUT on a calibration
-   run first). RAPID_MLX_MTP_PROMPT_LOOKUP=0/1 on a copy-heavy prompt under offload.
-4. Optional: next-layer prefetch (not built). Perf doc docs/engineering/performance/2026-10-xx-qwen4-ple-
-   expert-offload.md, goose notes worktree (see BUILD), push. Delete workmule ~/models-local copy at end.
-Write a small bench script (scratch or rapid_mlx/bench/) that starts the server, waits /health, sends the
-prompts via /v1/chat/completions (stream for TTFT/decode tok/s), dumps JSON {sha, tok/s, status} - keep
-its stdout to one line per prompt.
+1. Re-run e66 (command above). If refused again, grep server log for "memory_guard" lines (step=, idle base).
+2. MTP=0 parity: ref0 (PLE only, MTP=0) vs e73/e70/e66/e60 MTP=0 on code,prose,json,zh,long,copy -> shas must
+   match exactly. Then MTP-on perf runs at 60/66/70/73 (tok/s, per-prompt hit_rate, load_s), LRU vs LFU at 66.
+3. Prompt lookup off vs on at 66: RAPID_MLX_MTP_PROMPT_LOOKUP=0 env prefix on the copy prompt (default on;
+   resident copy decode 114-119 tok/s with lookup on).
+4. Perf doc docs/engineering/performance/2026-10-26-qwen4-ple-expert-offload.md (tables above + new), goose notes
+   worktree (see BUILD), push. Prefetch only if time. Cleanup on workmule: ~/models-local copy, ~/q4bench,
+   prefix_cache dir above.
 
 ## Measured facts (safetensors headers, 2026-10-26)
 - Model dir (SSD): /Volumes/AI-workhorse/models/goose/rapid-mlx/Qwen3.8-Flash-Next-4bit, 98 GiB, 28 shards.
