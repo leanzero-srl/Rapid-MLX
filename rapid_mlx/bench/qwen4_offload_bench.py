@@ -71,6 +71,7 @@ def _offload(port: int) -> dict:
     except Exception:  # noqa: BLE001
         return {}
     out = dict(st.get("qwen4_offload") or {})
+    out.update(out.pop("expert", None) or {})  # hits/misses/load_seconds live under "expert"
     mem = st.get("metal") or {}
     for k in ("active_memory_gb", "peak_memory_gb"):
         if k in mem:
