@@ -2324,6 +2324,7 @@ def _load_with_tokenizer_fallback(
         logger.info("Tokenizer loaded via fallback successfully")
     else:
         raise ValueError(f"No tokenizer.json found in {model_path}")
+    _qwen4_offload_post_load(model)
     return model, tokenizer
 
 
