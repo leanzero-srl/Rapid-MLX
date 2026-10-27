@@ -12,6 +12,15 @@
 #      mlx-lm 0.31.3's PipelineMixin.pipeline(group) has no split argument, and an
 #      uneven split is the only way MiMo-V2.6-Flash fits two Macs. It is the 0.32.0
 #      PipelineMixin.pipeline body, so behaviour matches the PR build.
+#   3. OMNI checkpoints (block marked "Rapid-MLX omni"; goose Session 12, 2026-10-27): an
+#      mlx-vlm-layout build (EigenLabs/MiMo-V2.6-Flash-MOPD-MLX-4bit-mtp) names the text
+#      weights `language_model.*` beside `vision_tower.*` / `audio_encoder.*`, and its
+#      config's per-module quantization keys carry the same prefix. ModelArgs.from_dict
+#      strips that prefix from the quantization blocks IN the dict mlx-lm's load_model
+#      keeps using (its class_predicate looks layers up by their text-model path), and
+#      sanitize strips it from the weights and drops the encoders and the MTP heads.
+#      MiMoV2Model.__call__ swaps media marker rows for image/video features
+#      (rapid_mlx.mlx_lm_models.mimo_v2_media) on the process that runs layer 0.
 # Not vendored: the PR's 3-line mlx_lm/utils.py change (quantization_config with
 #   store_dtype == "mxfp4" for un-converted HF checkpoints). MLX-converted checkpoints
 #   carry a "quantization" block and never reach that branch.
@@ -33,6 +42,8 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.pipeline import PipelineMixin
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
+
+from rapid_mlx.mlx_lm_models import mimo_v2_media as _media
 
 
 @dataclass
@@ -72,6 +83,19 @@ class ModelArgs(BaseModelArgs):
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = False
+
+    # --- Rapid-MLX omni ---
+    @classmethod
+    def from_dict(cls, params):
+        for name in ("quantization", "quantization_config"):
+            q = params.get(name)
+            if isinstance(q, dict) and any(k.startswith("language_model.") for k in q):
+                params[name] = {
+                    (k[len("language_model.") :] if k.startswith("language_model.") else k): v
+                    for k, v in q.items()
+                }
+        return super().from_dict(params)
+    # --- end Rapid-MLX omni ---
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -335,6 +359,15 @@ class MiMoV2Model(PipelineMixin, nn.Module):
             if input_embeddings is not None
             else self.embed_tokens(inputs)
         )
+        # --- Rapid-MLX omni: media features enter before layer 0 (the last pipeline rank
+        # runs the first layers; a single process is rank 0 of 1) ---
+        if (
+            input_embeddings is None
+            and _media.STORE is not None
+            and self.pipeline_rank == self.pipeline_size - 1
+        ):
+            h = _media.STORE.substitute(inputs, h)
+        # --- end Rapid-MLX omni ---
 
         local_layers = self.pipeline_layers
         if cache is None:
@@ -399,6 +432,14 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        # --- Rapid-MLX omni: mlx-vlm layout (language_model.* + encoders) ---
+        if any(k.startswith("language_model.") for k in weights):
+            weights = {
+                k[len("language_model.") :]: v
+                for k, v in weights.items()
+                if k.startswith("language_model.")
+            }
+        # --- end Rapid-MLX omni ---
         skip_prefixes = (
             "model.mtp.",
             "visual.",
