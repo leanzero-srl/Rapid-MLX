@@ -135,6 +135,14 @@ MATRIX_EXEMPT: dict[str, str] = {
         "tests/test_tool_call_value_fidelity.py and "
         "tests/test_tool_call_streaming_parity.py"
     ),
+    "longcat": (
+        "TODO: add mlx-community/LongCat-Flash-Lite-4bit (36 GB, ~41 GB peak) "
+        "to golden_models when the matrix has a 48 GB+ slot; parser unit, "
+        "route-level SSE/whole, value-fidelity and streaming-parity coverage "
+        "live in tests/test_longcat_tool_parser.py, "
+        "tests/test_tool_call_value_fidelity.py and "
+        "tests/test_tool_call_streaming_parity.py"
+    ),
     "k2_horizon": (
         "TODO: add K2 Horizon to golden_models when a correctness-grade "
         "8-bit checkpoint is available; the current public 4-bit checkpoint "
