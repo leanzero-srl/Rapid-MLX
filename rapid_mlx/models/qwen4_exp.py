@@ -2186,6 +2186,16 @@ class TextModel(nn.Module):
             for key, value in weights.items()
             if not key.startswith("mtp.") and ".visual." not in key
         }
+        for key in [k for k in weights if k.endswith(".ngram_embedding.weight_scale")]:
+            # The official FP8 checkpoint's PLE scale. A re-quantized build that already folded it
+            # keeps the tensor at exactly 1.0 (Jundot oQ4e-mtp, 2026-10-29): dropping it is exact.
+            # Any other value would have to multiply every gathered row; refuse it by name.
+            scale = weights.pop(key)
+            if not bool(mx.all(scale.astype(mx.float32) == 1.0).item()):
+                raise ValueError(
+                    f"{key} = {scale.astype(mx.float32).tolist()}: an unfolded FP8 PLE scale on a "
+                    "quantized table is not supported; convert the checkpoint with the scale folded"
+                )
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         sanitized = {}

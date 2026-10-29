@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -54,6 +55,12 @@ VISION_KEY_PREFIXES = ("model.visual.", "vision_tower.")
 # max_pixels, 1,003,520 px) on Qwen3.8-Flash-Next-4bit, M4 Max, 2026-09-24;
 # 1.139 GiB absolute, and every smaller image peaked lower (1.02-1.10 GiB).
 VISION_ENCODE_PEAK_MULTIPLE = 1.25
+# The text lane's per-image pixel cap. A checkpoint that ships Qwen's own preprocessor_config.json
+# (Jundot oQ4e-mtp, 2026-10-29) allows 16,777,216 px: 65,536 patches, i.e. ~340 GB of float32 encode
+# scores for one image beside a ~75 GB engine. Capped at the processor default the encode peak was
+# measured at (1,003,520 px, ~1.14 GiB); a 1280x800 screenshot fits it unscaled.
+# RAPID_MLX_TEXT_LANE_MAX_PIXELS raises or lowers it.
+TEXT_LANE_MAX_PIXELS = 1_003_520
 
 
 def checkpoint_config(model_dir: Path) -> dict[str, Any]:
@@ -264,9 +271,18 @@ def _image_processor(model_dir: Path):
         _qwen_vl_image_kwargs,
     )
 
-    return Qwen3VLImageProcessor(
-        **_qwen_vl_image_kwargs(str(model_dir), default_patch_size=16)
-    )
+    kwargs = _qwen_vl_image_kwargs(str(model_dir), default_patch_size=16)
+    cap = int(os.environ.get("RAPID_MLX_TEXT_LANE_MAX_PIXELS", TEXT_LANE_MAX_PIXELS))
+    declared = kwargs.get("max_pixels")
+    if declared is None or declared > cap:
+        if declared is not None:
+            logger.info(
+                "Text-lane vision: image max_pixels %d -> %d (encode memory cap)", declared, cap
+            )
+        kwargs["max_pixels"] = cap
+    if kwargs.get("min_pixels", 0) > kwargs["max_pixels"]:
+        kwargs["min_pixels"] = kwargs["max_pixels"]
+    return Qwen3VLImageProcessor(**kwargs)
 
 
 def vision_workspace_bytes(model_dir: Path) -> int:

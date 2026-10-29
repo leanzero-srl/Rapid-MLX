@@ -82,3 +82,34 @@ def test_the_mtp_head_ships_split_experts_and_an_unquantized_router():
         "group_size": 64,
         "bits": 4,
     }
+
+
+def test_the_folded_fp8_ple_scale_is_dropped_and_an_unfolded_one_refused():
+    """The oQ4e build carries ...ngram_embedding.weight_scale = 1.0 (BF16 [1]), the official FP8
+    checkpoint's PLE scale already folded; strict load_weights refused it as an unknown parameter."""
+    import mlx.core as mx
+
+    from rapid_mlx.models.qwen4_exp import TextModel
+
+    key = "model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
+    assert TENSORS["language_model." + key] == ["BF16", [1]]
+    fake = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=False))
+    out = TextModel.sanitize(fake, {key: mx.ones((1,), dtype=mx.bfloat16), "model.norm.weight": mx.ones((2,))})
+    assert list(out) == ["model.norm.weight"]
+    with pytest.raises(ValueError, match="unfolded FP8 PLE scale"):
+        TextModel.sanitize(fake, {key: mx.full((1,), 0.5, dtype=mx.bfloat16)})
+
+
+def test_the_official_preprocessor_pixel_limit_is_capped_on_the_text_lane(tmp_path, monkeypatch):
+    """Qwen's preprocessor_config.json (shipped by the oQ4e build) allows 16,777,216 px per image:
+    ~340 GB of encode scores. The text lane caps it at the measured 1,003,520 px unless told."""
+    from rapid_mlx.models import qwen4_exp_vision as v
+
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+        "size": {"longest_edge": 16777216, "shortest_edge": 65536},
+        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+        "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+    }))
+    assert v._image_processor(tmp_path).max_pixels == v.TEXT_LANE_MAX_PIXELS == 1_003_520
+    monkeypatch.setenv("RAPID_MLX_TEXT_LANE_MAX_PIXELS", "4000000")
+    assert v._image_processor(tmp_path).max_pixels == 4_000_000
