@@ -103,6 +103,8 @@ logger = logging.getLogger(__name__)
 # A/B switch only. The guard is always on; ``RAPID_MLX_MEMORY_GUARD=0``
 # (or off/false/no) restores the unguarded engine for a comparison run.
 GUARD_ENV = "RAPID_MLX_MEMORY_GUARD"
+# Diagnostics only: one INFO line per observation fed to the peak model.
+_TRACE = os.environ.get("RAPID_MLX_GUARD_TRACE", "").strip() in ("1", "true", "on")
 
 # ratio: live score-tensor copies per query head in the prior. Measured on an
 # M4 Max, mlx 0.32.2, head_dim 256, 24 query / 4 KV heads, bf16, causal mask
@@ -1247,6 +1249,19 @@ class MemoryGuard:
             transient = max(0, int(transient) - int(admit_bytes))
             fit = False
         changed = self.model.observe(shape, transient, fit=fit)
+        if _TRACE:
+            logger.info(
+                "[memory_guard] observe shape=%dx%dx%d transient=%.3fGB fit=%s "
+                "projected=%.3fGB calibrated=%s a=%.3f",
+                shape.batch,
+                shape.chunk,
+                shape.context,
+                _gb(transient),
+                fit,
+                _gb(projected),
+                self.model.calibrated,
+                self.model.attention_bytes_per_unit,
+            )
         self.last_step_footprint = max(0, int(live_beyond_base)) + max(
             0, int(transient)
         )
