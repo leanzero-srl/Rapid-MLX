@@ -68,6 +68,11 @@ class Glm47ToolParser(ToolParser):
     # over that call accounts for: the later "call" is that value's text.
     ORPHAN_CLOSE = re.compile(r"</arg_value>\s*</tool_call>")
 
+    # The call's tags, as the streaming and holdback paths look for them.
+    # A subclass with its own call tags (LongCat) overrides both.
+    _CALL_OPEN = "<tool_call>"
+    _CALL_CLOSE = "</tool_call>"
+
     # Streaming: how many calls already reached the wire this turn.
     _emitted = 0
     _deferred_after_first = False
@@ -204,13 +209,15 @@ class Glm47ToolParser(ToolParser):
         # Do NOT emit content deltas here, because if tool calls are found
         # the non-streaming path sets content=None (reasoning before the
         # tag should not leak as regular content).
-        if "<tool_call>" in current_text:
+        if self._CALL_OPEN in current_text:
             if self._deferred_after_first:
                 return None
             # A close that completed in THIS delta, counted on the
             # accumulated text: a tokenizer can split ``</tool_call>`` across
             # deltas, and then no single delta contains it.
-            if current_text.count("</tool_call>") > previous_text.count("</tool_call>"):
+            if current_text.count(self._CALL_CLOSE) > previous_text.count(
+                self._CALL_CLOSE
+            ):
                 result = self.extract_tool_calls(current_text, request)
                 if result.tools_called:
                     # Only the FIRST call is emitted as it closes; whether a
@@ -273,11 +280,11 @@ class Glm47ToolParser(ToolParser):
     ) -> bool:
         """An open ``<tool_call>NAME`` whose name may reach the client: a call
         being written, not markup to release (postprocessor #1359 budget)."""
-        start = text.rfind("<tool_call>")
-        if start < 0 or "</tool_call>" in text[start:]:
+        start = text.rfind(self._CALL_OPEN)
+        if start < 0 or self._CALL_CLOSE in text[start:]:
             return False
-        first_open = text.rfind("</tool_call>", 0, start)
-        if text.count("<tool_call>", first_open + 1, start) > 0:
+        first_open = text.rfind(self._CALL_CLOSE, 0, start)
+        if text.count(self._CALL_OPEN, first_open + 1, start) > 0:
             return False  # more than one open block: not ONE call in progress
         header = self._CALL_HEADER.match(text, start)
         if header is None or inside_code(text, start):
