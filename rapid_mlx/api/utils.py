@@ -651,7 +651,9 @@ def clean_output_text(text: str, *, muse_wire: bool = False) -> str:
         return (content or "").strip()
 
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
-    text = text.strip()
+    # No outer ``.strip()``: the non-streamed answer must be the same bytes
+    # the streamed deltas concatenate to (lz.16). The trim cut a code
+    # answer's final newline and any leading indentation.
 
     # Add opening <think> tag if response has closing but not opening
     # This happens when enable_thinking=True in the chat template
@@ -686,7 +688,9 @@ def strip_thinking_tags(text: str) -> str:
     """
     if not text:
         return text
-    return THINK_PATTERN.sub("", text).strip()
+    # Whitespace around the answer is kept (see ``clean_output_text``);
+    # ``THINK_PATTERN`` already eats the whitespace after a ``</think>``.
+    return THINK_PATTERN.sub("", text)
 
 
 def extract_json_from_response(text: str) -> str:
