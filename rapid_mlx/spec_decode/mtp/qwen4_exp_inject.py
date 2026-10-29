@@ -219,6 +219,11 @@ def inject_qwen4_exp_mtp_support(
                 mtp_cache,
                 return_hidden: bool = False,
             ):
+                vision = getattr(self.model, "text_lane_vision", None)
+                if vision is not None:
+                    # Prefill hands the prompt's next ids here, image slot
+                    # ids included; the head embeds them as image_token_id.
+                    next_token_ids = vision.map_ids(next_token_ids)
                 token_embeddings = self.model.embed_tokens(next_token_ids)
                 sample_hidden, multi_hidden = self.mtp(
                     hidden_states, token_embeddings, mtp_cache

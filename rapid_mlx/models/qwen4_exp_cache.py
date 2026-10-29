@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import mlx.core as mx
 
@@ -202,6 +203,30 @@ class QSAIndexCache(ArraysCache):
         self._right_padding: list[int] | None = None
         self._pending_left_padding = [int(item) for item in (left_padding or [0])]
         self.rollback_state = None
+        # Per-row image layout (qwen4_exp_vision.ImageSpan) for multimodal
+        # RoPE on the text lane; empty rows for every text-only sequence.
+        self._rope_spans = [[] for _ in range(batch)]
+
+    @property
+    def rope_spans(self) -> list[list[Any]]:
+        spans = getattr(self, "_rope_spans", None)
+        if spans is None or len(spans) != len(self._offsets):
+            spans = [[] for _ in self._offsets]
+            self._rope_spans = spans
+        return spans
+
+    @rope_spans.setter
+    def rope_spans(self, value) -> None:
+        self._rope_spans = [list(row) for row in value]
+
+    def _drop_rope_spans_from_offsets(self) -> None:
+        if any(self.rope_spans):
+            from .qwen4_exp_vision import drop_spans_from
+
+            self._rope_spans = [
+                drop_spans_from(row, offset)
+                for row, offset in zip(self.rope_spans, self._offsets)
+            ]
 
     def _ensure_batch(self, batch: int):
         """Adopt mlx-lm's fresh-batch size before state is committed."""
@@ -214,6 +239,7 @@ class QSAIndexCache(ArraysCache):
         self._offsets = [0] * batch
         self._compressed_counts = [0] * batch
         self._pending_left_padding = [int(item) for item in self.left_padding.tolist()]
+        self._rope_spans = [[] for _ in range(batch)]
 
     @property
     def raw_ring(self):
@@ -459,14 +485,18 @@ class QSAIndexCache(ArraysCache):
 
     @property
     def meta_state(self):
-        return json.dumps(
-            {
-                "compress_ratio": self.compress_ratio,
-                "offsets": self._offsets,
-                "compressed_counts": self._compressed_counts,
-            },
-            separators=(",", ":"),
-        )
+        meta = {
+            "compress_ratio": self.compress_ratio,
+            "offsets": self._offsets,
+            "compressed_counts": self._compressed_counts,
+        }
+        # Only image-bearing sequences carry the key, so a text-only cache's
+        # meta_state stays byte-identical to the pre-vision format.
+        if any(self.rope_spans):
+            meta["rope_spans"] = [
+                [span.to_json() for span in row] for row in self.rope_spans
+            ]
+        return json.dumps(meta, separators=(",", ":"))
 
     @meta_state.setter
     def meta_state(self, value):
@@ -474,6 +504,15 @@ class QSAIndexCache(ArraysCache):
         self.compress_ratio = int(decoded["compress_ratio"])
         self._offsets = [int(item) for item in decoded["offsets"]]
         self._compressed_counts = [int(item) for item in decoded["compressed_counts"]]
+        if decoded.get("rope_spans"):
+            from .qwen4_exp_vision import ImageSpan
+
+            self._rope_spans = [
+                [ImageSpan.from_json(span) for span in row]
+                for row in decoded["rope_spans"]
+            ]
+        else:
+            self._rope_spans = [[] for _ in self._offsets]
         self._valid_until = None
         self._right_padding = None
         self._pending_left_padding = [0] * len(self._offsets)
@@ -562,6 +601,7 @@ class QSAIndexCache(ArraysCache):
         self._compressed_counts = [
             offset // self.compress_ratio for offset in self._offsets
         ]
+        self._drop_rope_spans_from_offsets()
         return n
 
     def size(self):
@@ -580,7 +620,9 @@ class QSAIndexCache(ArraysCache):
             if isinstance(batch_indices, mx.array)
             else list(batch_indices)
         )
+        spans = self.rope_spans
         super().filter(batch_indices)
+        self._rope_spans = [list(spans[index]) for index in indices]
         self._offsets = [self._offsets[index] for index in indices]
         self._compressed_counts = [self._compressed_counts[index] for index in indices]
         self._pending_left_padding = [
@@ -604,6 +646,7 @@ class QSAIndexCache(ArraysCache):
         self._offsets = merged._offsets
         self._compressed_counts = merged._compressed_counts
         self._pending_left_padding = merged._pending_left_padding
+        self._rope_spans = merged.rope_spans
         self._valid_until = self._right_padding = None
 
     def extract(self, idx):
@@ -618,6 +661,7 @@ class QSAIndexCache(ArraysCache):
         cache._offsets = [self._offsets[idx]]
         cache._compressed_counts = [count]
         cache._pending_left_padding = [0]
+        cache._rope_spans = [list(self.rope_spans[idx])]
         return cache
 
     @classmethod
@@ -631,6 +675,7 @@ class QSAIndexCache(ArraysCache):
         merged._offsets = [cache._offsets[0] for cache in caches]
         merged._compressed_counts = [cache._compressed_counts[0] for cache in caches]
         merged._pending_left_padding = [0] * len(caches)
+        merged._rope_spans = [list(cache.rope_spans[0]) for cache in caches]
         max_offset = max(merged._offsets, default=0)
         merged.left_padding = mx.array(
             [max_offset - offset for offset in merged._offsets], dtype=mx.int32

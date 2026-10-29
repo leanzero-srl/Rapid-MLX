@@ -301,6 +301,9 @@ def _qsa_trim(self, n, *, verify_size=None, validate: bool = True):
     self._compressed_counts = [
         offset // self.compress_ratio for offset in self._offsets
     ]
+    drop_spans = getattr(self, "_drop_rope_spans_from_offsets", None)
+    if drop_spans is not None:
+        drop_spans()
     return drops
 
 
