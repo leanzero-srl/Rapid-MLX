@@ -24,6 +24,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from ..api.errors import GuidedGenerationCancelledError
@@ -1005,6 +1006,65 @@ def _should_start_qwen36_native_text_cache(
     )
 
 
+TEXT_LANE_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+
+def _resolve_text_lane_image(source: Any) -> str:
+    """Local file of one request image (data URL, http(s), file://, path).
+
+    The single engine's own resolver (size caps, SSRF guard, local paths
+    only under RAPID_MLX_MEDIA_ROOT); ``file://`` is its local-path branch.
+    """
+    from urllib.parse import unquote, urlparse
+
+    from ..models.mllm import process_image_input
+
+    if isinstance(source, dict):
+        source = source.get("url") or source.get("image_url") or ""
+        if isinstance(source, dict):
+            source = source.get("url") or ""
+    if isinstance(source, str) and source.startswith("file://"):
+        source = unquote(urlparse(source).path)
+    return process_image_input(source)
+
+
+def _attach_text_lane_vision(model: Any, checkpoint_source: Any, model_name: str):
+    """Load the checkpoint's vision tower and attach it to the decoder."""
+    from ..model_metadata import read_model_metadata
+    from ..models.qwen4_exp_vision import TextLaneVision, load_vision_tower
+
+    directory = None
+    for candidate in (checkpoint_source, model_name):
+        if candidate and (Path(str(candidate)) / "config.json").is_file():
+            directory = Path(str(candidate))
+            break
+    if directory is None:
+        metadata = read_model_metadata(model_name)
+        snapshot = getattr(metadata, "snapshot_dir", None)
+        if snapshot is not None:
+            directory = Path(snapshot)
+    if directory is None:
+        raise RuntimeError(f"text-lane vision: no local checkpoint for {model_name}")
+    decoder = getattr(getattr(model, "language_model", None), "model", None)
+    if decoder is None or not hasattr(type(decoder), "text_lane_vision"):
+        raise RuntimeError(
+            f"text-lane vision: {type(model).__name__} has no image-aware decoder"
+        )
+    tower = load_vision_tower(directory)
+    if tower is None:
+        raise RuntimeError(f"text-lane vision: {directory} declares no vision tower")
+    vision = TextLaneVision(tower)
+    decoder.text_lane_vision = vision
+    logger.info(
+        "Text-lane vision: %s vision tower attached (%.2f GiB, image token %d); "
+        "image requests keep MTP, prompt lookup, batching and the prefix cache",
+        directory.name,
+        tower.parameter_bytes / 2**30,
+        tower.image_token_id,
+    )
+    return vision
+
+
 class BatchedEngine(BaseEngine):
     """
     Batched engine for continuous batching.
@@ -1139,6 +1199,9 @@ class BatchedEngine(BaseEngine):
                 is_mllm=self._is_mllm,
             )
         self._serving_lane_reason = serving_lane_reason
+        # Image input served on the TEXT lane (reason ``text_lane_vision``):
+        # set by _start_llm, see models/qwen4_exp_vision.TextLaneVision.
+        self._text_lane_vision = None
         self._tool_logits_processor_factory = None
 
         self._model = None
@@ -1209,6 +1272,23 @@ class BatchedEngine(BaseEngine):
     def serving_lane_reason(self) -> str | None:
         """Stable reason supplied by the shared serving-lane contract."""
         return self._serving_lane_reason
+
+    @property
+    def text_lane_vision(self):
+        """The text lane's image glue, or None when it serves text only."""
+        return self._text_lane_vision
+
+    @property
+    def accepts_images(self) -> bool:
+        """Whether an image part reaches the model (either lane)."""
+        return bool(self._is_mllm or self._text_lane_vision is not None)
+
+    @property
+    def image_placeholder(self) -> str | None:
+        """Text the chat route writes where an image sat (text lane only)."""
+        if self._text_lane_vision is None:
+            return None
+        return TEXT_LANE_IMAGE_PLACEHOLDER
 
     @property
     def is_mllm(self) -> bool:
@@ -2222,6 +2302,16 @@ class BatchedEngine(BaseEngine):
             **_pin_kwargs,
         )
 
+        if self._serving_lane_reason == "text_lane_vision":
+            # The vision tower loads on the model worker (MLX streams) and
+            # attaches to the decoder before MTP injection and the scheduler.
+            self._text_lane_vision = self._model_load_executor.submit(
+                _attach_text_lane_vision,
+                self._model,
+                checkpoint_source,
+                self._model_name,
+            ).result()
+
         # 0.9.13 PR-A: new-arch MTP inject dispatcher (Gemma 4 external
         # assistant / Qwen3.5 baked-in MTP). Runs BEFORE the scheduler is
         # built so ``_install_mtp_vendored`` in scheduler.py sees the
@@ -2794,6 +2884,35 @@ class BatchedEngine(BaseEngine):
             and (getattr(self, "_engine", None) is None or images or videos)
         )
 
+    async def _expand_text_lane_images(
+        self, prompt: str | list[int], images: list[Any], kwargs: dict[str, Any]
+    ) -> list[int]:
+        """Prompt ids with each image's slot ids in place of its placeholder.
+
+        Moves ``prefix_boundary`` into the expanded token space and protects
+        the prompt from compression (an image is all-or-nothing).
+        """
+        vision = self._text_lane_vision
+        tokenizer = self.tokenizer
+        encoder = tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer
+
+        def expand() -> tuple[list[int], int]:
+            ids = (
+                [int(token) for token in prompt]
+                if isinstance(prompt, list)
+                else [int(token) for token in encoder.encode(prompt)]
+            )
+            paths = [_resolve_text_lane_image(image) for image in images]
+            return vision.expand_prompt(
+                ids, paths, int(kwargs.get("prefix_boundary", 0) or 0)
+            )
+
+        ids, boundary = await asyncio.to_thread(expand)
+        if kwargs.get("prefix_boundary"):
+            kwargs["prefix_boundary"] = boundary
+        kwargs["requires_prompt_integrity"] = True
+        return ids
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -2823,6 +2942,9 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        if images and self._text_lane_vision is not None:
+            prompt = await self._expand_text_lane_images(prompt, images, kwargs)
+            images = None
         admission_token, owns_admission = self._ensure_generation_admission()
 
         def request_committed() -> None:
@@ -3093,6 +3215,9 @@ class BatchedEngine(BaseEngine):
         # disconnect. Popped from kwargs so it never reaches the
         # scheduler's add_request (which would reject unknown kwargs).
         request_id_holder = kwargs.pop("request_id_holder", None)
+        if images and self._text_lane_vision is not None:
+            prompt = await self._expand_text_lane_images(prompt, images, kwargs)
+            images = None
         admission_token, owns_admission = self._ensure_generation_admission()
         request_committed = False
 

@@ -295,6 +295,10 @@ def _engine_is_mllm_or_none(engine: object | None) -> bool | None:
     """
     if engine is None:
         return None
+    # A text lane that serves images itself (``text_lane_vision``) reads
+    # images exactly like the vision lane does: advertise it.
+    if getattr(engine, "accepts_images", None) is True:
+        return True
     is_mllm = getattr(engine, "is_mllm", None)
     return is_mllm if isinstance(is_mllm, bool) else None
 

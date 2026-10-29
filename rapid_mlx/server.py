@@ -2585,7 +2585,13 @@ def load_model(
     # (``force_text``) and the automatic hybrid-backbone downgrade
     # (``_auto_text_fallback``). Kept as separate inputs above so the log lines
     # attribute the reason correctly; combined here to select the final lane.
-    _effective_force_text = force_text or _auto_text_fallback
+    # ``text_lane_vision``: a vision checkpoint whose images the text lane
+    # serves itself (qwen4_exp) — the engine must not re-detect it as MLLM.
+    _effective_force_text = (
+        force_text
+        or _auto_text_fallback
+        or _serving_lane_reason == "text_lane_vision"
+    )
 
     # Modality dispatch: ``text-diffusion`` aliases route to the
     # discrete-text-diffusion engine (mlx-vlm DiffusionGemma path).
@@ -2844,7 +2850,9 @@ async def _load_dynamic_resident_model(
         resolved_path = serving_checkpoint.model_path
         load_path = serving_checkpoint.load_path
         effective_force_text = (
-            profile_force_text or serving_checkpoint.auto_text_fallback
+            profile_force_text
+            or serving_checkpoint.auto_text_fallback
+            or serving_checkpoint.lane_reason == "text_lane_vision"
         )
         serving_lane_reason = serving_checkpoint.lane_reason
         # Runtime residency is a second model-load entry point used by the

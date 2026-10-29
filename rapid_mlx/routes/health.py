@@ -392,6 +392,12 @@ def _text_only_image_stats() -> dict:
     return text_only_image_stats()
 
 
+def _text_lane_vision_stats(engine) -> dict | None:
+    vision = getattr(engine, "text_lane_vision", None)
+    stats = getattr(vision, "stats", None)
+    return stats() if callable(stats) else None
+
+
 def _text_only_image_policy() -> str:
     from ..api.text_only_images import text_only_image_policy
 
@@ -485,9 +491,13 @@ async def status():
         # Text-only image notice (LeanZero fork): how many image parts a
         # text-only engine swapped for a text notice instead of a 400.
         "text_only_images_replaced": _text_only_image_stats()["images_replaced"],
+        "text_lane_vision": _text_lane_vision_stats(cfg.engine),
         "text_only_image": {
             "policy": _text_only_image_policy(),
-            "serving_text_only": not bool(getattr(cfg.engine, "is_mllm", False)),
+            "serving_text_only": not (
+                bool(getattr(cfg.engine, "is_mllm", False))
+                or getattr(cfg.engine, "accepts_images", False) is True
+            ),
             **_text_only_image_stats(),
         },
         "requests": stats.get("requests", []),

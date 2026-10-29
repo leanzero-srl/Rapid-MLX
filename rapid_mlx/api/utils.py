@@ -5,8 +5,10 @@ Utility functions for text processing and model detection.
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging.version import InvalidVersion, Version
@@ -1298,6 +1300,66 @@ def mllm_arch_unsupported_but_text_vendored(model_name: str) -> bool:
     return spec is None
 
 
+# Vision checkpoints whose images the TEXT lane serves itself (MTP, prompt
+# lookup, PLE offload, batching and the prefix cache stay on): the decoder
+# reads image slot ids, see rapid_mlx.models.qwen4_exp_vision.TextLaneVision.
+TEXT_LANE_VISION_MODEL_TYPES = frozenset({"qwen4_exp"})
+
+
+def text_lane_vision_supported(model_name: str) -> bool:
+    """True iff this checkpoint's images are served on the text lane.
+
+    Offline: the cached config declares a vision tower for a model type in
+    ``TEXT_LANE_VISION_MODEL_TYPES``, the shard index carries its tensors,
+    and mlx-vlm (tower + image processor) is importable.  The env switch
+    ``RAPID_MLX_TEXT_LANE_VISION=0`` turns it off (the checkpoint then routes
+    as before this lane existed).
+    """
+    if os.environ.get("RAPID_MLX_TEXT_LANE_VISION", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        return False
+    try:
+        metadata = read_model_metadata(model_name)
+    except Exception:  # noqa: BLE001 - routing probes never raise
+        return False
+    config = metadata.config if metadata is not None else None
+    if not isinstance(config, dict):
+        return False
+    if config.get("model_type") not in TEXT_LANE_VISION_MODEL_TYPES:
+        return False
+    if not config.get("vision_config") or config.get("language_model_only", False):
+        return False
+    snapshot = getattr(metadata, "snapshot_dir", None)
+    if snapshot is None:
+        return False
+    index = Path(snapshot) / "model.safetensors.index.json"
+    try:
+        weight_map = json.loads(index.read_text()).get("weight_map") or {}
+    except (OSError, ValueError):
+        return False
+    if not any(
+        key.startswith(("model.visual.", "vision_tower.")) for key in weight_map
+    ):
+        return False
+    import importlib.util as _importlib_util
+
+    try:
+        return all(
+            _importlib_util.find_spec(name) is not None
+            for name in (
+                "mlx_vlm.models.qwen4_exp",
+                "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
+                "PIL",
+            )
+        )
+    except (ImportError, ValueError):
+        return False
+
+
 def mllm_backbone_cache_mode(model_name: str) -> str | None:
     """Return the MLLM cache mode implied by checkpoint architecture metadata.
 
@@ -1391,6 +1453,7 @@ SERVING_LANE_REASONS = frozenset(
         "text_lane_forced",
         "text_checkpoint",
         "text_lane_speculative_decode",
+        "text_lane_vision",
         # resolve_serving_lane_decision — vision lane
         "vision_lane_forced",
         "vision_architecture_unavailable",
@@ -1509,6 +1572,11 @@ def resolve_serving_lane_decision(
     """
     if force_text:
         return ServingLaneDecision(False, "text_lane_forced")
+    # A vision checkpoint whose images the text lane serves: the text lane
+    # keeps every speculative decoder and the batching/prefix-cache machinery,
+    # so it outranks the serialized MLLM lane unless --mllm demands that.
+    if not force_mllm and text_lane_vision_supported(model_name):
+        return ServingLaneDecision(False, "text_lane_vision")
     # A requested speculative decoder is only honoured by the text lane
     # (``_start_llm`` consumes ``scheduler_config.spec_decode``; ``_start_mllm``
     # never reads it).  Give it the same precedence as force_text — above
@@ -1892,6 +1960,7 @@ def _content_to_text(content) -> str:
 def extract_multimodal_content(
     messages: list[Message],
     preserve_native_format: bool = False,
+    image_placeholder: str | None = None,
 ) -> tuple[list[dict], list[str], list[str]]:
     """
     Extract text content, images, and videos from OpenAI-format messages.
@@ -1914,6 +1983,10 @@ def extract_multimodal_content(
         - processed_messages: List of {"role": str, "content": str}
         - images: List of image URLs/paths/base64
         - videos: List of video URLs/paths/base64
+
+    ``image_placeholder`` (the text lane's image glue, e.g. qwen4_exp) is
+    written into the flattened text exactly where each image sat, so the
+    rendered prompt carries one placeholder per image, in image order.
     """
     processed_messages = []
     images = []
@@ -2059,11 +2132,15 @@ def extract_multimodal_content(
 
                 elif item_type == "image_url":
                     images.append(_extract_object_url(item, "image_url"))
+                    if image_placeholder is not None:
+                        text_parts.append(image_placeholder)
 
                 elif item_type == "image":
                     images.append(
                         _require_string(item.get("image", item.get("url")), "image")
                     )
+                    if image_placeholder is not None:
+                        text_parts.append(image_placeholder)
 
                 elif item_type == "input_image":
                     image_url = item.get("image_url")
@@ -2077,6 +2154,8 @@ def extract_multimodal_content(
                         images.append(
                             _require_string(image_url, "input_image.image_url")
                         )
+                    if image_placeholder is not None:
+                        text_parts.append(image_placeholder)
 
                 elif item_type == "video":
                     videos.append(
@@ -2091,8 +2170,15 @@ def extract_multimodal_content(
                         "Audio content blocks are not supported on this path."
                     )
 
-            # Combine text parts
-            combined_text = "\n".join(text_parts) if text_parts else ""
+            # Combine text parts.  With image placeholders the parts join
+            # with no separator, as the checkpoint's own template renders a
+            # content list (text and <|vision_start|>... back to back).
+            joiner = (
+                ""
+                if image_placeholder is not None and image_placeholder in text_parts
+                else "\n"
+            )
+            combined_text = joiner.join(text_parts) if text_parts else ""
             processed_messages.append({"role": role, "content": combined_text})
         else:
             # Unknown format, try to convert

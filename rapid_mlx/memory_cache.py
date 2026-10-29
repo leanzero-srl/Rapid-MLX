@@ -156,6 +156,18 @@ _OPTIONAL_STATE_METADATA = "__rapid_mlx_optional_state_v1"
 _VENDORED_STATE_METADATA = "__rapid_mlx_vendored_cache_classes_v1"
 
 
+# Token ids at or above this value are process-local image slot ids
+# (rapid_mlx.models.qwen4_exp_vision.IMAGE_ID_BASE); no vocabulary reaches it.
+PROCESS_LOCAL_TOKEN_ID_BASE = 1 << 24
+
+
+def _holds_process_local_token_ids(tokens_key) -> bool:
+    try:
+        return bool(tokens_key) and max(tokens_key) >= PROCESS_LOCAL_TOKEN_ID_BASE
+    except (TypeError, ValueError):
+        return False
+
+
 def _vendored_cache_class_names(cache: list[Any]) -> set[str]:
     """Return vendored cache types present in a possibly nested cache list."""
     found: set[str] = set()
@@ -3237,7 +3249,14 @@ class MemoryAwarePrefixCache:
         # docstring contract — auto-detect and adapt instead of
         # raising TypeError. Codex PR #667 round 3 BLOCKING-2.
         check_abort = _adapt_should_abort(should_abort)
-        entries_to_save = list(self._entries.items())
+        # Image slot ids (rapid_mlx.models.qwen4_exp_vision.IMAGE_ID_BASE and
+        # up) name images registered in THIS process; another process would
+        # read them as different pictures, so those entries never reach disk.
+        entries_to_save = [
+            item
+            for item in self._entries.items()
+            if not _holds_process_local_token_ids(item[0])
+        ]
         lru_rank = {tokens_key: rank for rank, tokens_key in enumerate(self._entries)}
         saved_lru_rank: dict[int, int] = {}
         if check_abort is not None:

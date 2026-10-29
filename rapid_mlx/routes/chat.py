@@ -4151,7 +4151,11 @@ async def _create_chat_completion_impl(
     # mixed text+image tool reply keeps its text), before the capability
     # validator, and before any template render / prefix-cache keying. The
     # notice is deterministic, so replays of the same image still cache-hit.
-    if should_replace_images(engine):
+    # A text lane that serves images itself (``text_lane_vision``) keeps them.
+    _text_lane_images = getattr(engine, "accepts_images", False) is True and (
+        getattr(engine, "is_mllm", False) is not True
+    )
+    if should_replace_images(engine) and not _text_lane_images:
         record_text_only_image_replacements(
             replace_images_in_openai_messages(request.messages),
             route="/v1/chat/completions",
@@ -4506,7 +4510,7 @@ async def _create_chat_completion_impl(
         validate_content_blocks_for_capabilities(
             request.messages,
             model_name=cfg.model_name,
-            allow_image=engine.is_mllm,
+            allow_image=engine.is_mllm or _text_lane_images,
             allow_video=engine.is_mllm,
             allow_audio=False,
         )
@@ -4539,9 +4543,13 @@ async def _create_chat_completion_impl(
             decode_inline_tool_call_arguments(messages)
         logger.debug(f"MLLM: Processing {len(messages)} messages")
     else:
+        _placeholder = getattr(engine, "image_placeholder", None)
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
+            image_placeholder=_placeholder
+            if _text_lane_images and isinstance(_placeholder, str)
+            else None,
         )
 
     has_media = bool(images or videos)

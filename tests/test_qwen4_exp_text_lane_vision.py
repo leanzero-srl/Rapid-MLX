@@ -523,3 +523,81 @@ def test_mtp_head_embeds_image_ids_as_the_image_token(loaded, tmp_path):
         assert vision.map_ids(ids).tolist() == [[IMAGE, 7, IMAGE]]
     finally:
         _detach(model)
+
+
+# ---------------------------------------------------------------------------
+# Lane, route and persistence contracts
+# ---------------------------------------------------------------------------
+
+
+def test_a_qwen4_vision_checkpoint_takes_the_text_lane_with_its_images(
+    vision_checkpoint, monkeypatch
+):
+    from rapid_mlx.api.utils import resolve_serving_lane_decision
+
+    path = str(vision_checkpoint)
+    for spec in ("none", "mtp"):
+        decision = resolve_serving_lane_decision(path, requested_spec_decode=spec)
+        assert (decision.is_mllm, decision.reason) == (False, "text_lane_vision")
+        assert decision.auto_text_fallback is False
+    forced = resolve_serving_lane_decision(path, force_text=True)
+    assert forced.reason == "text_lane_forced"
+    assert resolve_serving_lane_decision(path, force_mllm=True).reason != (
+        "text_lane_vision"
+    )
+    monkeypatch.setenv("RAPID_MLX_TEXT_LANE_VISION", "0")
+    assert resolve_serving_lane_decision(path).reason != "text_lane_vision"
+
+
+def test_a_checkpoint_without_tower_tensors_is_not_promised_images(
+    vision_checkpoint, tmp_path
+):
+    import shutil
+
+    from rapid_mlx.api.utils import text_lane_vision_supported
+
+    copy = tmp_path / "no-tower"
+    shutil.copytree(vision_checkpoint, copy)
+    index = json.loads((copy / "model.safetensors.index.json").read_text())
+    index["weight_map"] = {
+        key: value
+        for key, value in index["weight_map"].items()
+        if not key.startswith("model.visual.")
+    }
+    (copy / "model.safetensors.index.json").write_text(json.dumps(index))
+    assert text_lane_vision_supported(str(vision_checkpoint)) is True
+    assert text_lane_vision_supported(str(copy)) is False
+
+
+def test_the_route_writes_a_placeholder_where_each_image_sat():
+    from rapid_mlx.api.utils import extract_multimodal_content
+    from rapid_mlx.engine.batched import TEXT_LANE_IMAGE_PLACEHOLDER as P
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,BB"}},
+            ],
+        }
+    ]
+    flat, images, _ = extract_multimodal_content(messages, image_placeholder=P)
+    assert flat[0]["content"] == f"look:{P}and{P}"
+    assert len(images) == 2
+    plain, _, _ = extract_multimodal_content(messages)
+    assert plain[0]["content"] == "look:\nand"
+
+
+def test_image_bearing_prefix_entries_never_reach_disk():
+    from rapid_mlx.memory_cache import (
+        PROCESS_LOCAL_TOKEN_ID_BASE,
+        _holds_process_local_token_ids,
+    )
+
+    assert PROCESS_LOCAL_TOKEN_ID_BASE == IMAGE_ID_BASE
+    assert _holds_process_local_token_ids((1, 2, IMAGE_ID_BASE + 3)) is True
+    assert _holds_process_local_token_ids((1, 2, 248_319)) is False
+    assert _holds_process_local_token_ids(()) is False
