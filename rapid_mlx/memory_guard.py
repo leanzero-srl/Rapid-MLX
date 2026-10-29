@@ -161,6 +161,11 @@ REAPPLY_RATIO = 0.05
 # pairs exist (at 25% spans the run-to-run noise is a ~10% slope error; at a
 # shorter span it would dominate), and an overshoot raise decays back to it.
 SLOPE_MIN_SPAN_CHUNKS = 4
+# A (batch x chunk) group this large whose slope stays under one layer's KV
+# copy votes a = 0 instead of being dropped (``PeakModel._fit``): 4 whole
+# KV allocation steps, so a chunk this size cannot sit inside a buffer's
+# slack (the 13-48-token tails that drove ``a`` to 0 on Gabee are far below).
+FLAT_GROUP_MIN_TOKENS = 4 * KV_ALLOC_STEP_TOKENS
 SLOPE_MIN_SPAN_FRACTION = 0.25
 # Observations kept per (batch, chunk) group for pair slopes, and per
 # prefill-token count for the residual window: older ones age out, so the
@@ -435,7 +440,23 @@ class PeakModel:
         # each turn (slopes 0.5-3 kB < 4 kB) took ``a`` from ~46 to 21.6 and
         # a 1567 x 111,179 step was planned 2.01 GB short, over the ceiling.
         # Its observations still bound its own size (the residual window).
-        groups = [(u, sl) for u, sl in self._group_slopes() if sl >= g]
+        groups = []
+        for u, sl in self._group_slopes():
+            if sl >= g:
+                groups.append((u, sl))
+            elif u >= FLAT_GROUP_MIN_TOKENS:
+                # A chunk of several KV steps always grows the buffer, so a
+                # slope under one layer's copy here is not slack: the step's
+                # peak does not grow with the context in this range (the copy
+                # happens beside, not on top of, the activation peak). It
+                # votes "no attention term" (slope = g, a = 0); the residual
+                # window carries the measured transient and follows it up as
+                # the context grows. Workmule Flash-Next, the real Gauntlet
+                # session replayed (2026-10-29): 15 chunks of 2,048 from 2k
+                # to 44k context all measured 2.69-2.98 GB, the group was
+                # dropped, the 192 B/unit prior stayed (projected 18.7 GB for
+                # a 2.8 GB step) and the session was throttled and refused.
+                groups.append((u, g))
         if not groups:
             return None
         sizes = {u for u, _s in groups}

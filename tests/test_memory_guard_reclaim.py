@@ -230,3 +230,53 @@ def test_a_reduced_chunk_on_the_prior_is_a_power_of_two_of_the_floor(calibrated)
         ).chunk == plan.chunk + 1
     else:
         assert is_pow2_of_floor, plan.chunk
+
+
+# The real session's 2,048-token chunks (RAPID_MLX_GUARD_TRACE=1, the
+# Gauntlet conversation replayed on the workmule): context, measured GB.
+_FLAT_2048 = [
+    (2048, 2.976), (4096, 2.938), (6144, 2.937), (8192, 2.937), (10240, 2.937),
+    (12288, 2.937), (15341, 2.823), (17389, 2.967), (19437, 2.966),
+    (22632, 2.692), (28284, 2.764), (31026, 2.790), (33074, 2.968),
+    (35122, 2.968), (43998, 2.794),
+]
+
+
+def _workmule_prior() -> PeakPrior:
+    # The engine's prior for Jundot/Qwen3.8-Flash-Next-oQ4e-mtp (its log).
+    return PeakPrior(
+        attention_bytes_per_unit=192.0,
+        token_bytes=107_776.0,
+        kv_copy_bytes_per_context=2048.0,
+    )
+
+
+def test_a_flat_full_chunk_group_calibrates_instead_of_being_dropped():
+    """RED on ple.5: the group's median slope is under one layer's KV copy,
+    so it was dropped, the model stayed on the prior and projected 18.7 GB
+    for the 2.8 GB step at 44k (and 12.4 GB for a sub-GB step at 240k).
+    GREEN: it votes a = 0; the residual window holds the measured step."""
+    from rapid_mlx.memory_guard import PeakModel
+
+    model = PeakModel(_workmule_prior(), fit_floor_tokens=256)
+    for context, gb in _FLAT_2048:
+        model.observe(StepShape(1, 2048, context), int(gb * 1e9), fit=True)
+    assert model.calibrated
+    assert model.attention_bytes_per_unit == 0.0
+    # Every measured step is still covered by its projection (within the
+    # model's own 10% error bound), and the 44k step is no longer 18.7 GB.
+    for context, gb in _FLAT_2048:
+        assert model.project(StepShape(1, 2048, context)) >= 0.9 * gb * 1e9
+    assert model.project(StepShape(1, 2048, 43998)) < 4e9
+
+
+def test_flat_tail_groups_still_do_not_vote():
+    """The Gabee rule stands for chunks inside a buffer's slack: a group of
+    48-token tails with a slope under the copy is dropped, not a vote."""
+    from rapid_mlx.memory_guard import PeakModel
+
+    model = PeakModel(_workmule_prior(), fit_floor_tokens=8)
+    for i in range(16):
+        context = 4000 + 2000 * i
+        model.observe(StepShape(1, 48, context), int(5e6), fit=True)
+    assert not model.calibrated
