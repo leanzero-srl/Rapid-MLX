@@ -1153,20 +1153,6 @@ class MemoryGuard:
                     best, lo = mid, mid + 1
                 else:
                     hi = mid - 1
-            if not self.model.calibrated:
-                # Still on the PRIOR: reduce to a power-of-two multiple of the
-                # floor, so the reduced steps fall into a few (batch, chunk)
-                # groups and the pair fit can replace the prior. The largest
-                # chunk that fits moved by a few tokens every step (2015,
-                # 1888, 1824 ... 375, 374, 373), each a group of ONE: the
-                # workmule Flash-Next Gauntlet (2026-10-29) never calibrated
-                # in 2 h, planned 12.4 GB for a <1 GB step on the 192 B/unit
-                # prior (measured 0.2-13), prefilled 256-token chunks and
-                # refused a 241,320-token turn that fits.
-                snapped = floor
-                while snapped * 2 <= best:
-                    snapped *= 2
-                best = snapped
             chunk = best
             ok, shape, transient, margin = fits(chunk, fp)
         if chunk < start:

@@ -16,10 +16,11 @@ goose then compacted 241k -> 4k. A fresh engine on the same Mac admitted
 391,493 tokens (peak 96.46 GB). Two causes, both in this file:
 
 1. The step was priced on the PRIOR (192 B per chunk x context; this model
-   measures 0.2-13): in 2 h of turns the guard never calibrated once. Every
-   goose prefill step is the FIRST chunk of a turn (a prefix hit), and those
-   steps were kept out of the fit; once the prior shrank the chunk, each
-   step had a new chunk size (2015, 1888 ... 375, 374), a group of one.
+   measures 0-13): in 2 h of turns the guard never calibrated once. Most
+   goose prefill steps are the FIRST chunk of a turn (a prefix hit), kept
+   out of the fit; and the full 2,048-token chunks it did see measured FLAT
+   (2.7-3.0 GB from 2k to 44k context), a slope under one layer's KV copy,
+   so their group was dropped as buffer slack.
 2. The only entry left was the hit itself (6.34 GB). qwen4_exp's caches are
    not admitted by the singleton pass-through, so the hit cannot be handed
    over: admission copies it, and that copy was charged on top. Alone from
@@ -32,11 +33,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 
 from rapid_mlx.memory_guard import (
-    GuardProbe,
-    MemoryGuard,
     PeakPrior,
     RowPlan,
     StepShape,
@@ -181,55 +179,6 @@ def test_hit_step_transient_excludes_the_measured_copy():
     assert scheduler_mod.Scheduler._memguard_hit_step_transient(
         fake, plan, peak, 7 * gb, 6 * gb
     ) == (7 * gb, 6 * gb)
-
-
-def _probe(fp: int) -> GuardProbe:
-    return GuardProbe(
-        active=lambda: fp,
-        cache=lambda: 0,
-        clear_cache=lambda: None,
-        entry_count=lambda: 0,
-        evict_one=lambda level: False,
-    )
-
-
-@pytest.mark.parametrize("calibrated", [False, True])
-def test_a_reduced_chunk_on_the_prior_is_a_power_of_two_of_the_floor(calibrated):
-    """On the prior the reduced chunk snaps down to floor x 2^k so the steps
-    group and the fit can take over; once calibrated, the largest chunk that
-    fits (unchanged)."""
-    prior = PeakPrior(
-        attention_bytes_per_unit=192.0,
-        token_bytes=100_000.0,
-        kv_copy_bytes_per_context=2048.0,
-    )
-    guard = MemoryGuard(prior, floor_tokens=256)
-    if calibrated:
-        guard.model._a_learned = 192.0
-        guard.model._b_learned = 2048.0
-    ceiling = 100 * 10**9
-    row = RowPlan(
-        request_id="r",
-        offset=60_000,
-        segment=2048,
-        chunk_cap=0,
-        chunk_floor=0,
-        prompt_tokens=62_048,
-        admit_bytes=0,
-        admitting=False,
-        arrival=0.0,
-    )
-    plan = guard.plan([row], configured_chunk=2048, ceiling=ceiling, probe=_probe(80 * 10**9))
-    assert plan.refuse is None
-    assert 256 <= plan.chunk < 2048
-    is_pow2_of_floor = (plan.chunk // 256) & (plan.chunk // 256 - 1) == 0 and plan.chunk % 256 == 0
-    if calibrated:
-        # The largest that fits: one more token would not.
-        assert not guard.plan(
-            [row], configured_chunk=plan.chunk + 1, ceiling=ceiling, probe=_probe(80 * 10**9)
-        ).chunk == plan.chunk + 1
-    else:
-        assert is_pow2_of_floor, plan.chunk
 
 
 # The real session's 2,048-token chunks (RAPID_MLX_GUARD_TRACE=1, the
