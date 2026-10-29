@@ -212,3 +212,60 @@ def test_default_off_is_noop():
     assert not cfg.any
     w = {"language_model.model.layers.0.mlp.experts.down_proj": mx.zeros((512, 2))}
     assert qo.sanitize_weights(w) is w
+
+
+MLXVLM_PLE_PREFIX = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.{}"
+
+
+@pytest.mark.parametrize(
+    "prefix,dtype",
+    [
+        (PLE_PREFIX, mx.bfloat16),
+        # mlx-vlm / oMLX spelling (Jundot/Qwen3.8-Flash-Next-oQ4e-mtp, 2026-10-29)
+        (MLXVLM_PLE_PREFIX, mx.bfloat16),
+        (MLXVLM_PLE_PREFIX, mx.float16),
+    ],
+)
+def test_ple_rows_bit_identical_for_every_checkpoint_spelling(tmp_path, monkeypatch, prefix, dtype):
+    parts, rows, dims = 4, 96, 160
+    mx.random.seed(0)
+    tensors = {}
+    for shard in range(parts):
+        q, s, b = mx.quantize(mx.random.normal((rows, dims)).astype(dtype), group_size=32, bits=4)
+        for leaf, value in (("weight", q), ("scales", s), ("biases", b)):
+            tensors[f"{prefix.format(shard)}.{leaf}"] = value
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    monkeypatch.setenv("RAPID_MLX_QWEN4_OFFLOAD_DIR", str(tmp_path))
+
+    resident = ShardedEmbedding(parts * rows, dims, parts)
+    nn.quantize(resident, group_size=32, bits=4)
+    resident.load_weights(
+        [
+            (f"shards.{i}.{leaf}", tensors[f"{prefix.format(i)}.{leaf}"])
+            for i in range(parts)
+            for leaf in ("weight", "scales", "biases")
+        ]
+    )
+    # Constructed with a WRONG layout on purpose: attach reads bits/group from the tensors.
+    offloaded = qo.OffloadedShardedEmbedding(rows, dims, parts, group_size=64, bits=8)
+    ids = mx.array(np.random.default_rng(1).integers(0, parts * rows, size=(2, 9, 16)), dtype=mx.int64)
+    ref, got = resident(ids), offloaded(ids)
+    assert (offloaded.bits, offloaded.group_size) == (4, 32)
+    assert got.dtype == ref.dtype == dtype
+    assert mx.array_equal(got, ref).item()
+
+
+def test_a_checkpoint_without_ple_tables_is_named(tmp_path):
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"x.weight": mx.zeros((1,))})
+    with pytest.raises(KeyError, match="shards.0.weight"):
+        qo.ple_shard_prefix(qo.CheckpointIndex(tmp_path), 1, 0)
+
+
+def test_sanitize_drops_both_ple_spellings(monkeypatch):
+    monkeypatch.setenv("RAPID_MLX_QWEN4_PLE_OFFLOAD", "1")
+    w = {
+        "model.language_model.layers.2.ple.ple_embedding.ngram_embedding.shard_0.weight": mx.zeros((2, 2)),
+        "language_model.model.layers.2.ple.ple_embedding.ngram_embedding.shards.127.scales": mx.zeros((2, 2)),
+        "language_model.model.layers.2.ple.key_proj.weight": mx.zeros((2, 2)),
+    }
+    assert list(qo.sanitize_weights(w)) == ["language_model.model.layers.2.ple.key_proj.weight"]

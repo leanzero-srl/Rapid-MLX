@@ -2145,7 +2145,7 @@ def test_qwen4_mtp_inject_fails_closed_on_guards_tensor_mismatch_and_exception(
     monkeypatch.setattr(
         inject,
         "_build_mtp",
-        lambda _inner: (_ for _ in ()).throw(RuntimeError("injected build failure")),
+        lambda _inner, *_rest: (_ for _ in ()).throw(RuntimeError("injected build failure")),
     )
     assert inject.inject_qwen4_exp_mtp_support(model, allow_random_init=True) is False
     assert "native MTP attachment failed" in caplog.text
@@ -2791,3 +2791,41 @@ def test_qwen4_restore_rollback_owns_the_kept_state_not_a_view_of_the_stack():
     assert not start <= address(restored) < start + stack.nbytes
     assert mx.allclose(restored, stack[:, 1]).item()
     assert cache.rollback_state is None
+
+
+def test_qwen4_mtp_head_quantizes_like_a_mixed_precision_checkpoint(tmp_path, monkeypatch):
+    """Jundot/Qwen3.8-Flash-Next-oQ4e-mtp (2026-10-29) ships its MTP head 8-bit on attention and
+    hyper-connections and 4-bit elsewhere. The head must be quantized tensor by tensor from the
+    checkpoint's own shapes, or the strict tensor contract refuses it and MTP silently stays off."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from rapid_mlx.spec_decode.mtp import qwen4_exp_inject as inject
+
+    args = _ple_args()
+    args.mtp_num_hidden_layers = 1
+    model = Model(ModelArgs(model_type="qwen4_exp", text_config=asdict(args)))
+    real_quantize = nn.quantize
+    monkeypatch.setattr(nn, "quantize", lambda *_args, **_kwargs: None)
+    source = inject._build_mtp(model.language_model)
+    monkeypatch.setattr(nn, "quantize", real_quantize)
+    chosen = {}
+
+    def mixed(path, module):
+        if not hasattr(module, "to_quantized") or module.weight.shape[-1] % 32:
+            return False
+        spec = {"group_size": 32, "bits": 8 if path.endswith("attn_hyper_connection.input_mix_weight_down") or "block_inject" in path else 4}
+        chosen[path] = spec
+        return spec
+
+    nn.quantize(source, class_predicate=mixed)
+    assert {s["bits"] for s in chosen.values()} == {4, 8}
+    checkpoint = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(
+        str(checkpoint), {f"mtp.{key}": value for key, value in tree_flatten(source.parameters())}
+    )
+
+    assert inject.inject_qwen4_exp_mtp_support(model, mtp_sidecar=checkpoint) is True
+    loaded = dict(model.language_model.mtp.named_modules())
+    for path, spec in chosen.items():
+        assert (loaded[path].bits, loaded[path].group_size) == (spec["bits"], spec["group_size"]), path

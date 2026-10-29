@@ -77,7 +77,14 @@ def _sanitize_mtp_weights(raw: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
-def _build_mtp(inner: Any):
+def _build_mtp(inner: Any, checkpoint: dict[str, Any] | None = None):
+    """The one-layer head, quantized like ``checkpoint`` (sanitized ``mtp.*`` tensors) when given.
+
+    The checkpoint decides, tensor by tensor: a module is quantized exactly when its ``.scales``
+    ship, with bits and group read from the packed shapes. A mixed build (Jundot oQ4e: 8-bit
+    attention/hyper-connections, 4-bit experts) and the uniform 4-bit build both load strict.
+    Without a checkpoint (random init) the text model's own predicate applies.
+    """
     import mlx.nn as nn
 
     from rapid_mlx.models.qwen4_exp import (
@@ -139,7 +146,21 @@ def _build_mtp(inner: Any):
     def predicate(path: str, module: Any):
         if not hasattr(module, "to_quantized"):
             return False
-        return inner.quant_predicate(path, module)
+        if checkpoint is None:
+            return inner.quant_predicate(path, module)
+        scales = checkpoint.get(f"{path}.scales")
+        packed = checkpoint.get(f"{path}.weight")
+        if scales is None or packed is None:
+            return False
+        in_dim = int(module.weight.shape[-1])
+        bits, rem = divmod(int(packed.shape[-1]) * 32, in_dim)
+        group_size, grem = divmod(in_dim, int(scales.shape[-1]))
+        if rem or grem:
+            raise ValueError(
+                f"mtp.{path}: packed {tuple(packed.shape)} / scales {tuple(scales.shape)} "
+                f"do not fit input width {in_dim}"
+            )
+        return {"group_size": group_size, "bits": bits}
 
     nn.quantize(
         mtp,
@@ -174,11 +195,12 @@ def inject_qwen4_exp_mtp_support(
         return False
 
     try:
-        mtp = _build_mtp(inner)
         weights: dict[str, Any] = {}
         if mtp_sidecar is not None:
             for file in _mtp_weight_files(mtp_sidecar):
                 weights.update(_sanitize_mtp_weights(mx.load(str(file))))
+        mtp = _build_mtp(inner, weights if mtp_sidecar is not None else None)
+        if mtp_sidecar is not None:
 
             expected = dict(tree_flatten(mtp.parameters()))
             missing = set(expected) - set(weights)

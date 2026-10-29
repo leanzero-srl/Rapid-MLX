@@ -185,6 +185,31 @@ def _read_exact(fd: int, buffers: list[memoryview], offset: int) -> None:
 
 
 PLE_KEY_RE_PREFIX = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.shard_{shard}"
+# Every spelling a released checkpoint uses for one PLE shard, raw HF first. mlx-vlm / oMLX conversions
+# (Jundot/Qwen3.8-Flash-Next-oQ4e-mtp, 2026-10-29) store the module path of ``ShardedEmbedding.shards``.
+PLE_KEY_PREFIXES = (
+    PLE_KEY_RE_PREFIX,
+    "language_model.model.layers.{layer}.ple.ple_embedding.ngram_embedding.shards.{shard}",
+)
+# A pre-sanitize key is a PLE table row block when it holds one of these.
+PLE_KEY_MARKERS = (".ple.ple_embedding.ngram_embedding.shard_", ".ple.ple_embedding.ngram_embedding.shards.")
+
+
+def is_ple_table_key(key: str) -> bool:
+    return any(marker in key for marker in PLE_KEY_MARKERS)
+
+
+def ple_shard_prefix(index: "CheckpointIndex", layer: int, shard: int) -> str:
+    """The checkpoint's own key prefix for PLE ``shard`` of ``layer`` (either spelling)."""
+    for template in PLE_KEY_PREFIXES:
+        prefix = template.format(layer=layer, shard=shard)
+        if prefix + ".weight" in index.locs:
+            return prefix
+    raise KeyError(
+        f"no PLE shard {shard} of layer {layer} in {index.model_dir} (looked for "
+        + " / ".join(t.format(layer=layer, shard=shard) + ".weight" for t in PLE_KEY_PREFIXES)
+        + ")"
+    )
 
 
 class PLEOffloadStore:
@@ -195,11 +220,21 @@ class PLEOffloadStore:
         self.w: list[np.ndarray] = []
         self.s: list[np.ndarray] = []
         self.b: list[np.ndarray] = []
+        scale_dtypes = set()
         for shard in range(parts):
-            prefix = PLE_KEY_RE_PREFIX.format(layer=layer, shard=shard)
+            prefix = ple_shard_prefix(index, layer, shard)
             self.w.append(index.memmap(prefix + ".weight"))
             self.s.append(index.memmap(prefix + ".scales"))
             self.b.append(index.memmap(prefix + ".biases"))
+            scale_dtypes.add(index[prefix + ".scales"].dtype)
+            scale_dtypes.add(index[prefix + ".biases"].dtype)
+        if len(scale_dtypes) != 1 or not scale_dtypes <= {"BF16", "F16"}:
+            raise ValueError(f"PLE scales/biases dtype {sorted(scale_dtypes)} (expected one of BF16, F16)")
+        # The quant layout is read from the tensors, not assumed: packed uint32 words per row and
+        # one scale per group (oQ4e and the raw HF build are both 4-bit, group 32, width 160).
+        self.scale_dtype = scale_dtypes.pop()
+        self.words_per_row = self.w[0].shape[1]
+        self.groups_per_row = self.s[0].shape[1]
         self.rows_per_shard = self.w[0].shape[0]
         self.threads = threads
         self._pool = ThreadPoolExecutor(max_workers=threads) if threads > 1 else None
@@ -212,8 +247,8 @@ class PLEOffloadStore:
         ids = ids.astype(np.int64, copy=False)
         n = ids.shape[0]
         out_w = np.empty((n, self.w[0].shape[1]), dtype=np.uint32)
-        out_s = np.empty((n, self.s[0].shape[1]), dtype=np.uint16)
-        out_b = np.empty((n, self.b[0].shape[1]), dtype=np.uint16)
+        out_s = np.empty((n, self.s[0].shape[1]), dtype=self.s[0].dtype)
+        out_b = np.empty((n, self.b[0].shape[1]), dtype=self.b[0].dtype)
         shard = ids // self.rows_per_shard
         local = ids - shard * self.rows_per_shard
         order = np.argsort(shard, kind="stable")
@@ -255,6 +290,14 @@ class OffloadedShardedEmbedding(nn.Module):
     def attach(self, store: PLEOffloadStore) -> None:
         if store.rows_per_shard != self.rows_per_shard:
             raise ValueError("PLE shard geometry mismatch")
+        bits, rem = divmod(store.words_per_row * 32, self.dims)
+        group_size, grem = divmod(self.dims, store.groups_per_row)
+        if rem or grem or bits not in (2, 3, 4, 5, 6, 8) or group_size not in (32, 64, 128):
+            raise ValueError(
+                f"PLE quant layout: {store.words_per_row} words / {store.groups_per_row} groups "
+                f"per row of width {self.dims} is not an MLX affine layout"
+            )
+        self.bits, self.group_size = bits, group_size
         self.store = store
 
     def __call__(self, indices: mx.array) -> mx.array:
@@ -264,10 +307,11 @@ class OffloadedShardedEmbedding(nn.Module):
         ids = np.asarray(indices.astype(mx.int64)).reshape(-1)
         uniq, inverse = np.unique(ids, return_inverse=True)
         w, s, b = self.store.gather(uniq)
+        scale_dtype = mx.float16 if self.store.scale_dtype == "F16" else mx.bfloat16
         rows = mx.dequantize(
             mx.array(w),
-            mx.array(s).view(mx.bfloat16),
-            mx.array(b).view(mx.bfloat16),
+            mx.array(s).view(scale_dtype),
+            mx.array(b).view(scale_dtype),
             group_size=self.group_size,
             bits=self.bits,
         )
@@ -653,7 +697,7 @@ def sanitize_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
         return weights
     out = {}
     for key, value in weights.items():
-        if cfg.ple and ".ple.ple_embedding.ngram_embedding.shard_" in key:
+        if cfg.ple and is_ple_table_key(key):
             continue
         if (
             cfg.experts
