@@ -610,6 +610,14 @@ class PeakModel:
             ),
             "token_bytes_prior": round(self.prior.token_bytes, 1),
             "linear_bytes_by_tokens": {str(t): int(r) for t, r in self._envelope},
+            # Observations per (batch x chunk) group: the fit needs
+            # SLOPE_MIN_PAIRS spaced pairs inside ONE group.
+            "groups": dict(
+                sorted(
+                    ((f"{b}x{c}", len(g)) for (b, c), g in self._groups.items()),
+                    key=lambda kv: -kv[1],
+                )[:12]
+            ),
             "worst_transient_mb": round(self.worst_transient / 2**20, 1),
             "worst_shape": (
                 None
@@ -818,6 +826,10 @@ class MemoryGuard:
             # Entries given back because the kernel reported machine-wide
             # memory pressure (other apps / engines need it).
             "system_pressure_evictions": 0,
+            # Admitting requests whose prefix hit was given back so they
+            # re-prefill from token 0: they fit alone, but not beside the
+            # copy of their own hit (copy-on-admit, no hand-over possible).
+            "cold_requeues": 0,
         }
         self.last_chunk: int | None = None
         self.last_ceiling = 0
@@ -1118,6 +1130,20 @@ class MemoryGuard:
                     best, lo = mid, mid + 1
                 else:
                     hi = mid - 1
+            if not self.model.calibrated:
+                # Still on the PRIOR: reduce to a power-of-two multiple of the
+                # floor, so the reduced steps fall into a few (batch, chunk)
+                # groups and the pair fit can replace the prior. The largest
+                # chunk that fits moved by a few tokens every step (2015,
+                # 1888, 1824 ... 375, 374, 373), each a group of ONE: the
+                # workmule Flash-Next Gauntlet (2026-10-29) never calibrated
+                # in 2 h, planned 12.4 GB for a <1 GB step on the 192 B/unit
+                # prior (measured 0.2-13), prefilled 256-token chunks and
+                # refused a 241,320-token turn that fits.
+                snapped = floor
+                while snapped * 2 <= best:
+                    snapped *= 2
+                best = snapped
             chunk = best
             ok, shape, transient, margin = fits(chunk, fp)
         if chunk < start:

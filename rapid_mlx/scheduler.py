@@ -7998,6 +7998,17 @@ class Scheduler:
                 # (RC12 Gabee k=110: a 160k main refused 2.5 min into its
                 # prefill, 0.0x GB short, beside a waiting side's 22.8k loan).
                 continue
+            if fits_alone and self._memguard_requeue_cold(row):
+                # It fits this Mac ALONE from token 0, but not beside the
+                # copy of its own prefix hit (copy-on-admit holds the session
+                # twice; a hybrid cache that the singleton pass-through does
+                # not admit cannot be handed over instead). Give the hit back
+                # and re-prefill rather than refuse a turn that fits: a refusal
+                # makes the client compact the conversation (workmule
+                # Flash-Next Gauntlet 2026-10-29: 241,320 tokens refused,
+                # "needs 104.8 GB but this Mac can hold 103.9 GB", the hit's
+                # 6.3 GB copy charged; goose compacted 241k -> 4k).
+                continue
             refusals.append(self._memguard_refuse(plan, kv_fn))
         # Every iteration above either returns or changes the state (defer,
         # refuse, hand over, evict) -- reaching here is a planner defect: the
@@ -8671,10 +8682,12 @@ class Scheduler:
             len(others),
         )
 
-    def _memguard_requeue(self, request: Request) -> None:
+    def _memguard_requeue(self, request: Request, *, cold: bool = False) -> None:
         """Put a tokenless running request back at the head of the queue:
         out of the batch generator, its live cache dropped, and its prefix
-        re-fetched so it resumes from the cache instead of from token 0."""
+        re-fetched so it resumes from the cache instead of from token 0.
+        ``cold``: its prefix hit is given up instead (``_memguard_requeue_cold``):
+        nothing it held is kept as an entry and nothing is re-fetched."""
         rid = request.request_id
         uid = self.request_id_to_uid.pop(rid, None)
         if uid is not None:
@@ -8697,14 +8710,14 @@ class Scheduler:
                     kept = bg.remove([uid], return_prompt_caches=True)
                 except Exception:  # noqa: BLE001
                     logger.debug("[memory_guard] bg.remove failed", exc_info=True)
-                if kept:
+                if kept and not cold:
                     self._memguard_keep_requeued_kv(request, kept.get(uid), solo=solo)
             self.uid_to_request_id.pop(uid, None)
             self._hybrid_checkpoints.pop(uid, None)
             self._forget_uid_grammar(uid)
             getattr(self, "_admission_prefill_uids", set()).discard(uid)
         self.running.pop(rid, None)
-        self._memguard_reset_for_requeue(request)
+        self._memguard_reset_for_requeue(request, refetch=not cold)
         self.waiting.appendleft(request)
 
     def _memguard_keep_boundary_state(
@@ -9148,7 +9161,9 @@ class Scheduler:
             )
         return released > 0
 
-    def _memguard_reset_for_requeue(self, request: Request) -> None:
+    def _memguard_reset_for_requeue(
+        self, request: Request, *, refetch: bool = True
+    ) -> None:
         request.status = RequestStatus.WAITING
         request.batch_uid = None
         request.prompt_cache = None
@@ -9174,8 +9189,73 @@ class Scheduler:
         if not kept:
             request._boundary_snapshot_taken = False
             request._cache_snapshot_stored = False
+        if not refetch:
+            request.cache_hit_type = "miss"
+            return
         if mac is not None and not _pflash_compressed(request):
             self._fetch_memory_aware_prefix(request)
+
+    def _memguard_requeue_cold(self, row: RowPlan) -> bool:
+        """Give up an ADMITTING request's prefix hit and re-queue it to
+        prefill from token 0 (once per request). The entry it hit is evicted
+        (it only saved prefill if its copy fitted) together with any entry
+        sharing the loan's arrays, so its memory is back before the next
+        plan. Returns True when it re-queued."""
+        guard = self._memguard()
+        request = self.running.get(row.request_id)
+        if guard is None or request is None or not row.admitting:
+            return False
+        cached = int(getattr(request, "cached_tokens", 0) or 0)
+        if cached <= 0 or getattr(request, "_memguard_cold", False):
+            return False
+        layers = _exact_data_layers(getattr(request, "prompt_cache", None))
+        shared = {id(a) for layer in layers for a in (layer.keys, layer.values)}
+        keys = {
+            tuple(request.prompt_token_ids[:cached]),
+            tuple(request.prompt_token_ids[: cached + 1]),
+        }
+        mac = getattr(self, "memory_aware_cache", None)
+        owners: list[Any] = []
+        if mac is not None:
+            with mac._lock:  # noqa: SLF001
+                owners = [
+                    key
+                    for key, entry in mac._entries.items()  # noqa: SLF001
+                    if key in keys
+                    or (
+                        shared
+                        and any(
+                            id(getattr(layer, "keys", None)) in shared
+                            for layer in _exact_data_layers(entry.cache)
+                        )
+                    )
+                ]
+        request._memguard_cold = True
+        # Evicted BEFORE the re-queue: its reset must not trust a boundary
+        # entry that is about to go (the supersede rule reads it).
+        if mac is not None and owners:
+            with mac._lock:  # noqa: SLF001
+                for key in owners:
+                    if key in mac._entries:  # noqa: SLF001
+                        mac._evict_entry_locked(key, reason="cold_requeue")  # noqa: SLF001
+        self._memguard_requeue(request, cold=True)
+        try:
+            mx.clear_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        guard.counts["cold_requeues"] += 1
+        logger.warning(
+            "[memory_guard] cold requeue: request %s (prompt %d tokens) fits "
+            "alone but not beside the copy of its %d-token prefix hit; the hit "
+            "is given back (%d entr%s evicted) and the prompt re-prefills "
+            "instead of being refused",
+            row.request_id[:12],
+            row.prompt_tokens,
+            cached,
+            len(owners),
+            "y" if len(owners) == 1 else "ies",
+        )
+        return True
 
     def _memguard_defer(self, row: RowPlan, plan: GuardPlan, others: list[str]) -> None:
         guard = self._memguard()
@@ -9418,14 +9498,51 @@ class Scheduler:
             # tokens" (a 21k prompt fits alone). Mixed steps stay out of the
             # model; the backstop still records a real OOM on them.
             return
+        admit = int(plan.admit_bytes or 0)
+        if guard is not None and admit > 0:
+            transient, admit = self._memguard_hit_step_transient(
+                plan, peak, transient, admit
+            )
         if guard is not None:
             guard.observe(
                 plan.shape,
                 transient,
                 live_beyond_base=live,
                 fit=not mixed,
-                admit_bytes=plan.admit_bytes,
+                admit_bytes=admit,
             )
+
+    def _memguard_hit_step_transient(
+        self, plan: GuardPlan, peak: int, transient: int, admit: int
+    ) -> tuple[int, int]:
+        """A step that admitted a prefix hit, its copy MEASURED rather than
+        estimated: what admission copied stays resident after the step (it
+        is the row's live cache now), so the part of the peak that went away
+        again plus the chunk's own new KV is the step's transient without
+        the copy -- exactly the quantity a step without a hit measures.
+        Returned with ``admit_bytes`` 0, so the step enters the fit.
+
+        Why: in a goose session nearly every prefill step is the FIRST chunk
+        of a turn (the turn's new tokens; often fewer than one chunk), and
+        such steps were kept out of the fit (the copy was only an upper-bound
+        estimate). The workmule Flash-Next Gauntlet (2026-10-29) ran 2 h of
+        turns without ONE calibration and planned every step on the prior.
+        Returns ``(transient, admit)`` unchanged when the reading is missing.
+        """
+        try:
+            after = int(self._current_metal_active_bytes())
+            kv_fn = self._kv_footprint_fn()
+        except Exception:  # noqa: BLE001
+            return transient, admit
+        if after <= 0 or kv_fn is None:
+            return transient, admit
+        tokens = max(0, int(plan.shape.batch) * int(plan.shape.chunk))
+        new_kv = max(0, int(kv_fn(tokens)) - int(kv_fn(0)))
+        measured = max(0, int(peak) - after) + new_kv
+        # Never above the whole step (a step that also freed the source --
+        # an evicted or handed-over entry -- reads high here: kept whole,
+        # the conservative side).
+        return min(int(transient), measured), 0
 
     def _memguard_idle_base(self, *, sample: bool = False) -> int:
         """Weights + fixed runtime state: Metal active with nothing running,
