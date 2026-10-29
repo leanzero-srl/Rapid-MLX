@@ -246,7 +246,18 @@ def _sanitize_with(text: str, pattern: re.Pattern[str]) -> str:
         return text
     for ch in text:
         if ch in _SPECIAL_TOKEN_CHARS:
-            cleaned = pattern.sub("", text).strip()
+            cleaned = pattern.sub("", text)
+            if cleaned == text:
+                # Nothing was removed: the ``<``/``[``/``]`` was ordinary
+                # text (code, JSON, markdown). Return it byte-for-byte —
+                # trimming here made the non-streamed answer differ from
+                # the streamed one (and from what the model wrote) for
+                # any text that merely contains a bracket.
+                return text
+            # A marker was cut out: trim the whitespace it leaves at the
+            # ends of the assembled final string (cosmetic, final-string
+            # only — streamed deltas use ``_sanitize_for_stream``).
+            cleaned = cleaned.strip()
             return cleaned or None  # collapse empty to None
     return text
 
