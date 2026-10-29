@@ -56,7 +56,7 @@ class FlintToolParser(Xing4ToolParser):
         result = super().extract_tool_calls(model_output, request)
         if result.tools_called:
             cleaned = self.strip_think_tags(model_output)
-            first = cleaned.find("<tool_call>")
+            first = cleaned.find(self._WIRE.call_open)
             narration = cleaned[:first].strip() if first > 0 else ""
             result.content = narration or None
         return result

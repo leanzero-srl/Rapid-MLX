@@ -297,6 +297,28 @@ PARITY_FIXTURES: list = [
             ("read_file", {"path": "/etc/hostname"}),
         ],
     ),
+    # Meituan LongCat — <longcat_tool_call> with <longcat_arg_key>/
+    # <longcat_arg_value> pairs, newline-separated as its template renders
+    # them, raw string values; Flint's / Xing4.0's reading rules.
+    (
+        "longcat",
+        "longcat_arg_tool_call",
+        (
+            "<longcat_tool_call>get_current_weather\n"
+            "<longcat_arg_key>location</longcat_arg_key>\n"
+            "<longcat_arg_value>Paris</longcat_arg_value>\n"
+            "<longcat_arg_key>days</longcat_arg_key>\n"
+            "<longcat_arg_value>3</longcat_arg_value>\n</longcat_tool_call>\n"
+            "<longcat_tool_call>read_file\n"
+            "<longcat_arg_key>path</longcat_arg_key>\n"
+            "<longcat_arg_value>/etc/hostname</longcat_arg_value>\n"
+            "</longcat_tool_call>\n"
+        ),
+        [
+            ("get_current_weather", {"location": "Paris", "days": 3}),
+            ("read_file", {"path": "/etc/hostname"}),
+        ],
+    ),
 ]
 
 

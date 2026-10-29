@@ -23,6 +23,7 @@ Available parsers:
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - xing4/xing4_0/xing: XingChen-AGI Xing4.0 (<param_key>/<param_value> pairs)
 - flint: Recursive Flint (<arg_key>/<arg_value> pairs, raw string values)
+- longcat: Meituan LongCat (<longcat_tool_call> + <longcat_arg_key>/<longcat_arg_value>, raw string values)
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
 - muse: Meta Muse Glimmer (ATEM function-calls blocks on
   recipient-routed channels)
@@ -82,6 +83,7 @@ from .seed_oss_tool_parser import SeedOssToolParser
 from .ui_tars_tool_parser import UiTarsToolParser
 from .xing4_tool_parser import Xing4ToolParser
 from .flint_tool_parser import FlintToolParser
+from .longcat_tool_parser import LongCatToolParser
 from .xlam_tool_parser import xLAMToolParser
 
 __all__ = [

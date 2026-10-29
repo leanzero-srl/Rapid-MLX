@@ -92,8 +92,12 @@ class TestCleanOutputText:
         result = clean_output_text(text)
         assert result.count("<think>") == 1
 
-    def test_strips_whitespace(self):
-        assert clean_output_text("  Hello  ") == "Hello"
+    def test_keeps_whitespace(self):
+        # The answer is returned byte-for-byte: the streamed deltas carry
+        # this whitespace too, so trimming here made non-stream differ from
+        # stream (and a file returned as content lose its final newline).
+        assert clean_output_text("  Hello  ") == "  Hello  "
+        assert clean_output_text("x = [1]\n\n") == "x = [1]\n\n"
 
     def test_combined_special_tokens_and_think(self):
         text = "<|im_start|><think>I need to think.</think>42<|im_end|>"

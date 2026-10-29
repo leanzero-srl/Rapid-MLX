@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 from ..api.tool_calling import parse_tool_calls
-from ..api.utils import sanitize_output, strip_special_tokens
+from ..api.utils import sanitize_content_for_stream, strip_special_tokens
 from ..domain.events import StreamEvent
 
 if TYPE_CHECKING:
@@ -2987,7 +2987,7 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = sanitize_content_for_stream(mixed_content)
                     if mixed_content:
                         events.append(
                             StreamEvent(type="content", content=mixed_content)
@@ -3059,7 +3059,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = sanitize_content_for_stream(content)
                 if content:
                     if output.finished:
                         return [
@@ -3103,7 +3103,12 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            # Per-delta: strip markers only, never whitespace. Clients
+            # concatenate deltas verbatim; the old ``sanitize_output``
+            # call here ``.strip()``-ed any delta holding ``<``/``[``/``]``
+            # (" [--" -> "[--", "]\n\n" -> "]"), corrupting every
+            # streamed file write around brackets.
+            content = sanitize_content_for_stream(content)
             if not content:
                 content = None
 
@@ -3396,7 +3401,7 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = sanitize_content_for_stream(mixed_content)
                     if mixed_content:
                         events.append(
                             StreamEvent(type="content", content=mixed_content)
@@ -3468,7 +3473,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = sanitize_content_for_stream(content)
                 if content:
                     if output.finished:
                         return [
@@ -3512,7 +3517,12 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            # Per-delta: strip markers only, never whitespace. Clients
+            # concatenate deltas verbatim; the old ``sanitize_output``
+            # call here ``.strip()``-ed any delta holding ``<``/``[``/``]``
+            # (" [--" -> "[--", "]\n\n" -> "]"), corrupting every
+            # streamed file write around brackets.
+            content = sanitize_content_for_stream(content)
             if not content:
                 content = None
 
@@ -3610,7 +3620,7 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = sanitize_content_for_stream(mixed_content)
                     if mixed_content:
                         # R10-C7: mixed content+tool deltas also count
                         # as standard-path plain-content emission for
@@ -3695,7 +3705,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = sanitize_content_for_stream(content)
                 if content:
                     if output.finished:
                         return [
@@ -3738,7 +3748,12 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            # Per-delta: strip markers only, never whitespace. Clients
+            # concatenate deltas verbatim; the old ``sanitize_output``
+            # call here ``.strip()``-ed any delta holding ``<``/``[``/``]``
+            # (" [--" -> "[--", "]\n\n" -> "]"), corrupting every
+            # streamed file write around brackets.
+            content = sanitize_content_for_stream(content)
             if not content:
                 content = None
 
@@ -3893,7 +3908,7 @@ class StreamingPostProcessor:
             if delta_msg is not None:
                 trailing_content = getattr(delta_msg, "content", None)
                 if isinstance(trailing_content, str) and trailing_content:
-                    trailing_content = sanitize_output(
+                    trailing_content = sanitize_content_for_stream(
                         strip_special_tokens(trailing_content)
                     )
                     if trailing_content:

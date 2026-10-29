@@ -40,9 +40,6 @@ logger = logging.getLogger(__name__)
 
 _STRING_TYPES = frozenset({"string", "str", "text", "varchar", "char", "enum"})
 
-_OPEN = "<tool_call>"
-_CLOSE = "</tool_call>"
-
 
 class _Wire:
     """The key/value tag names of one ``<tool_call>NAME<k>..</k><v>..</v>`` wire.
@@ -51,7 +48,11 @@ class _Wire:
     GLM-4.7) ``<arg_key>``/``<arg_value>``. The reading rules are the same.
     """
 
-    def __init__(self, key: str, value: str):
+    def __init__(self, key: str, value: str, call: str = "tool_call"):
+        # The call's own tags: ``<tool_call>`` for Xing4.0 / Flint / GLM,
+        # ``<longcat_tool_call>`` for LongCat.
+        self.call_open = f"<{call}>"
+        self.call_close = f"</{call}>"
         self.key_open = f"<{key}>"
         self.key_close = f"</{key}>"
         self.val_open = f"<{value}>"
@@ -63,7 +64,7 @@ class _Wire:
             + r"\s*(?="
             + re.escape(self.key_open)
             + "|"
-            + re.escape(_CLOSE)
+            + re.escape(self.call_close)
             + ")"
         )
 
@@ -80,7 +81,8 @@ def _scan_call(
     """
     _KEY_OPEN, _KEY_CLOSE = wire.key_open, wire.key_close
     _VAL_OPEN, _VALUE_END = wire.val_open, wire.value_end
-    pos = start + len(_OPEN)
+    _CLOSE = wire.call_close
+    pos = start + len(wire.call_open)
     k = text.find(_KEY_OPEN, pos)
     c = text.find(_CLOSE, pos)
     if c < 0:
@@ -150,12 +152,12 @@ class Xing4ToolParser(Glm47ToolParser):
         tool_calls = []
         pos = 0
         while True:
-            start = cleaned_text.find(_OPEN, pos)
+            start = cleaned_text.find(self._WIRE.call_open, pos)
             if start < 0:
                 break
             found = _scan_call(cleaned_text, start, self._WIRE)
             if found is None:
-                pos = start + len(_OPEN)
+                pos = start + len(self._WIRE.call_open)
                 continue
             name, params, end = found
             pos = end

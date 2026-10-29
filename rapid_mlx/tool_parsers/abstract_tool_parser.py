@@ -194,6 +194,10 @@ def settle_cut_call(
 #   flint_arg_tool_call   — <tool_call>NAME<arg_key>K</arg_key>
 #                           <arg_value>V</arg_value></tool_call>
 #                           (Recursive Flint; raw string values)
+#   longcat_arg_tool_call — <longcat_tool_call>NAME\n<longcat_arg_key>K
+#                           </longcat_arg_key>\n<longcat_arg_value>V
+#                           </longcat_arg_value>\n</longcat_tool_call>
+#                           (Meituan LongCat; raw string values)
 WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
     {
         "tool_call_json",
@@ -224,6 +228,7 @@ WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
         "k2_ifm",
         "xing_param_tool_call",
         "flint_arg_tool_call",
+        "longcat_arg_tool_call",
     }
 )
 

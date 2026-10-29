@@ -1482,6 +1482,20 @@ def _detect_metadata_config(
         settings.setdefault("is_hybrid", False)
         settings.setdefault("is_hybrid_explicit", True)
 
+    # Meituan LongCat (``longcat_flash_ngram`` Flash-Lite, ``longcat_flash``).
+    # Its template writes calls as ``<longcat_tool_call>NAME`` with
+    # ``<longcat_arg_key>``/``<longcat_arg_value>`` pairs (tokenizer_config:
+    # ``tool_parser_type: longcat``). Without this a local folder had no
+    # tool parser and every call came back as content.
+    if any(m.startswith("longcat") for m in model_types):
+        template = metadata.chat_template or ""
+        if all(
+            m in template
+            for m in ("<longcat_tool_call>", "<longcat_arg_key>", "<longcat_arg_value>")
+        ):
+            settings["tool_call_parser"] = "longcat"
+            reasons.append("LongCat longcat_tool_call template")
+
     # IBM Granite. ``granitemoehybrid`` (Granite 4.0-H) is Mamba2 + attention.
     # ``granite`` (GraniteForCausalLM: Granite 3.x and the dense 4.1/4.2) is
     # plain attention, so it is NOT hybrid whatever its name says. Granite

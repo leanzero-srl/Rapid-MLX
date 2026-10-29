@@ -78,6 +78,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `ui_tars` | `ui-tars`, `uitars` | UI-TARS GUI-agent VLMs | `Action: verb(args)` computer-use lines |
 | `xing4` | `xing4_0`, `xing` | XingChen-AGI Xing4.0 | `<tool_call>name<param_key>`/`<param_value>` pairs, raw string values |
 | `flint` | | Recursive Flint | `<tool_call>name<arg_key>`/`<arg_value>` pairs, raw string values |
+| `longcat` | | Meituan LongCat (Flash-Lite) | `<longcat_tool_call>name` + `<longcat_arg_key>`/`<longcat_arg_value>` pairs, raw string values |
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 
 Two easy mix-ups to watch for:

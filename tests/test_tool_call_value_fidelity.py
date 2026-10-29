@@ -143,6 +143,14 @@ def _render_flint_arg(name: str, key: str, value: str) -> str:
     )
 
 
+def _render_longcat_arg(name: str, key: str, value: str) -> str:
+    # LongCat template: newline-separated tags, string values written raw.
+    return (
+        f"<longcat_tool_call>{name}\n<longcat_arg_key>{key}</longcat_arg_key>\n"
+        f"<longcat_arg_value>{value}</longcat_arg_value>\n</longcat_tool_call>\n"
+    )
+
+
 RENDERERS = {
     "json_body": _render_json_body,
     "raw_json": _render_raw_json,
@@ -152,6 +160,7 @@ RENDERERS = {
     "muse_atem": _render_muse_atem,
     "xing_param": _render_xing_param,
     "flint_arg": _render_flint_arg,
+    "longcat_arg": _render_longcat_arg,
 }
 
 # (parser_name, wire_format) pairs this file exercises. Parser names are the
@@ -179,6 +188,7 @@ COVERED: list[tuple[str, str]] = [
     ("xing4_0", "xing_param"),
     ("xing", "xing_param"),
     ("flint", "flint_arg"),
+    ("longcat", "longcat_arg"),
 ]
 
 # Formats whose escaping rules this file does not model yet. Each entry is a
@@ -297,6 +307,11 @@ _SCANNER_BLIND: dict[tuple[str, str], str] = {
     ): "parse_tool_calls does not recognise Flint's <arg_key>/<arg_value> "
     "markup; flint checkpoints always get the flint parser from "
     "model_auto_config",
+    (
+        "longcat",
+        "longcat_arg",
+    ): "parse_tool_calls does not recognise LongCat's <longcat_tool_call> "
+    "markup; longcat checkpoints get the longcat parser from model_auto_config",
 }
 
 _KEY = "body"
