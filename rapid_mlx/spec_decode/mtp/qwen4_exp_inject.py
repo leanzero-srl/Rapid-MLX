@@ -77,6 +77,23 @@ def _sanitize_mtp_weights(raw: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def checkpoint_quant_spec(checkpoint: dict[str, Any], path: str, in_dim: int):
+    """``{"group_size", "bits"}`` of module ``path`` as the checkpoint packs it, or False when it
+    ships unquantized. ``in_dim`` is the module's unquantized input width."""
+    scales = checkpoint.get(f"{path}.scales")
+    packed = checkpoint.get(f"{path}.weight")
+    if scales is None or packed is None:
+        return False
+    bits, rem = divmod(int(packed.shape[-1]) * 32, in_dim)
+    group_size, grem = divmod(in_dim, int(scales.shape[-1]))
+    if rem or grem:
+        raise ValueError(
+            f"mtp.{path}: packed {tuple(packed.shape)} / scales {tuple(scales.shape)} "
+            f"do not fit input width {in_dim}"
+        )
+    return {"group_size": group_size, "bits": bits}
+
+
 def _build_mtp(inner: Any, checkpoint: dict[str, Any] | None = None):
     """The one-layer head, quantized like ``checkpoint`` (sanitized ``mtp.*`` tensors) when given.
 
@@ -148,19 +165,7 @@ def _build_mtp(inner: Any, checkpoint: dict[str, Any] | None = None):
             return False
         if checkpoint is None:
             return inner.quant_predicate(path, module)
-        scales = checkpoint.get(f"{path}.scales")
-        packed = checkpoint.get(f"{path}.weight")
-        if scales is None or packed is None:
-            return False
-        in_dim = int(module.weight.shape[-1])
-        bits, rem = divmod(int(packed.shape[-1]) * 32, in_dim)
-        group_size, grem = divmod(in_dim, int(scales.shape[-1]))
-        if rem or grem:
-            raise ValueError(
-                f"mtp.{path}: packed {tuple(packed.shape)} / scales {tuple(scales.shape)} "
-                f"do not fit input width {in_dim}"
-            )
-        return {"group_size": group_size, "bits": bits}
+        return checkpoint_quant_spec(checkpoint, path, int(module.weight.shape[-1]))
 
     nn.quantize(
         mtp,

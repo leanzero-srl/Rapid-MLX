@@ -1,0 +1,5527 @@
+{
+"mtp_quantization": {
+"mtp.fc_embedding": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.fc_hidden": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.hyper_connection_mixer.input_mix_weight_down": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.hyper_connection_mixer.input_mix_weight_up": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.attn_hyper_connection.block_inject_weight": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_down": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_up": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.mlp.shared_expert.down_proj": {
+"bits": 8,
+"group_size": 128,
+"mode": "affine"
+},
+"mtp.layers.0.mlp.shared_expert.gate_proj": {
+"bits": 8,
+"group_size": 128,
+"mode": "affine"
+},
+"mtp.layers.0.mlp.shared_expert.up_proj": {
+"bits": 8,
+"group_size": 128,
+"mode": "affine"
+},
+"mtp.layers.0.mlp.shared_expert_gate": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.mlp_hyper_connection.block_inject_weight": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_down": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_up": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.self_attn.indexer.index_qk_proj": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.self_attn.k_proj": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.self_attn.o_proj": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.self_attn.q_proj": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+},
+"mtp.layers.0.self_attn.v_proj": {
+"bits": 8,
+"group_size": 64,
+"mode": "affine"
+}
+},
+"source": "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp @2322c888 model.safetensors.index.json + shard headers, 2026-10-29",
+"tensors": {
+"language_model.model.layers.1.ple.conv1d.weight": [
+"BF16",
+[
+10240,
+4,
+1
+]
+],
+"language_model.model.layers.1.ple.key_proj.biases": [
+"BF16",
+[
+10240,
+40
+]
+],
+"language_model.model.layers.1.ple.key_proj.scales": [
+"BF16",
+[
+10240,
+40
+]
+],
+"language_model.model.layers.1.ple.key_proj.weight": [
+"U32",
+[
+10240,
+640
+]
+],
+"language_model.model.layers.1.ple.norm_conv.weight": [
+"BF16",
+[
+10240
+]
+],
+"language_model.model.layers.1.ple.norm_key.weight": [
+"BF16",
+[
+10240
+]
+],
+"language_model.model.layers.1.ple.norm_query.weight": [
+"BF16",
+[
+10240
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.layer_multipliers": [
+"I64",
+[
+3
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.10.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.10.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.10.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.100.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.100.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.100.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.101.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.101.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.101.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.102.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.102.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.102.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.103.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.103.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.103.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.104.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.104.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.104.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.105.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.105.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.105.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.106.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.106.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.106.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.107.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.107.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.107.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.108.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.108.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.108.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.109.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.109.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.109.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.11.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.11.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.11.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.110.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.110.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.110.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.111.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.111.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.111.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.112.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.112.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.112.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.113.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.113.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.113.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.114.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.114.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.114.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.115.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.115.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.115.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.116.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.116.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.116.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.117.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.117.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.117.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.118.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.118.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.118.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.119.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.119.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.119.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.12.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.12.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.12.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.120.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.120.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.120.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.121.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.121.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.121.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.122.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.122.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.122.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.123.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.123.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.123.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.124.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.124.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.124.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.125.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.125.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.125.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.126.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.126.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.126.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.127.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.127.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.127.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.13.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.13.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.13.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.14.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.14.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.14.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.15.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.15.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.15.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.16.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.16.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.16.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.17.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.17.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.17.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.18.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.18.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.18.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.19.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.19.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.19.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.2.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.2.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.2.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.20.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.20.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.20.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.21.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.21.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.21.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.22.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.22.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.22.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.23.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.23.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.23.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.24.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.24.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.24.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.25.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.25.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.25.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.26.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.26.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.26.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.27.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.27.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.27.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.28.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.28.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.28.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.29.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.29.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.29.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.3.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.3.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.3.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.30.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.30.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.30.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.31.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.31.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.31.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.32.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.32.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.32.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.33.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.33.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.33.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.34.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.34.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.34.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.35.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.35.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.35.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.36.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.36.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.36.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.37.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.37.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.37.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.38.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.38.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.38.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.39.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.39.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.39.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.4.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.4.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.4.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.40.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.40.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.40.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.41.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.41.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.41.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.42.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.42.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.42.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.43.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.43.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.43.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.44.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.44.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.44.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.45.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.45.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.45.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.46.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.46.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.46.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.47.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.47.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.47.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.48.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.48.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.48.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.49.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.49.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.49.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.5.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.5.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.5.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.50.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.50.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.50.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.51.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.51.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.51.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.52.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.52.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.52.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.53.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.53.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.53.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.54.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.54.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.54.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.55.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.55.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.55.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.56.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.56.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.56.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.57.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.57.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.57.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.58.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.58.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.58.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.59.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.59.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.59.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.6.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.6.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.6.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.60.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.60.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.60.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.61.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.61.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.61.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.62.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.62.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.62.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.63.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.63.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.63.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.64.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.64.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.64.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.65.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.65.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.65.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.66.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.66.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.66.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.67.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.67.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.67.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.68.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.68.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.68.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.69.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.69.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.69.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.70.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.70.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.70.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.71.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.71.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.71.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.72.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.72.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.72.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.73.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.73.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.73.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.74.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.74.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.74.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.75.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.75.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.75.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.76.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.76.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.76.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.77.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.77.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.77.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.78.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.78.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.78.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.79.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.79.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.79.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.8.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.8.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.8.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.80.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.80.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.80.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.81.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.81.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.81.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.82.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.82.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.82.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.83.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.83.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.83.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.84.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.84.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.84.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.85.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.85.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.85.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.86.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.86.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.86.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.87.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.87.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.87.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.88.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.88.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.88.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.89.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.89.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.89.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.9.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.9.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.9.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.90.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.90.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.90.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.91.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.91.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.91.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.92.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.92.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.92.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.93.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.93.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.93.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.94.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.94.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.94.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.95.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.95.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.95.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.96.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.96.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.96.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.97.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.97.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.97.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.98.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.98.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.98.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.99.biases": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.99.scales": [
+"BF16",
+[
+2500012,
+5
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.99.weight": [
+"U32",
+[
+2500012,
+20
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale": [
+"BF16",
+[
+1
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_heads_offsets": [
+"I64",
+[
+16
+]
+],
+"language_model.model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes": [
+"I64",
+[
+16
+]
+],
+"language_model.model.layers.1.ple.value_proj.biases": [
+"BF16",
+[
+2560,
+40
+]
+],
+"language_model.model.layers.1.ple.value_proj.scales": [
+"BF16",
+[
+2560,
+40
+]
+],
+"language_model.model.layers.1.ple.value_proj.weight": [
+"U32",
+[
+2560,
+640
+]
+],
+"mtp.fc_embedding.biases": [
+"BF16",
+[
+2560,
+40
+]
+],
+"mtp.fc_embedding.scales": [
+"BF16",
+[
+2560,
+40
+]
+],
+"mtp.fc_embedding.weight": [
+"U32",
+[
+2560,
+640
+]
+],
+"mtp.fc_hidden.biases": [
+"BF16",
+[
+2560,
+40
+]
+],
+"mtp.fc_hidden.scales": [
+"BF16",
+[
+2560,
+40
+]
+],
+"mtp.fc_hidden.weight": [
+"U32",
+[
+2560,
+640
+]
+],
+"mtp.hyper_connection_mixer.hc_norm.weight": [
+"BF16",
+[
+10240
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_down.biases": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_down.scales": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_down.weight": [
+"U32",
+[
+320,
+2560
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_up.biases": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_up.scales": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.hyper_connection_mixer.input_mix_weight_up.weight": [
+"U32",
+[
+10240,
+80
+]
+],
+"mtp.layers.0.attn_hyper_connection.block_inject_weight.biases": [
+"BF16",
+[
+4,
+160
+]
+],
+"mtp.layers.0.attn_hyper_connection.block_inject_weight.scales": [
+"BF16",
+[
+4,
+160
+]
+],
+"mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": [
+"U32",
+[
+4,
+2560
+]
+],
+"mtp.layers.0.attn_hyper_connection.hc_norm.weight": [
+"BF16",
+[
+10240
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_down.biases": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_down.scales": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight": [
+"U32",
+[
+320,
+2560
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_up.biases": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_up.scales": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight": [
+"U32",
+[
+10240,
+80
+]
+],
+"mtp.layers.0.mlp.gate.weight": [
+"BF16",
+[
+512,
+2560
+]
+],
+"mtp.layers.0.mlp.shared_expert.down_proj.biases": [
+"BF16",
+[
+2560,
+5
+]
+],
+"mtp.layers.0.mlp.shared_expert.down_proj.scales": [
+"BF16",
+[
+2560,
+5
+]
+],
+"mtp.layers.0.mlp.shared_expert.down_proj.weight": [
+"U32",
+[
+2560,
+160
+]
+],
+"mtp.layers.0.mlp.shared_expert.gate_proj.biases": [
+"BF16",
+[
+640,
+20
+]
+],
+"mtp.layers.0.mlp.shared_expert.gate_proj.scales": [
+"BF16",
+[
+640,
+20
+]
+],
+"mtp.layers.0.mlp.shared_expert.gate_proj.weight": [
+"U32",
+[
+640,
+640
+]
+],
+"mtp.layers.0.mlp.shared_expert.up_proj.biases": [
+"BF16",
+[
+640,
+20
+]
+],
+"mtp.layers.0.mlp.shared_expert.up_proj.scales": [
+"BF16",
+[
+640,
+20
+]
+],
+"mtp.layers.0.mlp.shared_expert.up_proj.weight": [
+"U32",
+[
+640,
+640
+]
+],
+"mtp.layers.0.mlp.shared_expert_gate.biases": [
+"BF16",
+[
+1,
+40
+]
+],
+"mtp.layers.0.mlp.shared_expert_gate.scales": [
+"BF16",
+[
+1,
+40
+]
+],
+"mtp.layers.0.mlp.shared_expert_gate.weight": [
+"U32",
+[
+1,
+640
+]
+],
+"mtp.layers.0.mlp.switch_mlp.down_proj.biases": [
+"BF16",
+[
+512,
+2560,
+10
+]
+],
+"mtp.layers.0.mlp.switch_mlp.down_proj.scales": [
+"BF16",
+[
+512,
+2560,
+10
+]
+],
+"mtp.layers.0.mlp.switch_mlp.down_proj.weight": [
+"U32",
+[
+512,
+2560,
+80
+]
+],
+"mtp.layers.0.mlp.switch_mlp.gate_proj.biases": [
+"BF16",
+[
+512,
+640,
+40
+]
+],
+"mtp.layers.0.mlp.switch_mlp.gate_proj.scales": [
+"BF16",
+[
+512,
+640,
+40
+]
+],
+"mtp.layers.0.mlp.switch_mlp.gate_proj.weight": [
+"U32",
+[
+512,
+640,
+320
+]
+],
+"mtp.layers.0.mlp.switch_mlp.up_proj.biases": [
+"BF16",
+[
+512,
+640,
+40
+]
+],
+"mtp.layers.0.mlp.switch_mlp.up_proj.scales": [
+"BF16",
+[
+512,
+640,
+40
+]
+],
+"mtp.layers.0.mlp.switch_mlp.up_proj.weight": [
+"U32",
+[
+512,
+640,
+320
+]
+],
+"mtp.layers.0.mlp_hyper_connection.block_inject_weight.biases": [
+"BF16",
+[
+4,
+160
+]
+],
+"mtp.layers.0.mlp_hyper_connection.block_inject_weight.scales": [
+"BF16",
+[
+4,
+160
+]
+],
+"mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight": [
+"U32",
+[
+4,
+2560
+]
+],
+"mtp.layers.0.mlp_hyper_connection.hc_norm.weight": [
+"BF16",
+[
+10240
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.biases": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.scales": [
+"BF16",
+[
+320,
+160
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight": [
+"U32",
+[
+320,
+2560
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.biases": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.scales": [
+"BF16",
+[
+10240,
+5
+]
+],
+"mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight": [
+"U32",
+[
+10240,
+80
+]
+],
+"mtp.layers.0.self_attn.indexer.index_qk_proj.biases": [
+"BF16",
+[
+640,
+40
+]
+],
+"mtp.layers.0.self_attn.indexer.index_qk_proj.scales": [
+"BF16",
+[
+640,
+40
+]
+],
+"mtp.layers.0.self_attn.indexer.index_qk_proj.weight": [
+"U32",
+[
+640,
+640
+]
+],
+"mtp.layers.0.self_attn.indexer.k_layernorm.weight": [
+"BF16",
+[
+128
+]
+],
+"mtp.layers.0.self_attn.indexer.q_layernorm.weight": [
+"BF16",
+[
+128
+]
+],
+"mtp.layers.0.self_attn.k_norm.weight": [
+"BF16",
+[
+256
+]
+],
+"mtp.layers.0.self_attn.k_proj.biases": [
+"BF16",
+[
+512,
+40
+]
+],
+"mtp.layers.0.self_attn.k_proj.scales": [
+"BF16",
+[
+512,
+40
+]
+],
+"mtp.layers.0.self_attn.k_proj.weight": [
+"U32",
+[
+512,
+640
+]
+],
+"mtp.layers.0.self_attn.o_proj.biases": [
+"BF16",
+[
+2560,
+96
+]
+],
+"mtp.layers.0.self_attn.o_proj.scales": [
+"BF16",
+[
+2560,
+96
+]
+],
+"mtp.layers.0.self_attn.o_proj.weight": [
+"U32",
+[
+2560,
+1536
+]
+],
+"mtp.layers.0.self_attn.q_norm.weight": [
+"BF16",
+[
+256
+]
+],
+"mtp.layers.0.self_attn.q_proj.biases": [
+"BF16",
+[
+12288,
+40
+]
+],
+"mtp.layers.0.self_attn.q_proj.scales": [
+"BF16",
+[
+12288,
+40
+]
+],
+"mtp.layers.0.self_attn.q_proj.weight": [
+"U32",
+[
+12288,
+640
+]
+],
+"mtp.layers.0.self_attn.v_proj.biases": [
+"BF16",
+[
+512,
+40
+]
+],
+"mtp.layers.0.self_attn.v_proj.scales": [
+"BF16",
+[
+512,
+40
+]
+],
+"mtp.layers.0.self_attn.v_proj.weight": [
+"U32",
+[
+512,
+640
+]
+],
+"mtp.pre_fc_norm_embedding.weight": [
+"BF16",
+[
+2560
+]
+],
+"mtp.pre_fc_norm_hidden.weight": [
+"BF16",
+[
+10240
+]
+],
+"vision_tower.blocks.0.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.0.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.0.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.0.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.0.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.0.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.0.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.0.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.0.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.0.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.0.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.0.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.1.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.1.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.1.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.1.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.1.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.1.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.1.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.10.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.10.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.10.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.10.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.10.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.10.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.10.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.11.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.11.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.11.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.11.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.11.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.11.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.11.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.12.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.12.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.12.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.12.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.12.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.12.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.12.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.13.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.13.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.13.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.13.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.13.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.13.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.13.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.14.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.14.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.14.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.14.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.14.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.14.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.14.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.15.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.15.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.15.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.15.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.15.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.15.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.15.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.16.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.16.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.16.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.16.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.16.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.16.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.16.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.17.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.17.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.17.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.17.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.17.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.17.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.17.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.18.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.18.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.18.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.18.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.18.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.18.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.18.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.19.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.19.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.19.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.19.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.19.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.19.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.19.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.2.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.2.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.2.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.2.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.2.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.2.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.2.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.20.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.20.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.20.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.20.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.20.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.20.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.20.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.21.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.21.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.21.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.21.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.21.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.21.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.21.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.22.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.22.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.22.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.22.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.22.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.22.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.22.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.23.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.23.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.23.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.23.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.23.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.23.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.23.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.24.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.24.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.24.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.24.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.24.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.24.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.24.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.25.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.25.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.25.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.25.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.25.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.25.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.25.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.26.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.26.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.26.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.26.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.26.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.26.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.26.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.3.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.3.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.3.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.3.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.3.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.3.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.3.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.4.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.4.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.4.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.4.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.4.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.4.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.4.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.5.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.5.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.5.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.5.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.5.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.5.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.5.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.6.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.6.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.6.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.6.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.6.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.6.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.6.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.7.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.7.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.7.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.7.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.7.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.7.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.7.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.8.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.8.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.8.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.8.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.8.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.8.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.8.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.attn.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.attn.proj.weight": [
+"BF16",
+[
+1152,
+1152
+]
+],
+"vision_tower.blocks.9.attn.qkv.bias": [
+"BF16",
+[
+3456
+]
+],
+"vision_tower.blocks.9.attn.qkv.weight": [
+"BF16",
+[
+3456,
+1152
+]
+],
+"vision_tower.blocks.9.mlp.linear_fc1.bias": [
+"BF16",
+[
+4304
+]
+],
+"vision_tower.blocks.9.mlp.linear_fc1.weight": [
+"BF16",
+[
+4304,
+1152
+]
+],
+"vision_tower.blocks.9.mlp.linear_fc2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.mlp.linear_fc2.weight": [
+"BF16",
+[
+1152,
+4304
+]
+],
+"vision_tower.blocks.9.norm1.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.norm1.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.norm2.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.blocks.9.norm2.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.merger.linear_fc1.bias": [
+"BF16",
+[
+4608
+]
+],
+"vision_tower.merger.linear_fc1.weight": [
+"BF16",
+[
+4608,
+4608
+]
+],
+"vision_tower.merger.linear_fc2.bias": [
+"BF16",
+[
+2560
+]
+],
+"vision_tower.merger.linear_fc2.weight": [
+"BF16",
+[
+2560,
+4608
+]
+],
+"vision_tower.merger.norm.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.merger.norm.weight": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.patch_embed.proj.bias": [
+"BF16",
+[
+1152
+]
+],
+"vision_tower.patch_embed.proj.weight": [
+"BF16",
+[
+1152,
+2,
+16,
+16,
+3
+]
+],
+"vision_tower.pos_embed.weight": [
+"BF16",
+[
+2304,
+1152
+]
+]
+}
+}
