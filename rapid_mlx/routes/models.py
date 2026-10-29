@@ -57,6 +57,27 @@ def _engine_for(model_id: str):
     return None
 
 
+def _served_text_lane_reads_images(model_id: str) -> bool:
+    """True when the live engine for ``model_id`` reads images ON ITS TEXT LANE.
+
+    An alias that pins ``is_text_only`` (Qwen3.8-Flash-Next-4bit) keeps the
+    checkpoint off the serialized MLLM lane; with ``text_lane_vision`` the text
+    lane itself encodes the images, so the pin no longer means "no vision". Only
+    a real ``True`` counts (``accepts_images`` on a test double is not one), and
+    an MLLM engine never reaches this (an ``is_text_only`` alias routes
+    ``force_text``). Never raises (the "never 500 /v1/models" contract).
+    """
+    try:
+        engine = _engine_for(model_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if engine is None:
+        return False
+    return getattr(engine, "accepts_images", None) is True and getattr(
+        engine, "is_mllm", None
+    ) is not True
+
+
 def _scheduler_of(engine, method: str = "projected_memory_max_context"):
     """Walk the engine backend graph to a ``Scheduler`` exposing
     ``projected_memory_max_context``, or ``None``.
@@ -479,8 +500,9 @@ def _reported_modality(
         return profile_modality
     if is_text_only:
         # Operator pinned the text lane for a vision-config checkpoint —
-        # authoritative, do not consult is_mllm_model.
-        return "text"
+        # authoritative, do not consult is_mllm_model. A text lane that reads
+        # the images itself (``text_lane_vision``) is the one exception.
+        return "image" if _served_text_lane_reads_images(model_id) else "text"
     served = _served_engine_is_mllm(model_id)
     if served is not None:
         # The LIVE engine is the post-load SSOT for the served model and wins
@@ -557,8 +579,9 @@ def _is_vlm(
             return True
     if is_text_only:
         # Operator pinned the text lane for a vision-config checkpoint —
-        # authoritative, do not advertise the vision capability.
-        return False
+        # authoritative, do not advertise the vision capability, unless that
+        # text lane reads the images itself (``text_lane_vision``).
+        return _served_text_lane_reads_images(model_id)
     served = _served_engine_is_mllm(model_id)
     if served is not None:
         # Live engine is authoritative for the served model, BOTH ways (see

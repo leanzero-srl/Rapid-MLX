@@ -622,3 +622,57 @@ class TestIsTextOnlyOverride:
             f"capability leaked: {info.capabilities}."
         )
         assert "text" in info.capabilities
+
+
+class TestTextLaneVisionOverridesTheTextOnlyPin:
+    """qwen3.8-flash-next-4bit pins ``is_text_only`` (it must never take the
+    serialized MLLM lane), yet with ``text_lane_vision`` its TEXT lane encodes
+    images. Served under the alias's hf_path (what goose sends as
+    --served-model-name), /v1/models listed ["text","tools","experimental"], so
+    goose's openai provider replaced every image with the text-only placeholder
+    (live, workmule 2026-10-29). The live engine's text-lane vision wins over the
+    pin; a text-only engine behind the same alias keeps the pin.
+    """
+
+    MODEL_ID = "rapid-mlx/Qwen3.8-Flash-Next-4bit"
+
+    class _Engine:
+        def __init__(self, accepts_images, is_mllm=False):
+            self.accepts_images = accepts_images
+            self.is_mllm = is_mllm
+
+    def _info(self, monkeypatch, engine):
+        from rapid_mlx.config import get_config
+        from rapid_mlx.routes import models as models_route
+        from rapid_mlx.runtime.model_registry import ModelEntry, ModelRegistry
+
+        registry = ModelRegistry()
+        registry.add(
+            ModelEntry(engine=engine, model_name=self.MODEL_ID, model_path=self.MODEL_ID),
+            is_default=True,
+        )
+        monkeypatch.setattr(get_config(), "model_registry", registry)
+        # The checkpoint's config/index declare a tower (the static detector's verdict).
+        monkeypatch.setattr(models_route, "is_mllm_model", lambda _mid: True)
+        return models_route._build_model_info(self.MODEL_ID)
+
+    def test_the_alias_pins_text_only(self):
+        from rapid_mlx.model_aliases import resolve_profile
+
+        assert resolve_profile(self.MODEL_ID).is_text_only is True
+
+    def test_text_lane_vision_engine_advertises_vision_and_image(self, monkeypatch):
+        info = self._info(monkeypatch, self._Engine(accepts_images=True))
+        assert "vision" in info.capabilities, info.capabilities
+        assert info.capabilities.index("text") < info.capabilities.index("vision")
+        assert info.modality == "image"
+
+    def test_text_only_engine_behind_the_alias_keeps_the_pin(self, monkeypatch):
+        info = self._info(monkeypatch, self._Engine(accepts_images=False))
+        assert "vision" not in info.capabilities, info.capabilities
+        assert info.modality == "text"
+
+    def test_an_engine_without_the_attribute_keeps_the_pin(self, monkeypatch):
+        info = self._info(monkeypatch, object())
+        assert "vision" not in info.capabilities, info.capabilities
+        assert info.modality == "text"
