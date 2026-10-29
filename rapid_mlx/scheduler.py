@@ -8758,6 +8758,7 @@ class Scheduler:
                 _cache_has_non_trimmable(cache)
                 or any(type(layer) is RotatingKVCache for layer in cache)
             )
+            or not self._memguard_boundary_keepable(cache)
         ):
             return
         kept: list[Any] = []
@@ -8794,6 +8795,27 @@ class Scheduler:
             boundary,
             sum(int(a.nbytes) for _l, _s, a in _layer_arrays(state)) / 1e9,
         )
+
+    def _memguard_boundary_keepable(self, cache: Any) -> bool:
+        """The turn end can rebuild a message-boundary entry from this
+        cache's layout (``_memguard_keep_boundary_state``): every layer is a
+        recurrent ``ArraysCache``, a ``RotatingKVCache`` or a plain
+        ``KVCache``. False for any other layer type (qwen4_exp's hybrid
+        layers, workmule 2026-10-29): there the mid-turn COPY is the
+        conversation's only way to keep its resume point."""
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+        from .memory_cache import _layer_is_non_trimmable
+
+        if self.memory_aware_cache is None or not cache:
+            return False
+        for layer in cache:
+            if type(layer) is RotatingKVCache or type(layer) is KVCache:
+                continue
+            if _layer_is_non_trimmable(layer) and type(layer) is ArraysCache:
+                continue
+            return False
+        return True
 
     def _memguard_boundary_cover(
         self, key: tuple, entry: Any, finished: str | None = None
@@ -10470,7 +10492,31 @@ class Scheduler:
         if ceiling <= 0:
             return True  # the guard is inert (no device ceiling)
         device = ceiling
-        if not handoff and not turn_end and kind == "prefix entry":
+        # A prefix of the request's OWN prompt (a message boundary, the whole
+        # prompt, a requeue's held tokens): it supersedes the conversation's
+        # shorter resume points, which _memguard_supersede drops right after
+        # the store anyway.
+        own_prompt_prefix = (
+            request is not None
+            and not turn_end
+            and kind == "prefix entry"
+            and 0 < tokens <= len(request.prompt_token_ids or ())
+        )
+        # The copy is the ONLY way this conversation keeps a resume point
+        # when its cache cannot be trimmed and the turn end cannot rebuild a
+        # boundary from its layout (qwen4_exp, workmule 2026-10-29: every
+        # boundary copy from 213k on was skipped under the machine ceiling,
+        # 96.9 GB on an idle 128 GB Studio whose kernel/OS wired ~25 GB, and
+        # the turn end stored nothing -- the hit stuck at 200,785 tokens and
+        # every turn re-prefilled 14-24k tokens, TTFT 88-162 s). Then the
+        # copy is NECESSARY memory: the device ceiling.
+        necessary_copy = (
+            own_prompt_prefix
+            and not handoff
+            and _cache_has_non_trimmable(cache)
+            and not self._memguard_boundary_keepable(cache)
+        )
+        if not handoff and not turn_end and kind == "prefix entry" and not necessary_copy:
             # A mid-turn COPY is optional memory: on a machine whose other
             # processes need the room it is refused (a machine that leaves
             # nothing: 0), and the boundary is kept as recurrent state and
@@ -10545,9 +10591,16 @@ class Scheduler:
             # fully hit): those resume points never give way to it.
             # (_memguard_supersede and the ranking keep them for the same
             # reason.)
+            # Unless this entry is itself a prefix of the request's own
+            # prompt: then the own resume points it extends are superseded by
+            # it -- evicting the older one first is a swap, never a loss
+            # (skipping the store instead left the 200,785-token entry as the
+            # conversation's newest for good, workmule 2026-10-29).
             own_resume_points = (
                 request.prompt_token_ids
-                if request is not None and _cache_has_non_trimmable(cache)
+                if request is not None
+                and _cache_has_non_trimmable(cache)
+                and not own_prompt_prefix
                 else None
             )
 
