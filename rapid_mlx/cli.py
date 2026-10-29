@@ -3943,6 +3943,38 @@ def _apply_qwen4_offload_env(args) -> None:
             os.environ["RAPID_MLX_QWEN4_OFFLOAD_DIR"] = path
 
 
+def _add_qwen4_rope_args(parser) -> None:
+    """Qwen3.8 Flash-Next (qwen4_exp) YaRN context extension, default OFF."""
+    parser.add_argument(
+        "--qwen4-rope-scaling",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Opt-in YaRN rope scaling for qwen4_exp past the native 262,144 "
+            "tokens: 'yarn' (Qwen's recipe, factor 4 -> ~1M), 'yarn:<factor>', "
+            "a JSON rope_parameters override, or 'off' to disable a "
+            "checkpoint's own yarn. Unset = the checkpoint's config."
+        ),
+    )
+
+
+def _apply_qwen4_rope_env(args) -> None:
+    """Translate --qwen4-rope-scaling into the env the model module reads."""
+    import os
+
+    spec = getattr(args, "qwen4_rope_scaling", None)
+    if spec is None:
+        return
+    from .models.qwen4_exp_rope import ROPE_SCALING_ENV, parse_rope_scaling_override
+
+    try:
+        parse_rope_scaling_override(spec)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    os.environ[ROPE_SCALING_ENV] = spec
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -3951,6 +3983,7 @@ def serve_command(args):
 
     _validate_primary_lifecycle_args(args)
     _apply_qwen4_offload_env(args)
+    _apply_qwen4_rope_env(args)
 
     if bounds_error := _vision_pixel_bounds_error(
         getattr(args, "vision_min_pixels", 0),
@@ -11966,6 +11999,7 @@ Examples:
         ),
     )
     _add_qwen4_offload_args(serve_parser)
+    _add_qwen4_rope_args(serve_parser)
     serve_parser.add_argument(
         "--disk-stream-cache-gb",
         type=positive_finite_float,

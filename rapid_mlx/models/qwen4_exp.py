@@ -61,6 +61,11 @@ from ..kernels.qwen4_fused_gdn_decode import (  # noqa: E402
     qwen4_fused_gdn_decode,
 )
 from .qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache  # noqa: E402
+from .qwen4_exp_rope import (  # noqa: E402
+    YarnScaling,
+    resolve_rope_scaling,
+    yarn_inverse_frequency,
+)
 
 _FUSED_GDN_MODES = ("stock", "fused")
 _FUSED_GDN_DEFAULT = os.environ.get(
@@ -99,6 +104,8 @@ class TextModelArgs(BaseModelArgs):
     )
     partial_rotary_factor: float = 0.25
     rope_theta: float = 10_000_000.0
+    # Resolved YaRN dict (opt-in; see qwen4_exp_rope).  None = default rope.
+    rope_scaling: dict[str, Any] | None = None
 
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 48
@@ -142,6 +149,12 @@ class TextModelArgs(BaseModelArgs):
             rope.get("partial_rotary_factor", self.partial_rotary_factor)
         )
         self.rope_theta = float(rope.get("rope_theta", self.rope_theta))
+        yarn = resolve_rope_scaling(
+            rope, self.rope_scaling, self.max_position_embeddings
+        )
+        self.rope_scaling = None if yarn is None else yarn.as_dict()
+        if yarn is not None:
+            self.max_position_embeddings = yarn.max_position_embeddings
         self.ple_embed_dim = (
             self.hidden_size if self.ple_embed_dim is None else self.ple_embed_dim
         )
@@ -799,6 +812,8 @@ def apply_rotary_positions(
     *,
     rotary_dim: int,
     base: float,
+    inverse_frequency: mx.array | None = None,
+    attention_factor: float = 1.0,
 ) -> mx.array:
     """Apply non-interleaved partial RoPE at explicit logical positions.
 
@@ -813,13 +828,17 @@ def apply_rotary_positions(
         raise ValueError("Qwen4-Exp rotary dimensions must be even")
     if positions.ndim == 1:
         positions = positions[None, :]
-    inverse_frequency = 1.0 / (
-        base ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / float(rotary_dim))
-    )
+    if inverse_frequency is None:
+        inverse_frequency = 1.0 / (
+            base ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / float(rotary_dim))
+        )
     angles = positions.astype(mx.float32)[..., None] * inverse_frequency
     angles = mx.concatenate([angles, angles], axis=-1)[:, :, None, :]
     cosine = mx.cos(angles)
     sine = mx.sin(angles)
+    if attention_factor != 1.0:
+        cosine = cosine * attention_factor
+        sine = sine * attention_factor
     rotary = x[..., :rotary_dim]
     half = rotary_dim // 2
     rotated_half = mx.concatenate([-rotary[..., half:], rotary[..., :half]], axis=-1)
@@ -828,7 +847,9 @@ def apply_rotary_positions(
 
 
 @cache
-def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
+def _qwen4_exp_rope_kernel(
+    rotary_dim: int, position_ndim: int, attention_factor: float = 1.0
+):
     """Build the architecture's half-split MRoPE forward kernel.
 
     Forward math is adopted line-for-line from mlx-vlm commit
@@ -853,6 +874,15 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
         )
     if not mx.metal.is_available():
         return None
+    # YaRN's attention factor scales cos and sin (the rotary half of q/k).
+    # Absent (1.0) the source, and so the compiled kernel, is unchanged.
+    scale_source = ""
+    name_suffix = ""
+    if attention_factor != 1.0:
+        scale_source = f" c *= {attention_factor!r}f; s *= {attention_factor!r}f;"
+        name_suffix = "_af" + float(attention_factor).hex().replace(".", "_").replace(
+            "+", "p"
+        ).replace("-", "m")
     source = f"""
         uint elem = thread_position_in_grid.x;
 
@@ -891,7 +921,7 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
         float pos = static_cast<float>({position_expr});
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         float c = metal::cos(angle);
-        float s = metal::sin(angle);
+        float s = metal::sin(angle);{scale_source}
 
         int idx = base + d;
         float xv = static_cast<float>(x[idx]);
@@ -900,7 +930,7 @@ def _qwen4_exp_rope_kernel(rotary_dim: int, position_ndim: int):
         x_out[base + pair_d] = static_cast<T>(xp * c + xv * s);
     """
     return mx.fast.metal_kernel(
-        name=f"qwen4_exp_rope_half_split_{rotary_dim}_{position_ndim}d",
+        name=f"qwen4_exp_rope_half_split_{rotary_dim}_{position_ndim}d{name_suffix}",
         input_names=input_names,
         output_names=["x_out"],
         source=source,
@@ -928,6 +958,7 @@ def _apply_mrope_positions(
     selector: mx.array,
     inverse_frequency: mx.array,
     rotary_dim: int,
+    attention_factor: float = 1.0,
 ) -> mx.array:
     """Pure-MLX multimodal RoPE on ``[B, H, L, D]`` (the non-Metal path)."""
     per_frequency = mx.take(positions, selector, axis=0).transpose(1, 2, 0)
@@ -936,7 +967,12 @@ def _apply_mrope_positions(
     rotary = x[..., :rotary_dim]
     half = rotary_dim // 2
     rotated_half = mx.concatenate([-rotary[..., half:], rotary[..., :half]], axis=-1)
-    rotated = rotary * mx.cos(angles) + rotated_half * mx.sin(angles)
+    cosine = mx.cos(angles)
+    sine = mx.sin(angles)
+    if attention_factor != 1.0:
+        cosine = cosine * attention_factor
+        sine = sine * attention_factor
+    rotated = rotary * cosine + rotated_half * sine
     return mx.concatenate([rotated.astype(x.dtype), x[..., rotary_dim:]], axis=-1)
 
 
@@ -947,6 +983,7 @@ def apply_qwen4_exp_rope(
     rotary_dim: int,
     base: float,
     mrope_section: tuple[int, ...] = (),
+    rope_scaling: YarnScaling | None = None,
 ) -> mx.array:
     """Apply exact Qwen4-Exp text RoPE to ``[B, H, L, D]`` states.
 
@@ -958,9 +995,14 @@ def apply_qwen4_exp_rope(
 
     if positions.ndim == 1:
         positions = mx.broadcast_to(positions[None], (x.shape[0], positions.size))
-    inverse_frequency = 1.0 / (
-        base ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / float(rotary_dim))
-    )
+    attention_factor = 1.0
+    if rope_scaling is None:
+        inverse_frequency = 1.0 / (
+            base ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / float(rotary_dim))
+        )
+    else:
+        inverse_frequency = yarn_inverse_frequency(rotary_dim, base, rope_scaling)
+        attention_factor = rope_scaling.attention_factor
     extra_inputs = []
     if positions.ndim == 3:
         if not mrope_section:
@@ -971,17 +1013,27 @@ def apply_qwen4_exp_rope(
             tuple(mrope_section), inverse_frequency.shape[0]
         )
         extra_inputs.append(selector)
-    kernel = _qwen4_exp_rope_kernel(rotary_dim, positions.ndim)
+    if attention_factor == 1.0:
+        kernel = _qwen4_exp_rope_kernel(rotary_dim, positions.ndim)
+    else:
+        kernel = _qwen4_exp_rope_kernel(rotary_dim, positions.ndim, attention_factor)
     if kernel is None:
         if positions.ndim == 3:
             return _apply_mrope_positions(
-                x, positions, selector, inverse_frequency, rotary_dim
+                x,
+                positions,
+                selector,
+                inverse_frequency,
+                rotary_dim,
+                attention_factor=attention_factor,
             )
         return apply_rotary_positions(
             x.transpose(0, 2, 1, 3),
             positions,
             rotary_dim=rotary_dim,
             base=base,
+            inverse_frequency=None if rope_scaling is None else inverse_frequency,
+            attention_factor=attention_factor,
         ).transpose(0, 2, 1, 3)
     half_dim = inverse_frequency.shape[0]
     slots = half_dim + x.shape[-1] - rotary_dim
@@ -995,6 +1047,21 @@ def apply_qwen4_exp_rope(
         output_dtypes=[x.dtype],
     )
     return output
+
+
+def _rope_yarn(args: TextModelArgs) -> YarnScaling | None:
+    if not args.rope_scaling:
+        return None
+    stored = args.rope_scaling
+    return YarnScaling(
+        factor=float(stored["factor"]),
+        original_max_position_embeddings=int(
+            stored["original_max_position_embeddings"]
+        ),
+        beta_fast=float(stored["beta_fast"]),
+        beta_slow=float(stored["beta_slow"]),
+        attention_factor=float(stored["attention_factor"]),
+    )
 
 
 def _mrope_section(args: TextModelArgs) -> tuple[int, ...]:
@@ -1072,6 +1139,7 @@ class QSAIndexer(nn.Module):
         self.rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope_theta = args.rope_theta
         self.mrope_section = _mrope_section(args)
+        self.rope_yarn = _rope_yarn(args)
         self.index_qk_proj = nn.Linear(
             args.hidden_size,
             (self.num_heads + self.num_kv_heads) * self.head_dim,
@@ -1123,6 +1191,7 @@ class QSAIndexer(nn.Module):
             rotary_dim=self.rotary_dim,
             base=self.rope_theta,
             mrope_section=self.mrope_section,
+            rope_scaling=self.rope_yarn,
         ).transpose(0, 2, 1, 3)
 
         # A compressed key rotates at its group's first token.  With
@@ -1167,6 +1236,7 @@ class QSAIndexer(nn.Module):
                 rotary_dim=self.rotary_dim,
                 base=self.rope_theta,
                 mrope_section=self.mrope_section,
+                rope_scaling=self.rope_yarn,
             )[:, 0, 0, :]
 
         def transform_groups(groups: mx.array, starts: mx.array) -> mx.array:
@@ -1179,6 +1249,7 @@ class QSAIndexer(nn.Module):
                 rotary_dim=self.rotary_dim,
                 base=self.rope_theta,
                 mrope_section=self.mrope_section,
+                rope_scaling=self.rope_yarn,
             )[:, 0, :, :]
 
         cache.update(
@@ -1347,6 +1418,7 @@ class QSAAttention(nn.Module):
         self.q_norm = ZeroCenteredRMSNorm(args.head_dim, eps=args.rms_norm_eps)
         self.k_norm = ZeroCenteredRMSNorm(args.head_dim, eps=args.rms_norm_eps)
         self.mrope_section = _mrope_section(args)
+        self.rope_yarn = _rope_yarn(args)
         self.rope = initialize_rope(
             self.rotary_dim,
             base=args.rope_theta,
@@ -1439,6 +1511,7 @@ class QSAAttention(nn.Module):
             rotary_dim=self.rotary_dim,
             base=self.indexer.rope_theta,
             mrope_section=self.mrope_section,
+            rope_scaling=self.rope_yarn,
         )
         keys = apply_qwen4_exp_rope(
             keys.transpose(0, 2, 1, 3),
@@ -1446,6 +1519,7 @@ class QSAAttention(nn.Module):
             rotary_dim=self.rotary_dim,
             base=self.indexer.rope_theta,
             mrope_section=self.mrope_section,
+            rope_scaling=self.rope_yarn,
         )
         if kv_cache is not None:
             keys, values = kv_cache.update_and_fetch(keys, values)
@@ -2258,7 +2332,12 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
+        text_args = TextModelArgs.from_dict(args.text_config)
+        self.language_model = TextModel(text_args)
+        if text_args.rope_scaling:
+            # The served context limit reads ``model.args`` first: advertise
+            # the YaRN-extended window only when scaling is on.
+            self.args.max_position_embeddings = text_args.max_position_embeddings
 
     def __call__(
         self,
