@@ -62,12 +62,12 @@ from ..api.tool_calling import (
     validate_output_against_schema,
 )
 from ..api.utils import (
-    model_accepts_audio,
     UnsupportedContentBlockError,
     clean_output_text,
     decode_inline_tool_call_arguments,
     extract_json_from_response,
     extract_multimodal_content,
+    model_accepts_audio,
     sanitize_content_for_stream,
     sanitize_output,
     sanitize_reasoning_for_stream,

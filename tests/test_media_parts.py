@@ -7,7 +7,11 @@ import os
 import pytest
 
 from rapid_mlx.api import media_parts
-from rapid_mlx.api.media_parts import expand_media_parts, is_audio_marker, model_hears_audio
+from rapid_mlx.api.media_parts import (
+    expand_media_parts,
+    is_audio_marker,
+    model_hears_audio,
+)
 from rapid_mlx.api.utils import extract_multimodal_content
 
 WAV = base64.b64encode(b"RIFF\x24\x00\x00\x00WAVEfmt ").decode()
