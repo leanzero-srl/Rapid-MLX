@@ -28,8 +28,8 @@ from pathlib import Path
 from typing import Any
 
 from ..api.errors import GuidedGenerationCancelledError
-from ..api.tool_calling import convert_tools_for_template
 from ..api.media_parts import expand_media_parts
+from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
     clean_output_text,
     extract_multimodal_content,
