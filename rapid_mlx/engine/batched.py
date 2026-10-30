@@ -3514,7 +3514,8 @@ class BatchedEngine(BaseEngine):
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         audios: list[str] = []
-        if self._is_mllm:
+        # getattr: engines assembled without __init__ (the streaming tests build one field by field) are text-only.
+        if getattr(self, "_is_mllm", False):
             messages, audios = expand_media_parts(messages)
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
@@ -4569,7 +4570,8 @@ class BatchedEngine(BaseEngine):
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         audios: list[str] = []
-        if self._is_mllm:
+        # getattr: engines assembled without __init__ (the streaming tests build one field by field) are text-only.
+        if getattr(self, "_is_mllm", False):
             messages, audios = expand_media_parts(messages)
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
