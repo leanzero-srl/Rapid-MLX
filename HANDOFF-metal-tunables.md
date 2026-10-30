@@ -61,3 +61,12 @@ gate + bench parity rows + launcher enforcement. Final report <= 5 lines with nu
   but binds earlier than Activity Monitor suggests.
 - lz.19 tag exists (cache reclaim) but goose main pins lz.18.
 - Do not touch the mule while the Gauntlet engine runs (read-only GETs only).
+
+## GOOSE LANE STATE (agent returned at its own 350k guard, 2026-10-30)
+Worktree ~/Projects/goose-memory-tunables, branch lz/memory-tunables, NOT merged/pushed. Commits d2e9f6bed3 (sidecar argv
+per tunable), 5a553eac88 (ACP fields + memory_budget + wired-limit read/apply/LaunchDaemon), 51bab82038 (desktop Memory
+tab, 16 locales), 2e0451c552 (SDK regen), 39c7168fe2 (its HANDOFF.md: exact commands). Config keys under
+mlx_engine.memory. lz.20-only flags sent only when the launcher pins >= v0.14.3-lz.20 (else mount fails naming it).
+Open there: re-run clippy + regen acp-schema/SDK after the 5% commit, UI vitest + full test:run (Memory tab may break
+tab-list tests), the live CDP check (one Goose app per Mac), the independent reviewer, rebase + merge + push.
+Known unrelated failure: key_connection::only_a_refused_loopback_connect (verify on clean main).
