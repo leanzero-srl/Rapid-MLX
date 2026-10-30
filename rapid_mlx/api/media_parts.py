@@ -31,7 +31,13 @@ AUDIO_MARKER_TYPE = "audio"
 VIDEO_FPS = float(os.environ.get("RAPID_MLX_VIDEO_FRAME_FPS", "1.0"))
 VIDEO_MAX_FRAMES = int(os.environ.get("RAPID_MLX_VIDEO_MAX_FRAMES", "16"))
 
-_AUDIO_SUFFIX = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac", "m4a": ".m4a", "ogg": ".ogg"}
+_AUDIO_SUFFIX = {
+    "wav": ".wav",
+    "mp3": ".mp3",
+    "flac": ".flac",
+    "m4a": ".m4a",
+    "ogg": ".ogg",
+}
 
 
 def is_audio_marker(part: Any) -> bool:
@@ -67,7 +73,8 @@ def _write_audio(data: str, fmt: str) -> str:
     if not raw:
         raise ValueError("input_audio.data is empty")
     fd, path = tempfile.mkstemp(
-        prefix="rapid-mlx-audio-", suffix=_AUDIO_SUFFIX.get(fmt.lower(), "." + fmt.lower())
+        prefix="rapid-mlx-audio-",
+        suffix=_AUDIO_SUFFIX.get(fmt.lower(), "." + fmt.lower()),
     )
     with os.fdopen(fd, "wb") as f:
         f.write(raw)
@@ -90,7 +97,9 @@ def _frames_for(source: Any, fps: float, max_frames: int) -> list[str]:
     for frame in frames:
         buf = io.BytesIO()
         Image.fromarray(frame).save(buf, "JPEG", quality=90)
-        urls.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
+        urls.append(
+            "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        )
     return urls
 
 
@@ -131,11 +140,15 @@ def expand_media_parts(
                         ),
                     }
                 )
-                parts.extend({"type": "image_url", "image_url": {"url": p}} for p in frames)
+                parts.extend(
+                    {"type": "image_url", "image_url": {"url": p}} for p in frames
+                )
                 changed = True
             elif kind == "input_audio":
                 value = part.get("input_audio") or {}
-                audios.append(_write_audio(value.get("data", ""), value.get("format", "wav")))
+                audios.append(
+                    _write_audio(value.get("data", ""), value.get("format", "wav"))
+                )
                 parts.append({"type": AUDIO_MARKER_TYPE})
                 changed = True
             else:

@@ -40,7 +40,10 @@ def test_input_audio_becomes_a_file_and_a_template_marker():
 
 
 def test_messages_without_media_come_back_unchanged():
-    messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}, {"role": "assistant", "content": "x"}]
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": "x"},
+    ]
     out, audios = expand_media_parts(messages)
     assert audios == []
     assert out[0] is messages[0] and out[1] is messages[1]
@@ -49,31 +52,67 @@ def test_messages_without_media_come_back_unchanged():
 def test_bad_base64_audio_is_a_client_error():
     with pytest.raises(ValueError, match="base64"):
         expand_media_parts(
-            [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "@@", "format": "wav"}}]}]
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "@@", "format": "wav"},
+                        }
+                    ],
+                }
+            ]
         )
 
 
 def test_a_video_part_becomes_a_label_and_one_image_part_per_frame(monkeypatch):
-    monkeypatch.setattr(media_parts, "_frames_for", lambda source, fps, n: ["/tmp/f0.jpg", "/tmp/f1.jpg", "/tmp/f2.jpg"])
-    out, audios = expand_media_parts(
-        [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}]}],
-        fps=1.0,
+    monkeypatch.setattr(
+        media_parts,
+        "_frames_for",
+        lambda source, fps, n: ["/tmp/f0.jpg", "/tmp/f1.jpg", "/tmp/f2.jpg"],
     )
-    parts = out[0]["content"]
-    assert audios == []
-    assert parts[0]["type"] == "text" and "3 frames" in parts[0]["text"]
-    assert [p["image_url"]["url"] for p in parts[1:]] == ["/tmp/f0.jpg", "/tmp/f1.jpg", "/tmp/f2.jpg"]
-
-
-def test_the_extractor_skips_the_audio_marker_and_counts_frames_as_images(monkeypatch):
-    monkeypatch.setattr(media_parts, "_frames_for", lambda source, fps, n: ["/tmp/f0.jpg"])
     out, audios = expand_media_parts(
         [
             {
                 "role": "user",
                 "content": [
-                    {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
-                    {"type": "input_audio", "input_audio": {"data": WAV, "format": "wav"}},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "data:video/mp4;base64,AAAA"},
+                    }
+                ],
+            }
+        ],
+        fps=1.0,
+    )
+    parts = out[0]["content"]
+    assert audios == []
+    assert parts[0]["type"] == "text" and "3 frames" in parts[0]["text"]
+    assert [p["image_url"]["url"] for p in parts[1:]] == [
+        "/tmp/f0.jpg",
+        "/tmp/f1.jpg",
+        "/tmp/f2.jpg",
+    ]
+
+
+def test_the_extractor_skips_the_audio_marker_and_counts_frames_as_images(monkeypatch):
+    monkeypatch.setattr(
+        media_parts, "_frames_for", lambda source, fps, n: ["/tmp/f0.jpg"]
+    )
+    out, audios = expand_media_parts(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "data:video/mp4;base64,AAAA"},
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": WAV, "format": "wav"},
+                    },
                 ],
             }
         ]
