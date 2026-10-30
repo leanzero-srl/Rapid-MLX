@@ -29,6 +29,7 @@ from typing import Any
 
 from ..api.errors import GuidedGenerationCancelledError
 from ..api.tool_calling import convert_tools_for_template
+from ..api.media_parts import expand_media_parts
 from ..api.utils import (
     clean_output_text,
     extract_multimodal_content,
@@ -2874,14 +2875,17 @@ class BatchedEngine(BaseEngine):
         return prepared
 
     def _uses_mllm_request_path(
-        self, images: list[str] | None, videos: list[str] | None
+        self,
+        images: list[str] | None,
+        videos: list[str] | None,
+        audios: list[str] | None = None,
     ) -> bool:
         """Return whether this request needs the media-capable scheduler."""
 
         return bool(
             self._is_mllm
             and self._mllm_scheduler
-            and (getattr(self, "_engine", None) is None or images or videos)
+            and (getattr(self, "_engine", None) is None or images or videos or audios)
         )
 
     async def _expand_text_lane_images(
@@ -2952,7 +2956,8 @@ class BatchedEngine(BaseEngine):
                 admission_token, clear_context=owns_admission
             )
 
-        if self._uses_mllm_request_path(images, videos):
+        audios = kwargs.pop("audios", None)
+        if self._uses_mllm_request_path(images, videos, audios):
             mllm_scheduler = self._mllm_scheduler
             assert mllm_scheduler is not None
             # Media requests always use the MLLM scheduler. Qualified hybrid
@@ -2997,6 +3002,7 @@ class BatchedEngine(BaseEngine):
                     prompt=prompt,
                     images=images,
                     videos=videos,
+                    audios=audios,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
@@ -3232,7 +3238,8 @@ class BatchedEngine(BaseEngine):
             if owns_admission and not request_committed:
                 self.release_admission_reservation()
 
-        if self._uses_mllm_request_path(images, videos):
+        audios = kwargs.pop("audios", None)
+        if self._uses_mllm_request_path(images, videos, audios):
             mllm_scheduler = self._mllm_scheduler
             assert mllm_scheduler is not None
             # Media always stays on MLLMScheduler; only qualified text-only
@@ -3261,6 +3268,7 @@ class BatchedEngine(BaseEngine):
                     prompt=prompt,
                     images=images,
                     videos=videos,
+                    audios=audios,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
@@ -3505,6 +3513,9 @@ class BatchedEngine(BaseEngine):
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
+        audios: list[str] = []
+        if self._is_mllm:
+            messages, audios = expand_media_parts(messages)
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -3633,6 +3644,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            audios=audios or None,
             **kwargs,
         )
 
@@ -4556,6 +4568,9 @@ class BatchedEngine(BaseEngine):
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
+        audios: list[str] = []
+        if self._is_mllm:
+            messages, audios = expand_media_parts(messages)
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -4666,6 +4681,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            audios=audios or None,
             **kwargs,
         )
         # Prime scheduler admission before exposing any synthetic prefix. The

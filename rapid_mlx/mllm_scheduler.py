@@ -172,6 +172,8 @@ class MLLMRequest:
     prompt: str | list[int]
     images: list[str] | None = None
     videos: list[str] | None = None
+    # Local audio file paths (one per input_audio part, in prompt order).
+    audios: list[str] | None = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     stop: list[str] = field(default_factory=list)  # Text-based stop sequences
     video_fps: float | None = None
@@ -721,6 +723,7 @@ class MLLMScheduler:
             prompt=prompt,
             images=images,
             videos=videos,
+            audios=kwargs.pop("audios", None),
             sampling_params=sampling_params,
             stop=stop or [],
             video_fps=video_fps,
@@ -1023,6 +1026,7 @@ class MLLMScheduler:
                 prompt=request.prompt,
                 images=request.images,
                 videos=request.videos,
+                audios=request.audios,
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
