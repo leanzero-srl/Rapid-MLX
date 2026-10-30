@@ -131,7 +131,9 @@ class ContextExceedsDeviceMemoryError(Exception):
             "code": "context_length_exceeded",
             "n_prompt_tokens": self.prompt_tokens,
             "n_ctx": self.max_context,
-            "lz_reason": DEVICE_MEMORY_ERROR_KIND,
+            "lz_reason": (
+                "max_model_len" if self.limit == "max_model_len" else DEVICE_MEMORY_ERROR_KIND
+            ),
         }
         if self.max_tokens_reserved is not None:
             body["max_tokens_reserved"] = self.max_tokens_reserved

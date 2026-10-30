@@ -155,6 +155,7 @@ def test_max_model_len_caps_admission_and_the_window(llama, monkeypatch):
     refusal = scheduler.device_memory_admission(3001)
     assert refusal is not None and refusal.limit == "max_model_len"
     assert refusal.error_object()["n_ctx"] == 3000
+    assert refusal.error_object()["lz_reason"] == "max_model_len"
     assert "--max-model-len" in refusal.message
     assert scheduler.device_memory_admission(2999) is None
     window = scheduler.memory_guard_max_context(3000, stable=False)
