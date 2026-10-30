@@ -515,11 +515,50 @@ def _sysctl_int(name: bytes, ctype_name: str = "c_int") -> int | None:
 class MachineMemory:
     """One reading of the machine's memory (``host_statistics64``)."""
 
-    __slots__ = ("used", "swapouts")
+    __slots__ = ("used", "swapouts", "breakdown")
 
-    def __init__(self, used: int, swapouts: int):
+    def __init__(self, used: int, swapouts: int, breakdown: dict | None = None):
         self.used = int(used)  # resident bytes in use, Activity Monitor's
         self.swapouts = int(swapouts)  # pages swapped out since boot
+        # bytes per vm_stat class: what counts and what is left out (status)
+        self.breakdown = breakdown
+
+
+def used_bytes_from_pages(
+    *,
+    page: int,
+    wired: int,
+    internal: int,
+    purgeable: int,
+    compressor: int,
+    external: int = 0,
+    free: int = 0,
+    speculative: int = 0,
+) -> tuple[int, dict]:
+    """Memory that is really unavailable, from ``host_statistics64`` page
+    counts: wired + anonymous (internal, active AND inactive: an inactive
+    anonymous page only leaves RAM by being compressed or swapped) -
+    purgeable (volatile, the kernel drops it on demand) + the pages the
+    compressor occupies. NOT counted: file-backed (external) pages -- the
+    file cache, including the engine's own memory-mapped files such as the
+    qwen4 PLE shards (np.memmap, read-only, never wired), which macOS frees
+    on demand -- nor free or speculative pages. Measured on the mule
+    2026-10-30 mid-Gauntlet: used 119.5 GB = wired 102.0 + anonymous 16.5 +
+    compressor 1.4, with 19.5 GB of file-backed pages left out.
+
+    Returns ``(used_bytes, breakdown)``; the breakdown is published in
+    /v1/status ``memory_budget.machine`` so the floor's input is auditable."""
+    pages = int(wired) + int(internal) - int(purgeable) + int(compressor)
+    breakdown = {
+        "wired_bytes": int(wired) * page,
+        "anonymous_bytes": int(internal) * page,
+        "compressor_bytes": int(compressor) * page,
+        "purgeable_excluded_bytes": int(purgeable) * page,
+        "file_backed_excluded_bytes": int(external) * page,
+        "free_bytes": int(free) * page,
+        "speculative_excluded_bytes": int(speculative) * page,
+    }
+    return max(0, pages) * page, breakdown
 
 
 _VM_STATISTICS64 = None
@@ -578,13 +617,17 @@ def system_memory_used() -> MachineMemory | None:
         page = _sysctl_int(b"hw.pagesize", "c_uint64") or 0
         if page <= 0:
             return None
-        pages = (
-            vm.wire_count
-            + vm.internal_page_count
-            - vm.purgeable_count
-            + vm.compressor_page_count
+        used, breakdown = used_bytes_from_pages(
+            page=page,
+            wired=vm.wire_count,
+            internal=vm.internal_page_count,
+            purgeable=vm.purgeable_count,
+            compressor=vm.compressor_page_count,
+            external=vm.external_page_count,
+            free=vm.free_count,
+            speculative=vm.speculative_count,
         )
-        return MachineMemory(max(0, pages) * page, vm.swapouts)
+        return MachineMemory(used, vm.swapouts, breakdown)
     except Exception:  # noqa: BLE001
         return None
 

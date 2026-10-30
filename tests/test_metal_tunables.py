@@ -58,8 +58,14 @@ _ENVS = (
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
+    # setenv first so monkeypatch records the original state and restores it:
+    # the CLI tests write os.environ directly (_apply_memory_tunable_args), and
+    # a bare delenv of an absent variable records nothing, so those values
+    # leaked into the next test files (the store-ceiling and busy-machine
+    # suites then saw a 4 GB floor and refused a 600-token prompt).
     for name in _ENVS:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     with mb._process_floor_lock:
         saved = (mb._process_utilization_floor, mb._process_floor_generation)
         mb._process_utilization_floor = 0.0

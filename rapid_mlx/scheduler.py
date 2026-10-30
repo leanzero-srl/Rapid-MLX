@@ -9894,6 +9894,25 @@ class Scheduler:
             except Exception:  # noqa: BLE001
                 working_set = 0
         plan_need = getattr(self, "_memguard_plan_need", None)
+        # The floor's input, auditable: what host_statistics64 counts as
+        # unavailable (wired + anonymous - purgeable + compressor) and what it
+        # leaves out (file cache, incl. the engine's own memory-mapped files).
+        # Of the others, the engine's own non-Metal memory (Python objects,
+        # token buffers, driver allocations: phys_footprint - MLX active -
+        # MLX cache) is RAM it really holds, so it stays counted; it is
+        # published so "other apps" is never read as more than it is.
+        machine = dict(reading.breakdown or {}) if reading is not None else None
+        if machine is not None:
+            resident = int(self._current_process_resident_bytes() or 0)
+            machine["engine_metal_bytes"] = int(active + cache)
+            machine["engine_resident_bytes"] = resident or None
+            engine_extra = max(0, resident - int(active + cache)) if resident else 0
+            machine["others_engine_non_metal_bytes"] = (
+                min(engine_extra, int(others)) if others is not None else None
+            )
+            machine["others_rest_bytes"] = (
+                max(0, int(others) - engine_extra) if others is not None else None
+            )
         if ceiling < structural:
             binding = "memory_floor"
         else:
@@ -9921,6 +9940,7 @@ class Scheduler:
             "max_context_at_ceiling": self.memory_guard_max_context(
                 self._memguard_native_context()
             ),
+            "machine": machine,
             "tunables": tun.snapshot(),
         }
 

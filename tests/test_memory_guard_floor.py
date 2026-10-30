@@ -183,3 +183,74 @@ def test_the_reserve_fraction_moves_the_optional_memory_ceiling(llama, monkeypat
     monkeypatch.setenv(memory_budget.ENV_RESERVE_FRACTION, "0.3")
     wider = scheduler._memguard_cache_ceiling()
     assert default - wider == pytest.approx(0.22 * MACHINE_128, rel=0.01)
+
+
+# ── what the floor counts as used (owner question 2026-10-30) ────────────
+
+PAGE = 16384
+GB = 10**9
+
+
+def _pages(gb: float) -> int:
+    return int(gb * GB / PAGE)
+
+
+def test_file_cache_and_purgeable_are_not_counted_as_used():
+    """The engine's own memory-mapped files (qwen4 PLE shards, np.memmap,
+    read every step) are file-backed pages macOS frees on demand: they must
+    not count as memory other apps hold, nor may purgeable pages."""
+    base = dict(page=PAGE, wired=_pages(102.0), internal=_pages(16.5),
+                purgeable=_pages(0.04), compressor=_pages(1.36))
+    used, br = memory_budget.used_bytes_from_pages(**base, external=0)
+    used_cache, br_cache = memory_budget.used_bytes_from_pages(
+        **base, external=_pages(19.5), free=_pages(8.0), speculative=_pages(0.1)
+    )
+    assert used_cache == used  # 19.5 GB of file cache changes nothing
+    assert used == pytest.approx((102.0 + 16.5 - 0.04 + 1.36) * GB, rel=1e-3)
+    assert br_cache["file_backed_excluded_bytes"] == pytest.approx(19.5 * GB, rel=1e-3)
+    more_purgeable, _ = memory_budget.used_bytes_from_pages(
+        **{**base, "purgeable": _pages(5.04)}
+    )
+    assert used - more_purgeable == pytest.approx(5.0 * GB, rel=1e-3)
+
+
+def test_inactive_anonymous_memory_still_counts():
+    """An inactive anonymous page leaves RAM only by compression or swap:
+    the anonymous count (active + inactive) is used whole."""
+    used, br = memory_budget.used_bytes_from_pages(
+        page=PAGE, wired=0, internal=_pages(10.0), purgeable=0, compressor=0
+    )
+    assert used == br["anonymous_bytes"] == _pages(10.0) * PAGE
+
+
+def test_mule_floor_room_from_the_measured_breakdown():
+    """Mule mid-Gauntlet (lz.18, 2026-10-30): used 119.5 GB, MLX 97.4 GB,
+    so others = 22.4 GB; with a 7 GB floor (5% of 137.4) the RAM leaves the
+    engine 108.0 GB -- below the 112.0 GB auto cap at the default working
+    set, so a larger iogpu.wired_limit_mb buys no context there."""
+    physical = 137_438_953_472
+    used, _ = memory_budget.used_bytes_from_pages(
+        page=PAGE, wired=_pages(102.0), internal=_pages(16.5),
+        purgeable=_pages(0.04), compressor=_pages(1.36), external=_pages(19.5),
+    )
+    others = used - int(97.4 * GB)
+    room = memory_budget.floor_room_bytes(physical=physical, others=others, floor=7 * GB)
+    assert room == pytest.approx(108.0 * GB, abs=0.1 * GB)
+    assert room < int(0.97 * 115.45 * GB)
+
+
+def test_the_status_publishes_what_the_floor_counted(llama, monkeypatch):
+    monkeypatch.setenv(memory_budget.ENV_MEMORY_FLOOR_GB, str(FLOOR / 1e9))
+    scheduler, device = _scheduler(llama, monkeypatch, M4_MAX_128_CEILING)
+    machine = _Machine(monkeypatch, device, 1000 * MB, MACHINE_128)
+    breakdown = {"wired_bytes": 1, "anonymous_bytes": 2, "file_backed_excluded_bytes": 3}
+    monkeypatch.setattr(
+        memory_budget, "system_memory_used",
+        lambda: memory_budget.MachineMemory(machine.read().used, 0, breakdown),
+    )
+    monkeypatch.setattr(scheduler, "_current_process_resident_bytes", lambda: 0)
+    scheduler._memguard()
+    block = scheduler.get_stats()["memory_budget"]["machine"]
+    assert block["file_backed_excluded_bytes"] == 3
+    assert block["anonymous_bytes"] == 2
+    assert "engine_metal_bytes" in block and "others_rest_bytes" in block
