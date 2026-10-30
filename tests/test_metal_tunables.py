@@ -12,7 +12,7 @@ take, plus ~22 GB macOS kept for itself, sat unused.
 Each tunable is proven to REACH the engine and change what it does, not just
 to be stored. Devices: the fleet's three RAM sizes, with the measured MLX
 working sets (128 GiB workmule/laptop 115.45 GB, 96 GiB workhorse 83.49 GB;
-64 GiB Gabee 55.67 GB, the 50.10 GB guard ceiling of RC12 / 0.90).
+64 GiB Gabee 55.66 GB, measured).
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ GB = 1_000_000_000
 DEVICES = {
     "128": (137_438_953_472, 115_448_725_504),  # workmule / laptop, measured
     "96": (103_079_215_104, 83_494_174_720),  # workhorse, measured 2026-10-30
-    "64": (68_719_476_736, 55_666_666_666),  # Gabee: 50.10 GB ceiling / 0.90
+    "64": (68_719_476_736, 55_662_788_608),  # Gabee, measured 2026-10-30
 }
 
 _ENVS = (
@@ -380,3 +380,26 @@ def test_the_guard_margin_override_replaces_the_ceiling_share():
     guard.margin_bytes_override = int(0.5 * GB)
     assert guard.margin(0, ceiling) == int(0.5 * GB)
     assert guard.margin(10 * GB, ceiling) == int(0.5 * GB + 1 * GB)
+
+
+# ── /v1/status memory_budget ─────────────────────────────────────────────
+
+
+def test_status_block_merges_the_plan_over_the_live_figures():
+    from rapid_mlx.routes.health import _memory_budget_status
+
+    engine = SimpleNamespace(
+        metal_budget_snapshot=lambda: {
+            "mode": "auto",
+            "source": "auto-context",
+            "binding": "auto_ceiling",
+            "limit_bytes": 111 * GB,
+            "plan_need_bytes": 125 * GB,
+        }
+    )
+    stats = {"memory_budget": {"limit_bytes": 112 * GB, "step_binding": "memory_floor"}}
+    block = _memory_budget_status(engine, stats)
+    assert block["limit_bytes"] == 112 * GB and block["plan_limit_bytes"] == 111 * GB
+    assert block["source"] == "auto-context" and block["binding"] == "memory_floor"
+    # no engine plan, no guard yet: the tunables still show
+    assert "tunables" in _memory_budget_status(SimpleNamespace(), {})
