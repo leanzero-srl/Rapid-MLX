@@ -4513,7 +4513,10 @@ async def _create_chat_completion_impl(
             model_name=cfg.model_name,
             allow_image=engine.is_mllm or _text_lane_images,
             allow_video=engine.is_mllm,
-            allow_audio=bool(engine.is_mllm and model_accepts_audio(cfg.model_name)),
+            allow_audio=bool(
+                engine.is_mllm
+                and model_accepts_audio(cfg.model_path or cfg.model_name)
+            ),
         )
     except UnsupportedContentBlockError as e:
         raise HTTPException(

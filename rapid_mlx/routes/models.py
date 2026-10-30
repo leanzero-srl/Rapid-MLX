@@ -663,6 +663,10 @@ def _accepts_audio(model_id: str) -> bool:
     try:
         from ..api.utils import model_accepts_audio
 
+        # A served name (``--served-model-name``) is not a checkpoint: read the backing model.
+        if _is_served_model(model_id):
+            cfg = get_config()
+            model_id = cfg.model_path or cfg.model_name or model_id
         return model_accepts_audio(model_id)
     except Exception:
         return False

@@ -75,17 +75,23 @@ def _write_audio(data: str, fmt: str) -> str:
 
 
 def _frames_for(source: Any, fps: float, max_frames: int) -> list[str]:
-    from ..models.mllm import (
-        extract_video_frames_smart,
-        process_video_input,
-        save_frames_to_temp,
-    )
+    """The sampled frames as JPEG data URLs (the image loader refuses arbitrary local paths)."""
+    import io
+
+    from PIL import Image
+
+    from ..models.mllm import extract_video_frames_smart, process_video_input
 
     video_path = process_video_input(source)
     frames = extract_video_frames_smart(video_path, fps=fps, max_frames=max_frames)
     if not frames:
         raise ValueError("the video has no decodable frames")
-    return save_frames_to_temp(frames)
+    urls = []
+    for frame in frames:
+        buf = io.BytesIO()
+        Image.fromarray(frame).save(buf, "JPEG", quality=90)
+        urls.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
+    return urls
 
 
 def expand_media_parts(
