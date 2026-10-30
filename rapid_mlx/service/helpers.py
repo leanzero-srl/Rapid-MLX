@@ -5001,6 +5001,20 @@ def get_model_max_context(engine) -> int:
             return None
         return ivalue
 
+    # ``--max-model-len`` (lz.20): the window this engine serves, for every
+    # lane (text and vision) and on every surface that reads this helper --
+    # the context_length_exceeded check and /v1/models context_window, so the
+    # advertised window is the admitted one (review 2026-10-30: it still
+    # advertised max_position_embeddings and vision skipped the cap).
+    try:
+        from ..memory_budget import tunables as _tunables
+
+        configured = _maybe_int(_tunables().max_model_len)
+    except Exception:  # noqa: BLE001
+        configured = None
+    if configured is not None:
+        return configured
+
     model = getattr(engine, "_model", None) or getattr(engine, "model", None)
 
     if model is not None:

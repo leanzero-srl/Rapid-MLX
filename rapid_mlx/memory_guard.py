@@ -798,6 +798,7 @@ class MemoryGuard:
             # Steps held because only the free-memory floor was short
             # (--memory-floor-gb): other apps held the memory the step needs.
             "floor_holds": 0,
+            "floor_defers": 0,
             "store_skips": 0,
             # Of which end-of-turn (prompt + output) entries: the one a
             # session's next turn fetches. Mid-turn prompt/boundary entries
@@ -894,14 +895,21 @@ class MemoryGuard:
         self.margin_bytes_override: int | None = None
 
     # -- arithmetic -----------------------------------------------------
+    def static_margin(self, ceiling: int) -> int:
+        """The static share of the margin: ``--memory-guard-margin-gb`` when
+        set, else MARGIN_CEILING_RATIO (2%) of the ceiling. Every place that
+        keeps a static gap under the ceiling reads THIS, so the flag moves
+        all of them together (review 2026-10-30: six scheduler sites still
+        used the 2% constant)."""
+        override = getattr(self, "margin_bytes_override", None)
+        if override is not None:
+            return max(0, int(override))
+        return int(MARGIN_CEILING_RATIO * ceiling)
+
     def margin(self, transient: int, ceiling: int) -> int:
         # ``--memory-guard-margin-gb`` replaces the static share of the
         # ceiling (MARGIN_CEILING_RATIO, 2%); the transient share stays.
-        override = getattr(self, "margin_bytes_override", None)
-        static = (
-            int(override) if override is not None else MARGIN_CEILING_RATIO * ceiling
-        )
-        return int(static + MARGIN_TRANSIENT_RATIO * transient)
+        return int(self.static_margin(ceiling) + MARGIN_TRANSIENT_RATIO * transient)
 
     def backstop_extra(self, shape: StepShape) -> int:
         extra = 0.0

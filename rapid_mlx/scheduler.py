@@ -325,6 +325,8 @@ _PLAN_ATTEMPTS = 64
 # host_statistics64 call), and the window its reference may fall back over.
 _MEMGUARD_SYSTEM_READ_S = 1.0
 _MEMGUARD_OTHERS_WINDOW_S = 120.0
+# A floor hold not renewed within this gap is a NEW shortage (new wait).
+_MEMGUARD_FLOOR_HOLD_GAP_S = 2.0
 # The memory guard's line for requests that carry no SessionHint (raw
 # prompts): one conversation, as before per-session identity existed.
 _ANONYMOUS_LINE = ("anonymous",)
@@ -6857,6 +6859,20 @@ class Scheduler:
 
         return int(base * tunables().auto_floor) if base > 0 else 0
 
+    def _memguard_static_margin(self, ceiling: int) -> int:
+        """The guard's static margin under ``ceiling`` (``--memory-guard-
+        margin-gb``, else 2% of the ceiling) when there is no guard object
+        at hand: the same rule as ``MemoryGuard.static_margin``."""
+        guard = getattr(self, "_memory_guard", None)
+        if guard is not None:
+            return guard.static_margin(ceiling)
+        from .memory_budget import tunables
+
+        override = tunables().guard_margin_bytes
+        if override is not None:
+            return max(0, int(override))
+        return int(MARGIN_CEILING_RATIO * ceiling)
+
     def _memguard_floor_ceiling(self, ceiling: int) -> int:
         """The ceiling a prefill step plans under with the free-memory floor
         (``--memory-floor-gb``): ``min(ceiling, physical - others - floor)``,
@@ -6886,7 +6902,16 @@ class Scheduler:
 
         now = _time.monotonic()
         held = self.__dict__.setdefault("_memguard_floor_held", {})
-        since = held.setdefault(row.request_id, now)
+        since, last = held.get(row.request_id, (now, now))
+        if now - last > _MEMGUARD_FLOOR_HOLD_GAP_S:
+            # Not held on the previous steps: it was admitted (or deferred)
+            # since, so a new shortage gets a whole new wait, not the
+            # remainder of an old one (review 2026-10-30).
+            since = now
+        held[row.request_id] = (since, now)
+        if len(held) > 256:
+            for rid in [r for r, (_s, t) in held.items() if now - t > 60.0]:
+                held.pop(rid, None)
         if now - since >= tunables().floor_wait_s:
             held.pop(row.request_id, None)
             return False
@@ -6903,6 +6928,16 @@ class Scheduler:
                 tunables().memory_floor_bytes / 1e9,
             )
         return True
+
+    def _memguard_floor_defer(self, row: Any, plan: Any, others: Any) -> None:
+        """Only the free-memory floor is short and other requests are
+        running: defer THIS row (its prefill waits in the queue) so their
+        decode keeps running -- their completion is what frees memory -- and
+        never hold the whole batch (review 2026-10-30)."""
+        guard = self._memguard()
+        if guard is not None:
+            guard.counts["floor_defers"] += 1
+        self._memguard_defer(row, plan, others)
 
     def _memguard_take_hold(self) -> bool:
         """True (once) when the planner held this step for the floor."""
@@ -8061,7 +8096,7 @@ class Scheduler:
                 # (RC12 Gabee k=110: a 160k main refused 2.5 min into its
                 # prefill, 0.0x GB short, beside a waiting side's 22.8k loan).
                 continue
-            if (
+            floor_only = (
                 self._memguard_floor_bound
                 and kv_fn is not None
                 and guard.single_sequence_need(
@@ -8071,8 +8106,14 @@ class Scheduler:
                     ceiling=structural,
                 )
                 <= structural
-                and self._memguard_floor_hold(row)
-            ):
+            )
+            if floor_only and others:
+                # Only the free-memory floor is short and other requests run:
+                # defer THIS row so their decode continues (their completion
+                # frees memory); never hold the whole batch.
+                self._memguard_floor_defer(row, plan, others)
+                continue
+            if floor_only and self._memguard_floor_hold(row):
                 # Only the free-memory floor is short: the step waits for the
                 # other apps to give memory back (bounded by
                 # ``--memory-floor-wait-s``), it never runs below the floor.
@@ -8505,7 +8546,7 @@ class Scheduler:
         """Cap the verify at the widest width whose decode step fits (no
         eviction). Returns False when even the floor does not fit."""
         floor, widest = knob
-        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        margin = guard.static_margin(ceiling)
 
         def fits(rows: int) -> bool:
             need = self._memguard_decode_growth(guard, writes=rows)
@@ -8583,7 +8624,7 @@ class Scheduler:
         caller can defer the request that needs the room instead; then an
         entry a live session needs is not traded for less than the
         shortfall (returns False: defer)."""
-        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        margin = self._memguard_static_margin(ceiling)
         footprint = self._metal_footprint_bytes(reclaim_over=ceiling - extra - margin)
         if footprint + extra + margin <= ceiling:
             return True
@@ -8722,11 +8763,11 @@ class Scheduler:
             )
             shape = StepShape(len(ahead) + 1, configured, longest)
             transient = guard.plan_transient(shape)
-            extra += (
-                transient
-                + guard.margin(transient, ceiling)
-                - int(MARGIN_CEILING_RATIO * ceiling)
-            )
+            # the step's transient plus its own error share; the static
+            # margin is charged once, by _memguard_make_room
+            extra += guard.margin(transient, ceiling) - guard.static_margin(
+                ceiling
+            ) + transient
         extra += guard.decode_growth(
             max([*gen_lengths, final]),
             batch=len(gen_lengths) + 1,
@@ -9983,7 +10024,7 @@ class Scheduler:
                 # margin (a ratio of the ceiling), never by allocator noise.
                 version=(
                     guard.model.observations,
-                    int(base // max(1, MARGIN_CEILING_RATIO * ceiling)),
+                    int(base // max(1, guard.static_margin(ceiling))),
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -10752,7 +10793,7 @@ class Scheduler:
             # store is made and that step evicts it again (the session's
             # newest entry, as a last resort) -- copy/churn for nothing.
             need += self._memguard_own_decode_floor(request)
-        margin = int(MARGIN_CEILING_RATIO * ceiling)
+        margin = self._memguard_static_margin(ceiling)
         storing = None
         finished = None
         if request is not None and turn_end:
@@ -12238,7 +12279,10 @@ class Scheduler:
             getattr(self, "_memory_guard", None) is None and not guard_enabled()
         ):
             return self._resolve_pressure_evict_fraction()
-        return 1.0 - MARGIN_CEILING_RATIO
+        ceiling = int(self._memguard_ceiling() or 0)
+        if ceiling <= 0:
+            return 1.0 - MARGIN_CEILING_RATIO
+        return max(0.0, 1.0 - self._memguard_static_margin(ceiling) / ceiling)
 
     def _cache_self_pressure_threshold_bytes(self) -> int:
         """Return the prefix-cache memory threshold above which the

@@ -254,3 +254,104 @@ def test_the_status_publishes_what_the_floor_counted(llama, monkeypatch):
     assert block["file_backed_excluded_bytes"] == 3
     assert block["anonymous_bytes"] == 2
     assert "engine_metal_bytes" in block and "others_rest_bytes" in block
+
+
+# ── review 2026-10-30: one margin rule, the served window, floor fairness ─
+
+
+def test_the_guard_margin_flag_moves_every_static_margin(llama, monkeypatch):
+    """--memory-guard-margin-gb replaces the 2% static margin EVERYWHERE the
+    scheduler keeps a gap under the ceiling (verify narrowing, footprint fit,
+    store time, window bucket, the idle eviction line), not only in
+    MemoryGuard.margin()."""
+    scheduler, _device = _scheduler(llama, monkeypatch, M4_MAX_128_CEILING)
+    guard = scheduler._memguard()
+    ceiling = int(scheduler._memguard_ceiling())
+    default = scheduler._memguard_static_margin(ceiling)
+    assert default == int(0.02 * ceiling)
+    assert scheduler._memguard_pressure_fraction() == pytest.approx(0.98, abs=1e-3)
+    guard.margin_bytes_override = ceiling // 10
+    assert guard.static_margin(ceiling) == ceiling // 10
+    assert scheduler._memguard_static_margin(ceiling) == ceiling // 10
+    assert scheduler._memguard_pressure_fraction() == pytest.approx(0.9, abs=1e-3)
+    assert guard.margin(1000, ceiling) == ceiling // 10 + 100
+
+
+def test_max_model_len_is_the_served_window_on_every_lane(monkeypatch):
+    """/v1/models context_window and the context_length_exceeded check read
+    get_model_max_context: with --max-model-len it is that window, for text
+    and vision engines alike, not max_position_embeddings."""
+    from types import SimpleNamespace
+
+    from rapid_mlx.service.helpers import get_model_max_context
+
+    model = SimpleNamespace(args=SimpleNamespace(max_position_embeddings=262_144))
+    text = SimpleNamespace(_model=model, is_mllm=False)
+    vision = SimpleNamespace(_model=model, is_mllm=True)
+    assert get_model_max_context(text) == 262_144
+    monkeypatch.setenv(memory_budget.ENV_MAX_MODEL_LEN, "65536")
+    assert get_model_max_context(text) == 65_536
+    assert get_model_max_context(vision) == 65_536
+
+
+def test_a_new_floor_shortage_gets_a_whole_new_wait(llama, monkeypatch):
+    """A request held, then admitted, then short again later gets the full
+    --memory-floor-wait-s again, not what was left of the first wait."""
+    monkeypatch.setenv(memory_budget.ENV_FLOOR_WAIT_S, "5")
+    scheduler, _device = _scheduler(llama, monkeypatch, M4_MAX_128_CEILING)
+    clock = {"t": 1000.0}
+    import time as _time
+
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["t"])
+    row = type("Row", (), {"request_id": "r1"})()
+    assert scheduler._memguard_floor_hold(row)  # held at t=1000
+    clock["t"] += 4.0  # not renewed for 4 s: admitted in between
+    assert scheduler._memguard_floor_hold(row)  # a new wait, not refused
+    clock["t"] += 1.0
+    assert scheduler._memguard_floor_hold(row)
+    results = []
+    for _ in range(4):
+        clock["t"] += 1.0
+        results.append(scheduler._memguard_floor_hold(row))
+    # renewed every second from t=1004: held at 1006..1008, refused at 1009
+    assert results == [True, True, True, False]
+
+
+def test_a_floor_shortage_beside_running_requests_defers_not_holds(llama, monkeypatch):
+    """Only the floor is short for one of two decoding requests: that row
+    waits in the queue and the other keeps decoding (its end is what frees
+    memory) -- the batch is not frozen for a row the floor alone stops."""
+    monkeypatch.setenv(memory_budget.ENV_MEMORY_FLOOR_GB, str(FLOOR / 1e9))
+    scheduler, device = _scheduler(llama, monkeypatch, M4_MAX_128_CEILING)
+    machine = _Machine(monkeypatch, device, 50 * MB, MACHINE_128)
+    real = scheduler.step
+    count = {"n": 0}
+
+    def step():
+        n = count["n"] = count["n"] + 1
+        if n == 20:
+            machine.others = 950 * MB
+        if n == 60:
+            machine.others = 50 * MB
+        out = real()
+        machine.settle(max(machine.engine(), device.peak()))
+        return out
+
+    scheduler.step = step
+    try:
+        outs = _drive(
+            scheduler,
+            [
+                _request("side", _new_tokens(7, 2000), 400),
+                _request("main", _new_tokens(50_000, 2000), 400),
+            ],
+        )
+    finally:
+        scheduler.step = real
+    counts = scheduler._memguard().counts
+    assert outs["side"][-1].finished and not outs["side"][-1].error
+    assert outs["main"][-1].finished
+    assert machine.swapouts == 0
+    # the row short of the floor beside a running request was deferred
+    # (queue), not held (whole batch)
+    assert counts["floor_defers"] >= 1, dict(counts)
