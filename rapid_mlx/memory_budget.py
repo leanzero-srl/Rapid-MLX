@@ -120,6 +120,147 @@ def ratchet_utilization_and_apply(
         return effective, _process_floor_generation
 
 
+# ── Operator tunables (LeanZero fork, v0.14.3-lz.20) ──
+# Every number that decides how much memory the engine may take is a tunable:
+# a ``rapid-mlx serve`` flag that the CLI exports as the env var below (so a
+# worker process sees the same value), read here on each call. Unset = the
+# historical constant above, so an engine started without the flags resolves
+# byte-identically to lz.19.
+ENV_METAL_LIMIT_GB = "RAPID_MLX_METAL_LIMIT_GB"
+ENV_AUTO_FLOOR = "RAPID_MLX_AUTO_UTILIZATION_FLOOR"
+ENV_AUTO_CEILING = "RAPID_MLX_AUTO_UTILIZATION_CEILING"
+ENV_AUTO_HEADROOM = "RAPID_MLX_AUTO_HEADROOM_FRACTION"
+ENV_MEMORY_FLOOR_GB = "RAPID_MLX_MEMORY_FLOOR_GB"
+ENV_RESERVE_FRACTION = "RAPID_MLX_SYSTEM_RESERVE_FRACTION"
+ENV_MAX_MODEL_LEN = "RAPID_MLX_MAX_MODEL_LEN"
+ENV_GUARD_MARGIN_GB = "RAPID_MLX_MEMORY_GUARD_MARGIN_GB"
+ENV_FLOOR_WAIT_S = "RAPID_MLX_MEMORY_FLOOR_WAIT_S"
+
+# How long a prefill step may wait for other apps to give memory back before
+# the free-memory floor refuses it (the floor never lets a step through).
+DEFAULT_FLOOR_WAIT_S = 60.0
+
+
+def _env_float(name: str) -> float | None:
+    import os
+
+    raw = os.environ.get(name, "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class MemoryTunables:
+    """The operator's memory tunables in force (``None`` = not set)."""
+
+    metal_limit_bytes: int | None
+    auto_floor: float
+    auto_ceiling: float
+    auto_headroom_fraction: float
+    memory_floor_bytes: int
+    reserve_fraction: float
+    max_model_len: int | None
+    guard_margin_bytes: int | None
+    floor_wait_s: float
+
+    def snapshot(self) -> dict:
+        return {
+            "metal_limit_gb": (
+                None if self.metal_limit_bytes is None else self.metal_limit_bytes / 1e9
+            ),
+            "auto_utilization_floor": self.auto_floor,
+            "auto_utilization_ceiling": self.auto_ceiling,
+            "auto_headroom_fraction": self.auto_headroom_fraction,
+            "memory_floor_gb": self.memory_floor_bytes / 1e9,
+            "system_reserve_fraction": self.reserve_fraction,
+            "max_model_len": self.max_model_len,
+            "memory_guard_margin_gb": (
+                None if self.guard_margin_bytes is None else self.guard_margin_bytes / 1e9
+            ),
+            "memory_floor_wait_s": self.floor_wait_s,
+        }
+
+
+def tunables() -> MemoryTunables:
+    """The tunables in force now (env, set from the serve flags)."""
+    limit = _env_float(ENV_METAL_LIMIT_GB)
+    floor = _env_float(ENV_AUTO_FLOOR)
+    ceiling = _env_float(ENV_AUTO_CEILING)
+    headroom = _env_float(ENV_AUTO_HEADROOM)
+    mem_floor = _env_float(ENV_MEMORY_FLOOR_GB)
+    reserve = _env_float(ENV_RESERVE_FRACTION)
+    mml = _env_float(ENV_MAX_MODEL_LEN)
+    margin = _env_float(ENV_GUARD_MARGIN_GB)
+    wait = _env_float(ENV_FLOOR_WAIT_S)
+    return MemoryTunables(
+        metal_limit_bytes=int(limit * 1e9) if limit and limit > 0 else None,
+        auto_floor=AUTO_UTILIZATION_FLOOR if floor is None else floor,
+        auto_ceiling=AUTO_UTILIZATION_CEILING if ceiling is None else ceiling,
+        auto_headroom_fraction=(
+            _AUTO_HEADROOM_FRACTION if headroom is None else max(0.0, headroom)
+        ),
+        memory_floor_bytes=int(max(0.0, mem_floor or 0.0) * 1e9),
+        reserve_fraction=(
+            _SYSTEM_RESERVE_RATIO_DEFAULT if reserve is None else max(0.0, reserve)
+        ),
+        max_model_len=int(mml) if mml and mml > 0 else None,
+        guard_margin_bytes=int(margin * 1e9) if margin is not None and margin >= 0 else None,
+        floor_wait_s=DEFAULT_FLOOR_WAIT_S if wait is None else max(0.0, wait),
+    )
+
+
+def validate_tunables(
+    t: MemoryTunables, *, physical_bytes: int, utilization_set: bool = False
+) -> str | None:
+    """One line naming what is impossible, or ``None`` when the set is valid."""
+    if t.metal_limit_bytes is not None and utilization_set:
+        return (
+            "--metal-limit-gb and --gpu-memory-utilization both set: choose one "
+            "(an absolute cap in GB, or a fraction of the GPU working set)"
+        )
+    if not (0.1 <= t.auto_floor <= 1.0):
+        return f"--auto-utilization-floor {t.auto_floor:g} must be in 0.1..1.0"
+    if not (0.1 <= t.auto_ceiling <= 1.0):
+        return f"--auto-utilization-ceiling {t.auto_ceiling:g} must be in 0.1..1.0"
+    if t.auto_floor > t.auto_ceiling:
+        return (
+            f"--auto-utilization-floor {t.auto_floor:g} is above "
+            f"--auto-utilization-ceiling {t.auto_ceiling:g}"
+        )
+    if not (0.0 <= t.reserve_fraction <= 0.5):
+        return f"--system-reserve-fraction {t.reserve_fraction:g} must be in 0..0.5"
+    if physical_bytes > 0:
+        if t.memory_floor_bytes >= physical_bytes:
+            return (
+                f"--memory-floor-gb {t.memory_floor_bytes / 1e9:.1f} is not below "
+                f"this Mac's {physical_bytes / 1e9:.1f} GB of RAM"
+            )
+        if (
+            t.metal_limit_bytes is not None
+            and t.metal_limit_bytes + t.memory_floor_bytes > physical_bytes
+        ):
+            return (
+                f"--metal-limit-gb {t.metal_limit_bytes / 1e9:.1f} + --memory-floor-gb "
+                f"{t.memory_floor_bytes / 1e9:.1f} = "
+                f"{(t.metal_limit_bytes + t.memory_floor_bytes) / 1e9:.1f} GB is more "
+                f"than this Mac's {physical_bytes / 1e9:.1f} GB of RAM"
+            )
+    return None
+
+
+def floor_room_bytes(*, physical: int, others: int | None, floor: int) -> int | None:
+    """What the free-memory floor leaves the engine (its whole footprint):
+    ``physical - others - floor``; ``None`` when the floor is off or the
+    machine is unmeasured."""
+    if floor <= 0 or physical <= 0 or others is None:
+        return None
+    return max(0, int(physical) - int(others) - int(floor))
+
+
 class MetalPreflightError(RuntimeError):
     """The resolved Metal cap can never admit a request for this model.
 
@@ -139,6 +280,14 @@ class MetalBudgetPlan:
     resolved_utilization: float
     limit_bytes: int
     mode: str  # "manual" (operator override) or "auto"
+    # "auto-weights" (weights + headroom), "auto-context" (the context-aware
+    # need), "manual-utilization" or "manual-gb".
+    source: str = "auto-weights"
+    need_bytes: int = 0
+    # "engine" (the plan's own figure), "auto_ceiling" (the need was above
+    # the auto ceiling), or "macos_working_set" (a GB cap or the need was
+    # above what the macOS GPU working set allows).
+    binding: str = "engine"
 
 
 def plan_metal_limit(
@@ -146,6 +295,11 @@ def plan_metal_limit(
     weights_bytes: int,
     device_budget_bytes: int,
     requested_utilization: float | None = None,
+    need_bytes: int = 0,
+    limit_bytes: int | None = None,
+    floor: float = AUTO_UTILIZATION_FLOOR,
+    ceiling: float = AUTO_UTILIZATION_CEILING,
+    headroom_fraction: float = _AUTO_HEADROOM_FRACTION,
 ) -> MetalBudgetPlan:
     """Resolve the Metal allocation limit for one loaded model.
 
@@ -168,19 +322,41 @@ def plan_metal_limit(
     if device_budget_bytes <= 0:
         raise ValueError("device_budget_bytes must be positive")
 
-    if requested_utilization is not None:
+    binding = "engine"
+    need = 0
+    if limit_bytes is not None and limit_bytes > 0:
+        # An absolute cap in GB (``--metal-limit-gb``): the macOS GPU working
+        # set is the hard edge above it (utilization 1.0).
+        wanted = limit_bytes / device_budget_bytes
+        resolved = min(wanted, 1.0)
+        if wanted > 1.0:
+            binding = "macos_working_set"
+        mode, source = "manual", "manual-gb"
+    elif requested_utilization is not None:
         resolved = float(requested_utilization)
-        mode = "manual"
-    elif weights_bytes <= 0:
-        resolved = AUTO_UTILIZATION_FLOOR
-        mode = "auto"
+        mode, source = "manual", "manual-utilization"
+    elif weights_bytes <= 0 and need_bytes <= 0:
+        resolved = floor
+        mode, source = "auto", "auto-weights"
     else:
         headroom = max(
-            int(weights_bytes * _AUTO_HEADROOM_FRACTION),
+            int(weights_bytes * headroom_fraction),
             int(device_budget_bytes * _AUTO_HEADROOM_MIN_FRACTION),
         )
-        needed = (weights_bytes + headroom) / device_budget_bytes
-        resolved = min(max(needed, AUTO_UTILIZATION_FLOOR), AUTO_UTILIZATION_CEILING)
+        weights_need = weights_bytes + headroom if weights_bytes > 0 else 0
+        # The context-aware need (weights + KV of the served context + one
+        # step's peak + margin + prefix budget, the scheduler's own figures)
+        # when it is the larger: a 72 GB model served at 360k needs more
+        # than its weights + 8% (workmule 2026-10-30: 103.9 GB floor while
+        # 112 GB was allowed).
+        need = max(weights_need, int(need_bytes))
+        source = "auto-context" if int(need_bytes) > weights_need else "auto-weights"
+        needed = need / device_budget_bytes
+        resolved = min(max(needed, floor), ceiling)
+        if needed > ceiling:
+            # The need is above what auto may take: the auto ceiling binds
+            # (or, at a ceiling of 1.0, the macOS working set itself).
+            binding = "macos_working_set" if ceiling >= 1.0 else "auto_ceiling"
         mode = "auto"
 
     return MetalBudgetPlan(
@@ -190,6 +366,9 @@ def plan_metal_limit(
         resolved_utilization=resolved,
         limit_bytes=int(device_budget_bytes * resolved),
         mode=mode,
+        source=source,
+        need_bytes=int(need),
+        binding=binding,
     )
 
 
@@ -307,6 +486,10 @@ def system_memory_pressure() -> int:
 # reserve. A ratio of physical RAM, the headroom auto mode charges on top of
 # the weights.
 SYSTEM_RESERVE_RATIO = _AUTO_HEADROOM_FRACTION
+# The default of ``--system-reserve-fraction`` (receipt: RC10, a busy 128 GB
+# laptop -- the engine took 91 GB, 40.2 GB of it prefix entries, and the
+# machine went 46.8 GB into swap).
+_SYSTEM_RESERVE_RATIO_DEFAULT = SYSTEM_RESERVE_RATIO
 
 
 def _sysctl_int(name: bytes, ctype_name: str = "c_int") -> int | None:

@@ -6732,6 +6732,9 @@ class Scheduler:
         chosen = getattr(config, "adaptive_prefill_min_chunk_size", default_floor)
         floor = kv_growth_step() if chosen == default_floor else max(1, int(chosen))
         guard = MemoryGuard(self._memguard_prior(), floor_tokens=floor)
+        from .memory_budget import tunables
+
+        guard.margin_bytes_override = tunables().guard_margin_bytes
         try:
             guard.decode_verify_bytes_per_row = self._memguard_verify_bytes_per_row(
                 self._memguard_decode_write_rows()
@@ -6850,9 +6853,62 @@ class Scheduler:
             )
         except Exception:  # noqa: BLE001
             return 0
-        from .memory_budget import AUTO_UTILIZATION_FLOOR
+        from .memory_budget import tunables
 
-        return int(base * AUTO_UTILIZATION_FLOOR) if base > 0 else 0
+        return int(base * tunables().auto_floor) if base > 0 else 0
+
+    def _memguard_floor_ceiling(self, ceiling: int) -> int:
+        """The ceiling a prefill step plans under with the free-memory floor
+        (``--memory-floor-gb``): ``min(ceiling, physical - others - floor)``,
+        others re-read from ``host_statistics64`` at most every
+        ``_MEMGUARD_SYSTEM_READ_S``. The structural ceiling when the floor is
+        off or the machine is unmeasured."""
+        from .memory_budget import floor_room_bytes, tunables
+
+        floor = tunables().memory_floor_bytes
+        if floor <= 0 or ceiling <= 0:
+            return ceiling
+        others = self._memguard_others_bytes()
+        read = getattr(self, "_memguard_others_read", None)
+        physical = read[2] if read is not None else 0
+        room = floor_room_bytes(physical=physical, others=others, floor=floor)
+        if room is None:
+            return ceiling
+        return min(ceiling, room)
+
+    def _memguard_floor_hold(self, row: Any) -> bool:
+        """Hold this step (no dispatch) while only the free-memory floor is
+        short. True = hold; False once the row waited ``floor_wait_s`` (it is
+        then refused like any prompt that does not fit)."""
+        import time as _time
+
+        from .memory_budget import tunables
+
+        now = _time.monotonic()
+        held = self.__dict__.setdefault("_memguard_floor_held", {})
+        since = held.setdefault(row.request_id, now)
+        if now - since >= tunables().floor_wait_s:
+            held.pop(row.request_id, None)
+            return False
+        guard = self._memguard()
+        if guard is not None:
+            guard.counts["floor_holds"] += 1
+        self._memguard_hold_step = True
+        if since == now:
+            logger.warning(
+                "[memory_guard] free-memory floor: request %s waits (other apps "
+                "use %.1fGB; the step would leave less than %.1fGB free)",
+                str(row.request_id)[:12],
+                (self._memguard_others_bytes() or 0) / 1e9,
+                tunables().memory_floor_bytes / 1e9,
+            )
+        return True
+
+    def _memguard_take_hold(self) -> bool:
+        """True (once) when the planner held this step for the floor."""
+        hold = bool(getattr(self, "_memguard_hold_step", False))
+        self._memguard_hold_step = False
+        return hold
 
     def _memguard_others_bytes(self) -> int | None:
         """The REFERENCE for the RAM the rest of the machine uses (other
@@ -6910,7 +6966,7 @@ class Scheduler:
         c976b2a3a: planning steps under the lower ceiling evicted
         conversations' newest entries and cut chunks on Gabee at 16 GB of
         others). Unmeasured, or a big idle Mac: the device ceiling."""
-        from .memory_budget import SYSTEM_RESERVE_RATIO
+        from .memory_budget import tunables
 
         if device is None:
             device = self._memguard_ceiling()
@@ -6920,7 +6976,9 @@ class Scheduler:
         if others is None:
             return device
         physical = self._memguard_others_read[2]
-        system = max(0, physical - others - int(SYSTEM_RESERVE_RATIO * physical))
+        tun = tunables()
+        reserve = max(int(tun.reserve_fraction * physical), tun.memory_floor_bytes)
+        system = max(0, physical - others - reserve)
         return min(device, system)
 
     def _current_metal_cache_bytes(self) -> int:
@@ -7893,9 +7951,14 @@ class Scheduler:
         guard = self._memguard()
         if guard is None or self.batch_generator is None:
             return None, refusals
-        ceiling = self._memguard_ceiling()
-        if ceiling <= 0:
+        structural = self._memguard_ceiling()
+        if structural <= 0:
             return None, refusals
+        # The free-memory floor (``--memory-floor-gb``), against what the
+        # rest of the machine uses NOW: a prefill step never takes the Mac
+        # below it. Off (0) = the structural ceiling, as lz.19.
+        ceiling = self._memguard_floor_ceiling(structural)
+        self._memguard_floor_bound = ceiling < structural
         # The verify width is the generator's own choice unless THIS step's
         # decode plan narrows it (``_memguard_room_for_decode``).
         self._memguard_set_verify_cap(None)
@@ -7998,6 +8061,22 @@ class Scheduler:
                 # (RC12 Gabee k=110: a 160k main refused 2.5 min into its
                 # prefill, 0.0x GB short, beside a waiting side's 22.8k loan).
                 continue
+            if (
+                self._memguard_floor_bound
+                and kv_fn is not None
+                and guard.single_sequence_need(
+                    prompt,
+                    base=self._memguard_idle_base(),
+                    kv_footprint=kv_fn,
+                    ceiling=structural,
+                )
+                <= structural
+                and self._memguard_floor_hold(row)
+            ):
+                # Only the free-memory floor is short: the step waits for the
+                # other apps to give memory back (bounded by
+                # ``--memory-floor-wait-s``), it never runs below the floor.
+                return plan, refusals
             if fits_alone and self._memguard_requeue_cold(row):
                 # It fits this Mac ALONE from token 0, but not beside the
                 # copy of its own prefix hit (copy-on-admit holds the session
@@ -9756,6 +9835,95 @@ class Scheduler:
         scale = max(applied, int(REAPPLY_RATIO * self._memguard_ceiling()), 1)
         return abs(now - applied) > REAPPLY_RATIO * scale
 
+    def memory_plan_need_bytes(self, ceiling: int) -> int | None:
+        """What serving the configured context needs, for auto Metal sizing:
+        the guard's single-sequence need at ``--max-model-len`` (else the
+        model's window) -- idle base (weights), the sequence's KV/state, the
+        floor chunk's step peak and the margin, priced at ``ceiling`` -- plus
+        the prefix-cache budget (the operator's, else the cache's configured
+        default). ``None`` when the guard or the KV terms are unknown."""
+        guard = self._memguard()
+        kv_fn = self._kv_footprint_fn()
+        context = self._memguard_native_context()
+        if guard is None or kv_fn is None or not context or ceiling <= 0:
+            return None
+        base = self._memguard_idle_base()
+        need = guard.single_sequence_need(
+            int(context), base=base, kv_footprint=kv_fn, ceiling=int(ceiling)
+        )
+        prefix = 0
+        mac = getattr(self, "memory_aware_cache", None)
+        if mac is not None:
+            operator = self._memguard_operator_budget(mac)
+            if operator is not None:
+                prefix = int(operator)
+            else:
+                prefix = int(getattr(mac, "_configured_max_memory", 0) or 0)
+        self._memguard_plan_need = (int(context), int(need), int(prefix))
+        return int(need) + prefix
+
+    def memory_budget_status(self) -> dict[str, Any]:
+        """The /v1/status ``memory_budget`` block: every cap layer between
+        physical RAM and the step ceiling, and the tunables in force."""
+        from . import memory_budget as mb
+
+        tun = mb.tunables()
+        physical = mb.system_physical_memory()
+        reading = mb.system_memory_used()
+        structural = int(self._memguard_ceiling())
+        ceiling = int(self._memguard_floor_ceiling(structural))
+        others = self._memguard_others_bytes()
+        active = self._current_metal_active_bytes()
+        cache = self._current_metal_cache_bytes()
+        try:
+            peak = int(mx.get_peak_memory())
+        except Exception:  # noqa: BLE001
+            peak = None
+        terms = None
+        try:
+            terms = self._kv_footprint_terms()
+        except Exception:  # noqa: BLE001
+            terms = None
+        working_set = int(getattr(self, "_metal_cap_base_bytes", 0) or 0)
+        if working_set <= 0:
+            try:
+                info = mx.device_info()
+                working_set = int(
+                    info.get("max_recommended_working_set_size", 0) or 0
+                )
+            except Exception:  # noqa: BLE001
+                working_set = 0
+        plan_need = getattr(self, "_memguard_plan_need", None)
+        if ceiling < structural:
+            binding = "memory_floor"
+        else:
+            binding = None
+        return {
+            "physical_bytes": physical or None,
+            "device_working_set_bytes": working_set or None,
+            "wired_limit_mb": mb._sysctl_int(b"iogpu.wired_limit_mb"),
+            "limit_bytes": structural or None,
+            "effective_ceiling_bytes": ceiling or None,
+            "step_binding": binding,
+            "memory_floor_bytes": tun.memory_floor_bytes,
+            "others_bytes": None if others is None else int(others),
+            "used_bytes": None if reading is None else int(reading.used),
+            "free_bytes": (
+                None if reading is None or not physical else int(physical - reading.used)
+            ),
+            "active_bytes": int(active),
+            "cache_bytes": int(cache),
+            "peak_bytes": peak,
+            "kv_bytes_per_token": int(terms[0]) if terms else None,
+            "plan_context_tokens": plan_need[0] if plan_need else self._memguard_native_context(),
+            "plan_sequence_need_bytes": plan_need[1] if plan_need else None,
+            "prefix_budget_bytes": plan_need[2] if plan_need else None,
+            "max_context_at_ceiling": self.memory_guard_max_context(
+                self._memguard_native_context()
+            ),
+            "tunables": tun.snapshot(),
+        }
+
     def memory_guard_max_context(
         self, native_context: int | None = None, *, stable: bool = True
     ) -> int | None:
@@ -9803,6 +9971,13 @@ class Scheduler:
             return None
 
     def _memguard_native_context(self) -> int | None:
+        from .memory_budget import tunables
+
+        configured = tunables().max_model_len
+        if configured:
+            # ``--max-model-len``: the window this engine serves and sizes
+            # its memory for (may exceed max_position_embeddings with YaRN).
+            return int(configured)
         dims = _read_kv_dims(getattr(self, "model", None))
         if dims is None:
             return None
@@ -9821,6 +9996,17 @@ class Scheduler:
             tokens = int(prompt_tokens)
             if tokens <= 0:
                 return None
+            from .memory_budget import tunables
+
+            configured = tunables().max_model_len
+            if configured and tokens > configured:
+                return ContextExceedsDeviceMemoryError(
+                    prompt_tokens=tokens,
+                    needed_bytes=0,
+                    available_bytes=0,
+                    max_context=configured,
+                    limit="max_model_len",
+                )
             guard = self._memguard()
             if guard is None:
                 return None
@@ -15605,7 +15791,12 @@ class Scheduler:
                     guard_plan, refused = self._memguard_before_dispatch()
                     guard_refusals.extend(refused)
                     # A refusal can empty the batch; then nothing dispatches.
-                    dispatch = bool(self.running)
+                    # The free-memory floor holds the step (no dispatch) while
+                    # other apps hold the memory it needs.
+                    held = self._memguard_take_hold()
+                    if held:
+                        time.sleep(0.05)
+                    dispatch = bool(self.running) and not held
                     if dispatch:
                         self._memguard_step_describe(guard_plan)
                         guard_begin = self._memguard_measure_begin(guard_plan)
@@ -16419,6 +16610,10 @@ class Scheduler:
                 self._memguard_native_context()
             )
             stats["memory_guard"] = snap
+            try:
+                stats["memory_budget"] = self.memory_budget_status()
+            except Exception:  # noqa: BLE001 - a status read never fails on this
+                logger.debug("[memory_guard] memory_budget status failed", exc_info=True)
         else:
             stats["memory_guard"] = {
                 "enabled": guard_enabled(),

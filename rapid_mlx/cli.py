@@ -3975,6 +3975,108 @@ def _apply_qwen4_rope_env(args) -> None:
     os.environ[ROPE_SCALING_ENV] = spec
 
 
+_MEMORY_TUNABLE_FLAGS = (
+    # (dest, env, type, help)
+    (
+        "metal_limit_gb",
+        "RAPID_MLX_METAL_LIMIT_GB",
+        float,
+        "Absolute engine Metal cap in GB (1e9 bytes) instead of auto sizing. "
+        "Clamped to the macOS GPU working set (raise iogpu.wired_limit_mb to "
+        "go past it). Exclusive with --gpu-memory-utilization.",
+    ),
+    (
+        "auto_utilization_floor",
+        "RAPID_MLX_AUTO_UTILIZATION_FLOOR",
+        float,
+        "Auto mode: the lowest share of the GPU working set the cap takes "
+        "(default 0.90, the historical global default, #2858).",
+    ),
+    (
+        "auto_utilization_ceiling",
+        "RAPID_MLX_AUTO_UTILIZATION_CEILING",
+        float,
+        "Auto mode: the highest share of the GPU working set the cap takes "
+        "(default 0.97: 3%% allocator slack, #2858).",
+    ),
+    (
+        "auto_headroom_fraction",
+        "RAPID_MLX_AUTO_HEADROOM_FRACTION",
+        float,
+        "Auto mode: runtime headroom charged on the measured weights "
+        "(default 0.08, #2858).",
+    ),
+    (
+        "memory_floor_gb",
+        "RAPID_MLX_MEMORY_FLOOR_GB",
+        float,
+        "Free-memory floor in GB for the whole Mac: a prefill step never "
+        "leaves less free than this, against what other apps use NOW "
+        "(re-read every second). It waits, then refuses. Default 0 (off).",
+    ),
+    (
+        "memory_floor_wait_s",
+        "RAPID_MLX_MEMORY_FLOOR_WAIT_S",
+        float,
+        "Seconds a step waits for other apps to free memory before the "
+        "free-memory floor refuses it (default 60).",
+    ),
+    (
+        "system_reserve_fraction",
+        "RAPID_MLX_SYSTEM_RESERVE_FRACTION",
+        float,
+        "Share of physical RAM the engine's optional memory (prefix cache) "
+        "leaves to the rest of the Mac (default 0.08, RC10).",
+    ),
+    (
+        "max_model_len",
+        "RAPID_MLX_MAX_MODEL_LEN",
+        int,
+        "Maximum context in tokens: prompts above it are refused, the "
+        "advertised window is capped at it, and auto mode sizes the Metal "
+        "cap for it (default: the model's max_position_embeddings).",
+    ),
+    (
+        "memory_guard_margin_gb",
+        "RAPID_MLX_MEMORY_GUARD_MARGIN_GB",
+        float,
+        "Memory guard static safety margin in GB (default: 2%% of the "
+        "ceiling).",
+    ),
+)
+
+
+def _add_memory_tunable_args(parser) -> None:
+    for dest, _env, typ, help_text in _MEMORY_TUNABLE_FLAGS:
+        parser.add_argument(
+            "--" + dest.replace("_", "-"), dest=dest, type=typ, default=None, help=help_text
+        )
+
+
+def _apply_memory_tunable_args(args) -> None:
+    """Export the memory tunables to the env the engine reads, validate the
+    set (exit 2 with one line naming the flag)."""
+    import os as _os
+
+    from .memory_budget import system_physical_memory, tunables, validate_tunables
+
+    for dest, env, _typ, _help in _MEMORY_TUNABLE_FLAGS:
+        value = getattr(args, dest, None)
+        if value is not None:
+            if value < 0:
+                print(f"Error: --{dest.replace('_', '-')} must be >= 0", file=sys.stderr)
+                sys.exit(2)
+            _os.environ[env] = str(value)
+    problem = validate_tunables(
+        tunables(),
+        physical_bytes=system_physical_memory(),
+        utilization_set=getattr(args, "gpu_memory_utilization", None) is not None,
+    )
+    if problem:
+        print(f"Error: {problem}", file=sys.stderr)
+        sys.exit(2)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -4414,6 +4516,10 @@ def serve_command(args):
                 file=sys.stderr,
             )
             sys.exit(2)
+
+    # Memory tunables (lz.20): export to the env the engine reads, then
+    # reject an impossible combination before anything loads.
+    _apply_memory_tunable_args(args)
 
     # Validate gpu-memory-utilization range (None = auto budgeting, #2858)
     if args.gpu_memory_utilization is not None and not (
@@ -12651,6 +12757,7 @@ Examples:
         "the device working-set budget). Pass an explicit value only as an "
         "advanced override.",
     )
+    _add_memory_tunable_args(serve_parser)
     serve_parser.add_argument(
         "--resident-memory-limit-gb",
         type=float,

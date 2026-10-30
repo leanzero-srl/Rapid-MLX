@@ -482,6 +482,9 @@ async def status():
         # Memory guard (LeanZero fork): ceiling, margin, peak-model
         # coefficients, action counts, refusals and backstop firings.
         "memory_guard": stats.get("memory_guard", {"enabled": False}),
+        # Every cap layer between physical RAM and the step ceiling (lz.20):
+        # the engine's resolved Metal plan plus the guard's live figures.
+        "memory_budget": _memory_budget_status(cfg.engine, stats),
         # KV dtype guard (LeanZero fork): the model's compute dtype, cold rows
         # that joined a batch without promoting it to float32, extends that
         # met two dtypes (should stay 0) and promoted entries dropped.
@@ -544,3 +547,32 @@ async def clear_all_caches():
         }
     except ImportError:
         return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+
+
+def _memory_budget_status(engine, stats: dict) -> dict:
+    """``/v1/status`` ``memory_budget``: the engine's Metal plan (mode,
+    source, binding, need) merged over the scheduler's live figures."""
+    out = dict(stats.get("memory_budget") or {})
+    snap_fn = getattr(engine, "metal_budget_snapshot", None)
+    plan = None
+    if callable(snap_fn):
+        try:
+            plan = snap_fn()
+        except Exception:  # noqa: BLE001 - a status read never fails on this
+            plan = None
+    if plan:
+        for key, value in plan.items():
+            if key == "limit_bytes" and out.get("limit_bytes"):
+                # The scheduler's cap is the one enforced (ratchet included).
+                out["plan_limit_bytes"] = value
+                continue
+            out.setdefault(key, value)
+        # The scheduler's figure wins where both exist except the binding:
+        # the step binding (memory floor) beats the plan's.
+        if out.get("step_binding"):
+            out["binding"] = out["step_binding"]
+    if not out:
+        from ..memory_budget import tunables
+
+        out = {"tunables": tunables().snapshot()}
+    return out

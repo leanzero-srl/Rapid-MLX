@@ -2380,6 +2380,11 @@ class BatchedEngine(BaseEngine):
         )
         self._bind_prompt_host_cache(self._engine)
 
+        # Auto mode, second pass (lz.20): the scheduler now knows the KV per
+        # token, the step-peak prior and the prefix budget, so the limit is
+        # re-sized for the context this engine serves (raise only).
+        self._raise_metal_budget_for_context()  # pragma: no cover
+
         # #2858 acceptance: a model must not report healthy while every
         # request deterministically 503s under the resolved cap. The
         # scheduler exists as of AsyncEngineCore construction, so run its
@@ -2411,13 +2416,13 @@ class BatchedEngine(BaseEngine):
         import mlx.core as mx
 
         from ..memory_budget import (
-            AUTO_UTILIZATION_FLOOR,
             plan_metal_limit,
-            ratchet_utilization_and_apply,
+            tunables,
         )
 
+        tun = tunables()
         requested = self._gpu_memory_utilization
-        fallback = requested if requested is not None else AUTO_UTILIZATION_FLOOR
+        fallback = requested if requested is not None else tun.auto_floor
         if not mx.metal.is_available():
             return fallback
         device_info = mx.device_info()
@@ -2450,7 +2455,22 @@ class BatchedEngine(BaseEngine):
             weights_bytes=weights_bytes,
             device_budget_bytes=int(max_recommended),
             requested_utilization=requested,
+            limit_bytes=tun.metal_limit_bytes,
+            floor=tun.auto_floor,
+            ceiling=tun.auto_ceiling,
+            headroom_fraction=tun.auto_headroom_fraction,
         )
+        return self._apply_metal_plan(plan, int(max_recommended))
+
+    def _apply_metal_plan(self, plan, max_recommended: int) -> float:
+        """Publish ``plan`` into the process ratchet and install the Metal
+        limits (worker thread). Returns the effective utilization."""
+        import mlx.core as mx
+
+        from ..memory_budget import ratchet_utilization_and_apply
+
+        weights_bytes = plan.weights_bytes
+        self._metal_budget_plan = plan
 
         # Publish the resolved utilization into the process-wide
         # ratchet AND install the Metal limits under the same lock
@@ -2479,11 +2499,12 @@ class BatchedEngine(BaseEngine):
                 cache_limit = _compute_metal_cache_limit(effective_limit)
                 mx.set_cache_limit(cache_limit)
                 logger.info(
-                    f"Metal memory limits set ({plan.mode}): "
+                    f"Metal memory limits set ({plan.mode}, {plan.source}): "
                     f"allocation_limit={effective_limit / 1e9:.1f}GB "
                     f"({effective_utilization * 100:.0f}% of "
                     f"{max_recommended / 1e9:.1f}GB, "
-                    f"weights={weights_bytes / 1e9:.1f}GB), "
+                    f"weights={weights_bytes / 1e9:.1f}GB, "
+                    f"need={plan.need_bytes / 1e9:.1f}GB, binding={plan.binding}), "
                     f"cache_limit={cache_limit / 1e9:.1f}GB"
                 )
             except Exception as limit_exc:
@@ -2498,6 +2519,92 @@ class BatchedEngine(BaseEngine):
             plan.resolved_utilization, _apply_limits
         )
         return effective_utilization
+
+    def _context_metal_need(self) -> tuple[int, int] | None:
+        """(need bytes, max recommended) for the served context, from the
+        scheduler's guard (worker thread); ``None`` when unknown."""
+        import mlx.core as mx
+
+        if not mx.metal.is_available():
+            return None
+        info = mx.device_info()
+        max_recommended = int(
+            info.get("max_recommended_working_set_size", info.get("memory_size", 0))
+            or 0
+        )
+        engine = getattr(self, "_engine", None)
+        scheduler = getattr(getattr(engine, "engine", None), "scheduler", None)
+        if max_recommended <= 0 or scheduler is None:
+            return None
+        need_fn = getattr(scheduler, "memory_plan_need_bytes", None)
+        if not callable(need_fn):
+            return None
+        from ..memory_budget import tunables
+
+        need = need_fn(int(max_recommended * tunables().auto_ceiling))
+        if not need:
+            return None
+        return int(need), max_recommended
+
+    def _raise_metal_budget_for_context(self) -> None:
+        """Auto mode only: re-plan with the context-aware need and raise the
+        limit when it is larger (never lowers: the ratchet only rises)."""
+        plan = getattr(self, "_metal_budget_plan", None)
+        if plan is None or plan.mode != "auto":
+            return
+        executor = self._model_load_executor
+        if executor is None:
+            return
+
+        def _work() -> float | None:
+            from ..memory_budget import plan_metal_limit, tunables
+
+            got = self._context_metal_need()
+            if got is None:
+                return None
+            need, max_recommended = got
+            tun = tunables()
+            new_plan = plan_metal_limit(
+                weights_bytes=plan.weights_bytes,
+                device_budget_bytes=max_recommended,
+                need_bytes=need,
+                floor=tun.auto_floor,
+                ceiling=tun.auto_ceiling,
+                headroom_fraction=tun.auto_headroom_fraction,
+            )
+            if new_plan.resolved_utilization <= plan.resolved_utilization:
+                # Still record the need and source for /v1/status.
+                self._metal_budget_plan = new_plan
+                return None
+            return self._apply_metal_plan(new_plan, max_recommended)
+
+        try:
+            raised = executor.submit(_work).result()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Context-aware Metal budget failed (kept the weights plan): {e}")
+            return
+        if raised is not None:
+            self._gpu_memory_utilization = raised
+            scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+            cfg = getattr(scheduler, "config", None)
+            if cfg is not None and getattr(cfg, "gpu_memory_utilization", 0.0) > 0.0:
+                cfg.gpu_memory_utilization = max(cfg.gpu_memory_utilization, raised)
+
+    def metal_budget_snapshot(self) -> dict | None:
+        """The resolved plan for /v1/status (``None`` before load)."""
+        plan = getattr(self, "_metal_budget_plan", None)
+        if plan is None:
+            return None
+        return {
+            "mode": plan.mode,
+            "source": plan.source,
+            "binding": plan.binding,
+            "resolved_utilization": plan.resolved_utilization,
+            "limit_bytes": plan.limit_bytes,
+            "device_working_set_bytes": plan.device_budget_bytes,
+            "weights_bytes": plan.weights_bytes,
+            "plan_need_bytes": plan.need_bytes,
+        }
 
     def _install_resolved_metal_budget(self) -> None:
         """Run the budget resolution on the worker and store the result.
@@ -2516,9 +2623,9 @@ class BatchedEngine(BaseEngine):
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
             if self._gpu_memory_utilization is None:
-                from ..memory_budget import AUTO_UTILIZATION_FLOOR
+                from ..memory_budget import tunables
 
-                self._gpu_memory_utilization = AUTO_UTILIZATION_FLOOR
+                self._gpu_memory_utilization = tunables().auto_floor
 
     def _run_metal_admission_preflight(self) -> None:
         """Fail the load if the resolved cap can never admit a request.

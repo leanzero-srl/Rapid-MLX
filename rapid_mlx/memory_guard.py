@@ -795,6 +795,9 @@ class MemoryGuard:
             "backstop_requeued": 0,
             "calibrations": 0,
             "deferrals": 0,
+            # Steps held because only the free-memory floor was short
+            # (--memory-floor-gb): other apps held the memory the step needs.
+            "floor_holds": 0,
             "store_skips": 0,
             # Of which end-of-turn (prompt + output) entries: the one a
             # session's next turn fetches. Mid-turn prompt/boundary entries
@@ -887,10 +890,18 @@ class MemoryGuard:
         self._pending_window: tuple[int, Any] | None = None
         # E5: [context_threshold, extra_bytes, original] decaying margins.
         self._backstop: list[list[float]] = []
+        # ``--memory-guard-margin-gb`` (bytes), None = MARGIN_CEILING_RATIO.
+        self.margin_bytes_override: int | None = None
 
     # -- arithmetic -----------------------------------------------------
     def margin(self, transient: int, ceiling: int) -> int:
-        return int(MARGIN_CEILING_RATIO * ceiling + MARGIN_TRANSIENT_RATIO * transient)
+        # ``--memory-guard-margin-gb`` replaces the static share of the
+        # ceiling (MARGIN_CEILING_RATIO, 2%); the transient share stays.
+        override = getattr(self, "margin_bytes_override", None)
+        static = (
+            int(override) if override is not None else MARGIN_CEILING_RATIO * ceiling
+        )
+        return int(static + MARGIN_TRANSIENT_RATIO * transient)
 
     def backstop_extra(self, shape: StepShape) -> int:
         extra = 0.0

@@ -72,7 +72,11 @@ class ContextExceedsDeviceMemoryError(Exception):
         available_bytes: int,
         max_context: int,
         max_tokens_reserved: int | None = None,
+        limit: str = "device_memory",
     ) -> None:
+        # "device_memory" (the guard), or "max_model_len" (the operator's
+        # --max-model-len: ``max_context`` is that configured window).
+        self.limit = limit
         self.prompt_tokens = int(prompt_tokens)
         self.needed_bytes = int(needed_bytes)
         self.available_bytes = int(available_bytes)
@@ -89,6 +93,12 @@ class ContextExceedsDeviceMemoryError(Exception):
 
     @property
     def message(self) -> str:
+        if self.limit == "max_model_len":
+            return (
+                f"This prompt ({self.prompt_tokens} tokens) is longer than this "
+                f"engine's configured maximum context of {self.max_context} tokens "
+                f"(--max-model-len)."
+            )
         need, have = self.needed_bytes / 1e9, self.available_bytes / 1e9
         # A close call needs the digits that tell the two apart, and the
         # shortfall itself (RC12 Gabee: "needs 50.1 GB but this Mac can hold
