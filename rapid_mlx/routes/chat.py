@@ -67,6 +67,7 @@ from ..api.utils import (
     decode_inline_tool_call_arguments,
     extract_json_from_response,
     extract_multimodal_content,
+    model_accepts_audio,
     sanitize_content_for_stream,
     sanitize_output,
     sanitize_reasoning_for_stream,
@@ -4512,7 +4513,9 @@ async def _create_chat_completion_impl(
             model_name=cfg.model_name,
             allow_image=engine.is_mllm or _text_lane_images,
             allow_video=engine.is_mllm,
-            allow_audio=False,
+            allow_audio=bool(
+                engine.is_mllm and model_accepts_audio(cfg.model_path or cfg.model_name)
+            ),
         )
     except UnsupportedContentBlockError as e:
         raise HTTPException(

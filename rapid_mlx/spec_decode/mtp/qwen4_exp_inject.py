@@ -232,8 +232,19 @@ def inject_qwen4_exp_mtp_support(
 
         class _Qwen4ExpWithMTP(original_class):  # type: ignore[valid-type, misc]
             mtp_prompt_lookup_supported = True
+            # Sampled requests copy too. A copy is a point-mass proposal, so
+            # the shared verify path accepts it with p(token) and otherwise
+            # draws from p with that token removed -- exactly the target's
+            # distribution (``PromptLookupPolicy.admits_temperature``). The
+            # rollback a refused copy needs is the one greedy already uses
+            # (QSA snapshot + GDN per-boundary restore), and it does not
+            # depend on temperature. Left False, every sampled request --
+            # the Gauntlet's temperature 1.0 included -- made 0 proposals.
+            # Measured on Jundot/Qwen3.8-Flash-Next-oQ4e-mtp at temp 1.0:
+            # see NGRAM-RESEARCH-LEDGER (2026-10-30, pld-sampled).
             mtp_prompt_lookup_policy = PromptLookupPolicy(
                 enabled_by_default=True,
+                enabled_under_sampling=True,
                 min_ngram=16,
                 max_ngram=64,
                 max_tokens=8,

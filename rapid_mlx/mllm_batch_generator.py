@@ -277,7 +277,11 @@ def _is_text_only_request(request: "MLLMBatchRequest") -> bool:
     exempt from the per-batch cap that exists purely to bound vision-merge
     memory (#682 / #1848).
     """
-    return request.pixel_values is None and request.image_grid_thw is None
+    return (
+        request.pixel_values is None
+        and request.image_grid_thw is None
+        and not getattr(request, "audios", None)
+    )
 
 
 def _is_control_stop_token(
@@ -397,6 +401,7 @@ class MLLMBatchRequest:
     prompt: str | list[int]  # Text prompt or an exact pre-tokenized workload
     images: list[str] | None = None  # Image paths/URLs/base64
     videos: list[str] | None = None  # Video inputs
+    audios: list[str] | None = None  # Local audio file paths
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
@@ -3048,7 +3053,7 @@ class MLLMBatchGenerator:
         # MLLM requests therefore admit the same pre-tokenized contract as the
         # native text scheduler; media requests remain processor-owned.
         if isinstance(request.prompt, list):
-            if request.images or request.videos:
+            if request.images or request.videos or request.audios:
                 raise ClientRequestError(
                     "pre-tokenized prompts cannot be combined with media inputs"
                 )
@@ -3147,11 +3152,19 @@ class MLLMBatchGenerator:
         # immutable snapshot, so a mutable file/URL changing on disk
         # between hashing and decoding cannot key pixels of content B
         # under the digest of content A.
-        if all_images and self._should_stamp_media_content_key():
+        # Audio is not part of any media key: the pixel cache, the vision-feature cache and the
+        # media boundary store all key on images, so a request carrying audio uses none of them
+        # (a hit would reuse another clip's audio features under the same images and prompt).
+        has_audio = bool(request.audios)
+        if all_images and not has_audio and self._should_stamp_media_content_key():
             request.vision_feature_key = compute_images_hash(all_images)
 
         # Check pixel cache first
-        cached_pixels = self.vision_cache.get_pixel_cache(all_images, request.prompt)
+        cached_pixels = (
+            None
+            if has_audio
+            else self.vision_cache.get_pixel_cache(all_images, request.prompt)
+        )
         if cached_pixels is not None:
             # Cache hit - use cached pixel values
             request.input_ids = cached_pixels.input_ids
@@ -3284,6 +3297,7 @@ class MLLMBatchGenerator:
                     inputs = prepare_inputs(
                         self.processor,
                         images=all_images if all_images else None,
+                        audio=list(request.audios) if request.audios else None,
                         prompts=request.prompt,
                         image_token_index=image_token_index,
                     )
@@ -3340,7 +3354,7 @@ class MLLMBatchGenerator:
         processing_time = time.perf_counter() - tic
 
         # Store in pixel cache for future reuse
-        if all_images and request.pixel_values is not None:
+        if all_images and not has_audio and request.pixel_values is not None:
             self.vision_cache.set_pixel_cache(
                 images=all_images,
                 prompt=request.prompt,

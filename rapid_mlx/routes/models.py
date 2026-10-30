@@ -659,6 +659,19 @@ def _tools_capable(model_id: str, profile_tool_parser: str | None) -> bool:
         return False
 
 
+def _accepts_audio(model_id: str) -> bool:
+    try:
+        from ..api.utils import model_accepts_audio
+
+        # A served name (``--served-model-name``) is not a checkpoint: read the backing model.
+        if _is_served_model(model_id):
+            cfg = get_config()
+            model_id = cfg.model_path or cfg.model_name or model_id
+        return model_accepts_audio(model_id)
+    except Exception:
+        return False
+
+
 def _detect_capabilities(
     model_id: str,
     profile_modality: str | None = None,
@@ -724,6 +737,11 @@ def _detect_capabilities(
     caps: list[str] = ["text"]
     if _is_vlm(model_id, profile_modality, is_text_only):
         caps.append("vision")
+        # The MLLM chat lane samples a video part into frames (api/media_parts.py), so every
+        # vision model watches video; audio needs an audio encoder in the checkpoint.
+        caps.append("video")
+        if _accepts_audio(model_id):
+            caps.append("audio")
     if _tools_capable(model_id, profile_tool_parser):
         caps.append("tools")
     if experimental:

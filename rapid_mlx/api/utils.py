@@ -22,6 +22,7 @@ from ..model_metadata import (
     read_model_metadata,
 )
 from ..recommendations import physical_ram_gb
+from .media_parts import is_audio_marker
 from .models import Message
 
 logger = logging.getLogger(__name__)
@@ -1141,6 +1142,23 @@ def _check_legacy_string_patterns(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in MLLM_PATTERNS)
 
 
+def model_accepts_audio(model_name: str) -> bool:
+    """Whether the MLLM lane can hand this checkpoint's processor an audio clip.
+
+    True when the model routes to the MLLM lane AND its config declares an audio encoder
+    (``audio_config``, or Qwen-Omni's ``thinker_config.audio_config``). Any read failure is False.
+    """
+    try:
+        if not is_mllm_model(model_name):
+            return False
+        metadata = read_model_metadata(model_name)
+    except Exception:
+        return False
+    from .media_parts import model_hears_audio
+
+    return model_hears_audio(metadata.config if metadata is not None else None)
+
+
 def is_mllm_model(model_name: str) -> bool:
     """Check if a model name or path indicates a multimodal language model.
 
@@ -2124,6 +2142,10 @@ def extract_multimodal_content(
             text_parts = []
             for item in content:
                 item = _content_part_to_dict(item)
+                # The MLLM lane extracts each audio clip to a file first and leaves a bare
+                # ``{"type": "audio"}`` marker for the chat template (api/media_parts.py).
+                if is_audio_marker(item):
+                    continue
                 _validate_content_part_payload(item)
                 item_type = item.get("type", "")
 
