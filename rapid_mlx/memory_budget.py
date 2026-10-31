@@ -261,6 +261,124 @@ def floor_room_bytes(*, physical: int, others: int | None, floor: int) -> int | 
     return max(0, int(physical) - int(others) - int(floor))
 
 
+# The others' reference (the free-memory floor's input, ``Scheduler.
+# _memguard_others_bytes``): it RISES only to a reading held for this long
+# (the lowest reading since the newest sample at least this old), and FALLS
+# to the highest such sustained reading of the window, only after a window
+# with no swap-out. lz.20 rose at once to any single reading: on the mule's
+# growing-session replay (2026-10-31, Qwen3.8-Flash-Next, turn 110) one
+# 40.95 GB reading -- the idle machine is 19.6 GB -- dropped the ceiling from
+# 111.99 to 89.49 GB for ~2 minutes and the session went cold at 167k tokens
+# (lz.19: 371k). Another app really holding 30 GB for 30 s still lowers it.
+OTHERS_SUSTAIN_S = 15.0
+OTHERS_WINDOW_S = 120.0
+
+
+class OthersReference:
+    """Hysteresis over the machine readings, per part: ``rest`` (memory in
+    use less this engine's whole process -- max(phys_footprint, MLX active +
+    cache) -- i.e. wired + anonymous of OTHER processes + the compressor)
+    and ``engine_extra`` (the engine's own memory outside MLX's tally:
+    phys_footprint - active - cache, Python objects and driver buffers the
+    Metal plan does not count). The reference is the sum of both filtered
+    parts: what the engine's Metal plan must leave room for.
+
+    A part RISES only to a SUSTAINED reading: the minimum over every sample
+    since the newest one at least ``sustain_s`` old (none that old yet: no
+    rise) -- one spike, or a burst shorter than ``sustain_s``, never lowers
+    the ceiling. Exception: when the machine swapped out within that span the
+    pressure is real and the part rises to the current reading at once (the
+    engine must not read others' swapped-out pages as room). A part FALLS
+    only when nothing was swapped out over a window spanning at least half
+    of ``window_s``, and then only to the highest sustained reading of that
+    window."""
+
+    __slots__ = ("sustain_s", "window_s", "samples", "rest", "extra", "last")
+
+    def __init__(self, sustain_s: float = OTHERS_SUSTAIN_S, window_s: float = OTHERS_WINDOW_S):
+        from collections import deque
+
+        self.sustain_s = float(sustain_s)
+        self.window_s = float(window_s)
+        # (t, rest, extra, swapouts, sustained_rest, sustained_extra)
+        self.samples: deque = deque()
+        self.rest: int | None = None
+        self.extra: int | None = None
+        self.last: dict | None = None  # the newest sample's parts (status)
+
+    @property
+    def value(self) -> int | None:
+        if self.rest is None:
+            return None
+        return int(self.rest) + int(self.extra or 0)
+
+    def _sustained(self, now: float, index: int) -> int | None:
+        anchor = None
+        for i in range(len(self.samples) - 1, -1, -1):
+            if self.samples[i][0] <= now - self.sustain_s:
+                anchor = i
+                break
+        if anchor is None:
+            return None
+        return min(s[index] for s in list(self.samples)[anchor:])
+
+    def update(self, now: float, rest: int, extra: int, swapouts: int) -> int:
+        rest, extra = max(0, int(rest)), max(0, int(extra))
+        self.samples.append((now, rest, extra, int(swapouts), None, None))
+        keep = max(self.window_s, self.sustain_s) + 1.0
+        # keep one sample older than the sustain span (its anchor)
+        while len(self.samples) > 2 and now - self.samples[1][0] > keep:
+            self.samples.popleft()
+        s_rest = self._sustained(now, 1)
+        s_extra = self._sustained(now, 2)
+        t, r, e, so, _a, _b = self.samples[-1]
+        self.samples[-1] = (t, r, e, so, s_rest, s_extra)
+        if self.rest is None:  # the first reading: nothing to filter against
+            self.rest, self.extra = rest, extra
+        else:
+            swapping = int(swapouts) > self._anchor_swapouts(now)
+            window = [x for x in self.samples if now - x[0] <= self.window_s]
+            quiet = (
+                now - window[0][0] >= 0.5 * self.window_s
+                and window[-1][3] <= window[0][3]
+            )
+            self.rest = self._step(self.rest, rest, s_rest, swapping, quiet, window, 4)
+            self.extra = self._step(self.extra, extra, s_extra, swapping, quiet, window, 5)
+        self.last = {
+            "others_instant_bytes": rest,
+            "engine_extra_instant_bytes": extra,
+            "others_sustained_bytes": s_rest,
+            "engine_extra_sustained_bytes": s_extra,
+            "others_ref_bytes": self.rest,
+            "engine_extra_ref_bytes": self.extra,
+        }
+        return self.value
+
+    def _anchor_swapouts(self, now: float) -> int:
+        """The swap-out counter at the start of the sustain span."""
+        anchor = self.samples[0][3]
+        for x in self.samples:
+            if x[0] <= now - self.sustain_s:
+                anchor = x[3]
+            else:
+                break
+        return anchor
+
+    @staticmethod
+    def _step(ref, current, sustained, swapping, quiet, window, index):
+        if swapping and current > ref:
+            return current
+        if sustained is not None and sustained > ref:
+            return sustained
+        if current < ref and quiet:
+            # the highest SUSTAINED reading of the window (a spike in it does
+            # not hold the reference up); no sustained reading yet: the raw max
+            highs = [x[index] for x in window if x[index] is not None]
+            target = max(highs) if highs else max(x[index - 3] for x in window)
+            return min(ref, max(target, current))
+        return ref
+
+
 class MetalPreflightError(RuntimeError):
     """The resolved Metal cap can never admit a request for this model.
 
@@ -515,13 +633,25 @@ def _sysctl_int(name: bytes, ctype_name: str = "c_int") -> int | None:
 class MachineMemory:
     """One reading of the machine's memory (``host_statistics64``)."""
 
-    __slots__ = ("used", "swapouts", "breakdown")
+    __slots__ = ("used", "swapouts", "breakdown", "engine_footprint")
 
-    def __init__(self, used: int, swapouts: int, breakdown: dict | None = None):
+    def __init__(
+        self,
+        used: int,
+        swapouts: int,
+        breakdown: dict | None = None,
+        engine_footprint: int | None = None,
+    ):
         self.used = int(used)  # resident bytes in use, Activity Monitor's
         self.swapouts = int(swapouts)  # pages swapped out since boot
         # bytes per vm_stat class: what counts and what is left out (status)
         self.breakdown = breakdown
+        # this process's phys_footprint (task_info), read in the SAME call as
+        # the page counts so "used - engine" never mixes two moments; None
+        # when unknown (then the engine is its Metal footprint alone)
+        self.engine_footprint = (
+            int(engine_footprint) if engine_footprint and engine_footprint > 0 else None
+        )
 
 
 def used_bytes_from_pages(
@@ -627,7 +757,14 @@ def system_memory_used() -> MachineMemory | None:
             free=vm.free_count,
             speculative=vm.speculative_count,
         )
-        return MachineMemory(used, vm.swapouts, breakdown)
+        footprint = None
+        try:
+            from .runtime.process_memory import get_phys_footprint
+
+            footprint = get_phys_footprint() or None
+        except Exception:  # noqa: BLE001
+            footprint = None
+        return MachineMemory(used, vm.swapouts, breakdown, footprint)
     except Exception:  # noqa: BLE001
         return None
 

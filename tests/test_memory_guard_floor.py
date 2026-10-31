@@ -51,6 +51,10 @@ def _env(monkeypatch):
     # within the test (production: 1 s cache, 120 s window).
     monkeypatch.setattr(scheduler_mod, "_MEMGUARD_SYSTEM_READ_S", 0.0)
     monkeypatch.setattr(scheduler_mod, "_MEMGUARD_OTHERS_WINDOW_S", 0.2)
+    # These grabs last a few steps (well under a second of wall clock): react
+    # at once, as the floor mechanics are what is tested here. The sustain
+    # rule itself (production 15 s) is tested in test_memory_guard_others_sustained.
+    monkeypatch.setattr(scheduler_mod, "_MEMGUARD_OTHERS_SUSTAIN_S", 0.0)
 
 
 def _grab_run(llama, monkeypatch, floor: int, grab: int = 900 * MB):

@@ -325,6 +325,9 @@ _PLAN_ATTEMPTS = 64
 # host_statistics64 call), and the window its reference may fall back over.
 _MEMGUARD_SYSTEM_READ_S = 1.0
 _MEMGUARD_OTHERS_WINDOW_S = 120.0
+# ...and how long a higher reading must hold before the reference rises to it
+# (memory_budget.OTHERS_SUSTAIN_S: one spike never lowers the ceiling).
+_MEMGUARD_OTHERS_SUSTAIN_S = 15.0
 # A floor hold not renewed within this gap is a NEW shortage (new wait).
 _MEMGUARD_FLOOR_HOLD_GAP_S = 2.0
 # The memory guard's line for requests that carry no SessionHint (raw
@@ -6946,18 +6949,24 @@ class Scheduler:
         return hold
 
     def _memguard_others_bytes(self) -> int | None:
-        """The REFERENCE for the RAM the rest of the machine uses (other
-        apps, other engines, the OS): ``host_statistics64`` memory in use
-        less the engine's own Metal footprint, read together at most every
-        ``_MEMGUARD_SYSTEM_READ_S`` (one GPU wire/unwire moves a buffer
-        between wired and anonymous, both counted: stable).
+        """The REFERENCE for the RAM the engine's Metal plan must leave to the
+        rest of the machine, re-read at most every ``_MEMGUARD_SYSTEM_READ_S``.
 
-        Hysteresis, so one sample never drives a permanent action and the
-        engine cannot talk itself into room by swapping the others out
-        (their swapped-out pages stop counting as used): the reference RISES
-        at once to any higher reading, and FALLS only to the highest reading
-        of the last ``_MEMGUARD_OTHERS_WINDOW_S`` and only when the machine
-        swapped nothing out during it. ``None`` when unmeasured."""
+        One reading: ``host_statistics64`` memory in use (wired + anonymous -
+        purgeable + compressor; file cache left out) and, in the SAME call,
+        this process's ``phys_footprint``; MLX active + cache read right
+        after. The engine's own process -- max(phys_footprint, active +
+        cache) -- is taken out whole, so what remains is the wired +
+        anonymous memory of OTHER processes and the compressor; the engine's
+        memory outside MLX's tally (phys_footprint - active - cache) is a
+        separate part. Both parts go through ``memory_budget.OthersReference``:
+        a part rises only to a reading SUSTAINED for ``_MEMGUARD_OTHERS_
+        SUSTAIN_S`` (at once only while the machine swaps out), falls only
+        after a ``_MEMGUARD_OTHERS_WINDOW_S`` window with no swap-out, to that
+        window's highest sustained reading. lz.20 rose at once to any single
+        reading: on the mule (2026-10-31) one 40.95 GB reading cut the ceiling
+        from 111.99 to 89.49 GB and the growing session went cold at 167k
+        tokens. ``None`` when unmeasured."""
         import time as _time
 
         from . import memory_budget
@@ -6966,25 +6975,28 @@ class Scheduler:
         last = getattr(self, "_memguard_others_read", None)
         if last is not None and now - last[0] < _MEMGUARD_SYSTEM_READ_S:
             return last[1]
+        filt = getattr(self, "_memguard_others_filter", None)
+        if (
+            last is None  # reset (tests, a re-measure): start a new reference
+            or filt is None
+            or filt.sustain_s != _MEMGUARD_OTHERS_SUSTAIN_S
+            or filt.window_s != _MEMGUARD_OTHERS_WINDOW_S
+        ):
+            filt = memory_budget.OthersReference(
+                _MEMGUARD_OTHERS_SUSTAIN_S, _MEMGUARD_OTHERS_WINDOW_S
+            )
+            self._memguard_others_filter = filt
         reading = memory_budget.system_memory_used()
         physical = memory_budget.system_physical_memory()
-        ref = last[1] if last is not None else None
         if reading is None or physical <= 0:
             self._memguard_others_read = (now, None, physical)
             return None
-        engine = self._current_metal_active_bytes() + self._current_metal_cache_bytes()
-        others = max(0, reading.used - engine)
-        window = self.__dict__.setdefault("_memguard_others_window", deque())
-        window.append((now, others, reading.swapouts))
-        while window and now - window[0][0] > _MEMGUARD_OTHERS_WINDOW_S:
-            window.popleft()
-        if ref is None or others >= ref:
-            ref = others
-        elif (
-            now - window[0][0] >= 0.5 * _MEMGUARD_OTHERS_WINDOW_S
-            and window[-1][2] <= window[0][2]
-        ):
-            ref = max(o for _t, o, _s in window)
+        metal = self._current_metal_active_bytes() + self._current_metal_cache_bytes()
+        footprint = reading.engine_footprint or 0
+        engine = max(int(footprint), int(metal))
+        rest = max(0, reading.used - engine)
+        extra = max(0, int(footprint) - int(metal))
+        ref = filt.update(now, rest, extra, reading.swapouts)
         self._memguard_others_read = (now, ref, physical)
         return ref
 
@@ -9938,22 +9950,22 @@ class Scheduler:
         # The floor's input, auditable: what host_statistics64 counts as
         # unavailable (wired + anonymous - purgeable + compressor) and what it
         # leaves out (file cache, incl. the engine's own memory-mapped files).
-        # Of the others, the engine's own non-Metal memory (Python objects,
-        # token buffers, driver allocations: phys_footprint - MLX active -
-        # MLX cache) is RAM it really holds, so it stays counted; it is
-        # published so "other apps" is never read as more than it is.
+        # The engine's whole process (max(phys_footprint, MLX active + cache))
+        # is out of "others"; its memory outside MLX's tally (phys_footprint
+        # - active - cache) is a separate, filtered part of the reference.
+        # Instant vs sustained vs reference per part: a spike shows as an
+        # instant reading the reference did not follow.
         machine = dict(reading.breakdown or {}) if reading is not None else None
         if machine is not None:
-            resident = int(self._current_process_resident_bytes() or 0)
+            resident = int(reading.engine_footprint or 0)
             machine["engine_metal_bytes"] = int(active + cache)
             machine["engine_resident_bytes"] = resident or None
-            engine_extra = max(0, resident - int(active + cache)) if resident else 0
-            machine["others_engine_non_metal_bytes"] = (
-                min(engine_extra, int(others)) if others is not None else None
-            )
-            machine["others_rest_bytes"] = (
-                max(0, int(others) - engine_extra) if others is not None else None
-            )
+            filt = getattr(self, "_memguard_others_filter", None)
+            parts = dict(filt.last or {}) if filt is not None else {}
+            machine.update(parts)
+            machine["others_engine_non_metal_bytes"] = parts.get("engine_extra_ref_bytes")
+            machine["others_rest_bytes"] = parts.get("others_ref_bytes")
+            machine["others_sustain_s"] = _MEMGUARD_OTHERS_SUSTAIN_S
         if ceiling < structural:
             binding = "memory_floor"
         else:
