@@ -19,6 +19,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -147,6 +148,9 @@ from .hybrid_state_checkpoints import (  # noqa: E402
 )
 from .hybrid_state_checkpoints import (  # noqa: E402
     collect_checkpoints as _collect_state_checkpoints,
+)
+from .hybrid_state_checkpoints import (  # noqa: E402
+    is_recurrent_layer as _is_recurrent_layer,
 )
 from .hybrid_state_checkpoints import (  # noqa: E402
     record_checkpoints as _record_state_checkpoints,
@@ -5660,6 +5664,73 @@ class Scheduler:
         if holders and cache:
             _attach_state_checkpoints(cache, holders, max_position=length)
 
+    def _model_has_recurrent_state(self) -> bool:
+        """Whether this model's prompt cache has recurrent layers (the only
+        layers checkpoints are recorded for). Measured once from the model's
+        own cache factory; unknown counts as no."""
+        known = getattr(self, "_model_recurrent_state", None)
+        if known is None:
+            try:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                known = any(
+                    _is_recurrent_layer(layer)
+                    for layer in make_prompt_cache(self.model)
+                )
+            except Exception as exc:  # noqa: BLE001 - a probe, never a failure
+                logger.debug("[hybrid_checkpoint] cache probe failed: %s", exc)
+                known = False
+            self._model_recurrent_state = known
+        return bool(known)
+
+    def _frame_checkpoint_split(
+        self, request: Request, tokens_to_process: list[int]
+    ) -> int | None:
+        """Local offset in ``tokens_to_process`` where the prefill stops for a
+        frame checkpoint, or None.
+
+        A new conversation shares the previous one's system/tools frame
+        (``SessionHint.frame``, measured with the model's own template) and
+        diverges right after it, in its first user message. A hybrid entry
+        resumes only at a recorded recurrent checkpoint, and the chunk
+        checkpoints (every ``RAPID_MLX_HYBRID_CHECKPOINT_STRIDE`` tokens) end
+        up to a stride short of the frame -- 5,917 tokens re-prefilled on a
+        21,860-token goose frame. Splitting the prefill at the frame records
+        a checkpoint there (pinned, so thinning keeps it). Only when that
+        part of the prompt is still to be prefilled, and rounded down to a
+        free prefill tile like the message boundary.
+        """
+        request._frame_checkpoint = 0
+        if not self._hybrid_checkpoints_enabled() or _pflash_compressed(request):
+            return None
+        hint = getattr(request, "session_hint", None)
+        frame = int(getattr(hint, "frame", 0) or 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        if frame <= 0 or frame >= prompt_len:
+            return None
+        cached = request.cached_tokens or 0
+        if not 0 < frame - cached < len(tokens_to_process):
+            return None
+        if not self._model_has_recurrent_state():
+            return None
+        frame = self._tile_aligned_boundary(request, frame)
+        local = frame - cached
+        if frame <= 0 or not 0 < local < len(tokens_to_process):
+            return None
+        request._frame_checkpoint = frame
+        return local
+
+    @staticmethod
+    def _prefill_segments(
+        tokens: list[int], splits: Iterable[int | None]
+    ) -> list[list[int]] | None:
+        """``tokens`` cut at each local split (None when there is none)."""
+        cuts = sorted({int(c) for c in splits if c and 0 < int(c) < len(tokens)})
+        if not cuts:
+            return None
+        edges = [0, *cuts, len(tokens)]
+        return [list(tokens[a:b]) for a, b in zip(edges, edges[1:], strict=False)]
+
     def _record_hybrid_checkpoints(self, prompt_responses) -> None:
         """Record recurrent state at each prefill chunk boundary (#hybrid ckpt).
 
@@ -5687,8 +5758,9 @@ class Scheduler:
             if request is None or _pflash_compressed(request):
                 continue
             position = int(request.cached_tokens or 0) + int(progress[0])
+            pin = position == int(getattr(request, "_frame_checkpoint", 0) or 0)
             holders = self._hybrid_checkpoints.get(resp.uid)
-            if holders:
+            if holders and not pin:
                 newest = max(
                     (h.positions[-1] for h in holders if h is not None and h.positions),
                     default=0,
@@ -5710,12 +5782,13 @@ class Scheduler:
                 holders = [None] * len(cache)
             if len(holders) != len(cache):
                 continue
-            if _record_state_checkpoints(cache, holders, position):
+            if _record_state_checkpoints(cache, holders, position, pin=pin):
                 self._hybrid_checkpoints[resp.uid] = holders
-                logger.debug(
-                    "[hybrid_checkpoint] uid=%s recorded position=%d",
+                (logger.info if pin else logger.debug)(
+                    "[hybrid_checkpoint] uid=%s recorded position=%d%s",
                     resp.uid,
                     position,
+                    " (frame end, pinned)" if pin else "",
                 )
 
     def _snapshot_promoted_prompts(self, prompt_responses) -> None:
@@ -14731,16 +14804,19 @@ class Scheduler:
                 _local = _pb - _cached
                 if 0 < _local < len(tokens_to_process):
                     boundary_local_split = _local
+            # A frame checkpoint for the next NEW conversation (hybrid only).
+            prefill_segments = self._prefill_segments(
+                tokens_to_process,
+                (
+                    boundary_local_split,
+                    self._frame_checkpoint_split(request, tokens_to_process),
+                ),
+            )
 
             try:
-                if boundary_local_split is not None:
+                if prefill_segments is not None:
                     uids = self.batch_generator.insert_segments(
-                        [
-                            [
-                                tokens_to_process[:boundary_local_split],
-                                tokens_to_process[boundary_local_split:],
-                            ]
-                        ],
+                        [prefill_segments],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=[cache_to_use] if cache_to_use else None,
                         samplers=[request_sampler],
@@ -14773,16 +14849,18 @@ class Scheduler:
                         "_cache_snapshot_boundary",
                         getattr(request, "prefix_boundary", 0),
                     )
-                    if self.memory_aware_cache is not None and 0 < retry_boundary < len(
-                        tokens_to_process
-                    ):
+                    retry_segments = self._prefill_segments(
+                        tokens_to_process,
+                        (
+                            retry_boundary
+                            if self.memory_aware_cache is not None
+                            else None,
+                            self._frame_checkpoint_split(request, tokens_to_process),
+                        ),
+                    )
+                    if retry_segments is not None:
                         uids = self.batch_generator.insert_segments(
-                            [
-                                [
-                                    tokens_to_process[:retry_boundary],
-                                    tokens_to_process[retry_boundary:],
-                                ]
-                            ],
+                            [retry_segments],
                             max_tokens=[request.sampling_params.max_tokens],
                             caches=None,
                             samplers=[request_sampler],

@@ -76,11 +76,19 @@ class StateCheckpoints:
     cache entry can be shared by every copy of that entry.
     """
 
-    __slots__ = ("_items",)
+    __slots__ = ("_items", "_pinned")
 
-    def __init__(self, items: Iterable[tuple[int, tuple[Any, ...]]] = ()):
+    def __init__(
+        self,
+        items: Iterable[tuple[int, tuple[Any, ...]]] = (),
+        pinned: Iterable[int] = (),
+    ):
         self._items: tuple[tuple[int, tuple[Any, ...]], ...] = tuple(
             sorted(((int(p), tuple(a)) for p, a in items), key=lambda it: it[0])
+        )
+        present = {p for p, _ in self._items}
+        self._pinned: frozenset[int] = frozenset(
+            int(p) for p in pinned if int(p) in present
         )
 
     def __len__(self) -> int:
@@ -95,6 +103,13 @@ class StateCheckpoints:
     @property
     def positions(self) -> tuple[int, ...]:
         return tuple(p for p, _ in self._items)
+
+    @property
+    def pinned(self) -> frozenset[int]:
+        """Positions thinning keeps: the end of a request's system/tools
+        frame, the one place a NEW conversation with the same frame can
+        resume (see ``with_checkpoint(pin=True)``)."""
+        return self._pinned
 
     @property
     def nbytes(self) -> int:
@@ -120,7 +135,9 @@ class StateCheckpoints:
 
     def truncated(self, position: int) -> StateCheckpoints:
         """Keep only checkpoints at or below ``position``."""
-        return StateCheckpoints(it for it in self._items if it[0] <= position)
+        return StateCheckpoints(
+            (it for it in self._items if it[0] <= position), self._pinned
+        )
 
     def with_checkpoint(
         self,
@@ -129,6 +146,7 @@ class StateCheckpoints:
         *,
         max_count: int,
         stride: int,
+        pin: bool = False,
     ) -> StateCheckpoints:
         """Return a holder that also records ``arrays`` at ``position``.
 
@@ -137,26 +155,49 @@ class StateCheckpoints:
         When the bound is exceeded, the checkpoint with the smallest gap to
         its predecessor is dropped; the newest one is never dropped, so the
         most recent prefill work is always the cheapest to resume.
+
+        ``pin=True`` records a frame-end checkpoint: it skips the stride
+        gate (the frame rarely lands on a stride multiple) and thinning
+        keeps it while any unpinned non-newest checkpoint is left to drop.
+        The count bound is unchanged, so memory is too.
         """
         if max_count <= 0:
             return self
         position = int(position)
-        if self._items:
+        pinned = set(self._pinned)
+        if pin:
+            if position <= 0:
+                return self
+            if any(p == position for p, _ in self._items):
+                if position in pinned:
+                    return self
+                pinned.add(position)
+                return StateCheckpoints(self._items, pinned)
+            pinned.add(position)
+        elif self._items:
             newest = self._items[-1][0]
             if position <= newest or position - newest < stride:
                 return self
-        items = list(self._items) + [(position, tuple(arrays))]
+        items = sorted(
+            list(self._items) + [(position, tuple(arrays))], key=lambda it: it[0]
+        )
         while len(items) > max_count:
-            # gap of item i = items[i].pos - items[i-1].pos (first item: pos)
-            victim = 0
-            smallest = items[0][0]
-            for i in range(1, len(items) - 1):
+            # gap of item i = items[i].pos - items[i-1].pos (first item: pos);
+            # the newest is never a candidate, a pinned one only when no
+            # unpinned candidate is left.
+            candidates = [
+                i for i in range(len(items) - 1) if items[i][0] not in pinned
+            ] or list(range(len(items) - 1))
+            victim = candidates[0]
+            smallest = items[victim][0] - (items[victim - 1][0] if victim else 0)
+            for i in candidates[1:]:
                 gap = items[i][0] - items[i - 1][0]
                 if gap < smallest:
                     smallest = gap
                     victim = i
+            pinned.discard(items[victim][0])
             del items[victim]
-        return StateCheckpoints(items)
+        return StateCheckpoints(items, pinned)
 
 
 def _recurrent_cache_types() -> tuple[type, ...]:
@@ -290,8 +331,12 @@ def record_checkpoints(
     *,
     max_count: int | None = None,
     stride: int | None = None,
+    pin: bool = False,
 ) -> bool:
     """Record every recurrent layer of ``cache`` at ``position`` into ``holders``.
+
+    ``pin=True`` records a frame-end checkpoint (``with_checkpoint``): no
+    stride gate, and thinning keeps it.
 
     ``cache`` must hold single-row (batch 1) layers, e.g. what
     ``BatchGenerator.extract_cache`` returns for one request. ``holders`` is
@@ -314,16 +359,20 @@ def record_checkpoints(
         states[i] = arrays
     # Gate on one layer: all layers share the same position history.
     probe = holders[recurrent[0]]
-    newest = probe.positions[-1] if probe is not None and probe.positions else None
-    if newest is not None and (position <= newest or position - newest < stride):
-        return False
+    if pin:
+        if probe is not None and position in probe.pinned:
+            return False
+    else:
+        newest = probe.positions[-1] if probe is not None and probe.positions else None
+        if newest is not None and (position <= newest or position - newest < stride):
+            return False
     states = _owned_states(states)
     if not _materialise(states):
         return False
     for i in recurrent:
         base = holders[i] or StateCheckpoints()
         holders[i] = base.with_checkpoint(
-            position, states[i], max_count=max_count, stride=stride
+            position, states[i], max_count=max_count, stride=stride, pin=pin
         )
     return True
 

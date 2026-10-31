@@ -33,6 +33,7 @@ import os
 import struct
 import threading
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -1485,11 +1486,7 @@ def _snap_hybrid_trim(
     # that forbids trimming (a trim-liar class, a wrapper, an unknown shape)
     # keeps the pre-checkpoint refusal: a snap must never trim a layer it
     # cannot restore.
-    if any(
-        _layer_forbids_trim(layer) and not is_recurrent_layer(layer)
-        for layer in cache
-        if layer is not None
-    ):
+    if not _snappable(cache):
         return None
     position = achievable_position(cache, min(target_len, entry_len))
     if position <= 0:
@@ -1507,6 +1504,37 @@ def _snap_hybrid_trim(
             return None
         trimmed[i] = restored
     return trimmed, position
+
+
+def _common_prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
+    """Length of the common prefix of two token sequences (block compare
+    first, so a 30k-token prompt costs a few hundred C-level slices)."""
+    n = min(len(a), len(b))
+    i = 0
+    block = 512
+    while i + block <= n and a[i : i + block] == b[i : i + block]:
+        i += block
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _hybrid_resume_position(cache: list[Any], entry_len: int, shared: int) -> int:
+    """Where ``_snap_hybrid_trim`` would resume ``cache`` for a request
+    sharing ``shared`` tokens with it (0 when it cannot)."""
+    if shared <= 0 or entry_len <= 0 or not _snappable(cache):
+        return 0
+    return achievable_position(cache, min(shared, entry_len))
+
+
+def _snappable(cache: list[Any]) -> bool:
+    """Every trim-forbidding layer is a recurrent layer that carries
+    checkpoints (``_snap_hybrid_trim``'s own refusal rule)."""
+    return not any(
+        _layer_forbids_trim(layer) and not is_recurrent_layer(layer)
+        for layer in cache
+        if layer is not None
+    )
 
 
 def _needs_kv_trim(layer: Any) -> bool:
@@ -2352,35 +2380,9 @@ class MemoryAwarePrefixCache:
         # This handles the agentic pattern: same system+context prefix
         # but different final user message.  Use the sorted index to find
         # the nearest neighbor which likely shares the longest prefix.
-        best_lcp_entry: _CacheEntry | None = None
-        best_lcp_length = 0
-
-        if sorted_keys:
-            idx = bisect.bisect_left(sorted_keys, tokens_key)
-            # Check neighbors around insertion point (they share the most
-            # common prefix due to lexicographic ordering).
-            for i in (idx - 1, idx):
-                if i < 0 or i >= len(sorted_keys):
-                    continue
-                cached_key = sorted_keys[i]
-                if cached_key == tokens_key:
-                    continue  # Skip exact (already handled)
-                min_len = min(len(cached_key), len(tokens_key))
-                if min_len <= best_lcp_length:
-                    continue
-                # Compute LCP length
-                lcp = 0
-                for j in range(min_len):
-                    if cached_key[j] != tokens_key[j]:
-                        break
-                    lcp = j + 1
-                if lcp > best_lcp_length:
-                    best_lcp_entry = self._entries[cached_key]
-                    best_lcp_length = lcp
-                    logger.debug(
-                        f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
-                        f"req_len={len(tokens_key)} lcp={lcp}"
-                    )
+        best_lcp_entry, best_lcp_length = self._best_lcp_candidate(
+            sorted_keys, tokens_key
+        )
 
         if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
@@ -2450,6 +2452,60 @@ class MemoryAwarePrefixCache:
         self._last_match_type = "miss"
 
         return None, tokens
+
+    def _best_lcp_candidate(
+        self, sorted_keys: Sequence[tuple[int, ...]], tokens_key: tuple[int, ...]
+    ) -> tuple[_CacheEntry | None, int]:
+        """The entry to serve a divergent request from, and its shared length.
+
+        Entries are sorted, so the shared prefix with the request can only
+        shrink walking away from its insertion point: the two neighbours
+        hold the longest one, which a trimmable entry reuses whole.  A hybrid
+        entry is only reusable down to its newest recurrent checkpoint at or
+        below the shared prefix, so several entries can tie on the shared
+        prefix (a conversation's boundary entry and its later, longer turns)
+        while their checkpoints stop at different depths -- a long entry's
+        are thinned the most.  Walk on while an entry could still resume
+        deeper and keep the deepest resume point; the walk stops at the
+        first entry whose shared prefix cannot beat it.
+        """
+        best_entry: _CacheEntry | None = None
+        best_lcp = 0
+        best_usable = 0
+        if not sorted_keys:
+            return None, 0
+        idx = bisect.bisect_left(sorted_keys, tokens_key)
+        for start, step in ((idx - 1, -1), (idx, 1)):
+            i = start
+            while 0 <= i < len(sorted_keys):
+                cached_key = sorted_keys[i]
+                i += step
+                if cached_key == tokens_key:
+                    continue  # Skip exact (already handled)
+                min_len = min(len(cached_key), len(tokens_key))
+                if min_len <= best_usable:
+                    break
+                lcp = _common_prefix_length(cached_key, tokens_key)
+                if lcp <= best_usable:
+                    break
+                entry = self._entries[cached_key]
+                hybrid = any(_layer_forbids_trim(lc) for lc in entry.cache)
+                usable = (
+                    _hybrid_resume_position(entry.cache, len(cached_key), lcp)
+                    if hybrid
+                    else lcp
+                )
+                logger.debug(
+                    f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
+                    f"req_len={len(tokens_key)} lcp={lcp} usable={usable}"
+                )
+                if (usable, lcp) > (best_usable, best_lcp):
+                    best_entry, best_lcp, best_usable = entry, lcp, usable
+                if not hybrid or not _snappable(entry.cache):
+                    # A trimmable neighbour reuses its whole LCP; a cache that
+                    # cannot snap at all gains nothing from a deeper look.
+                    break
+        return best_entry, best_lcp
 
     def store(
         self,
